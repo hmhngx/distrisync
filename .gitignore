@@ -120,3 +120,7 @@ gradle-app.setting
 *.orig
 *.rej
 *.patch
+
+# ─── DistriSync runtime data ──────────────────────────────────────────────────
+distrisync-data/
+docs/
