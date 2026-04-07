@@ -26,6 +26,27 @@ final class ClientSession {
     final UUID sessionId = UUID.randomUUID();
 
     /**
+     * Human-readable display name supplied by the client in its {@code HANDSHAKE}
+     * frame.  Defaults to an empty string for sessions that have not yet completed
+     * their handshake.  Written only once (on HANDSHAKE receipt); reads are safe
+     * from the single-threaded NIO event loop.
+     */
+    volatile String authorName = "";
+
+    /**
+     * Session-scoped client identifier supplied in the {@code HANDSHAKE} frame.
+     * Correlates shapes to the originating client session across the board state.
+     */
+    volatile String clientId = "";
+
+    /**
+     * Room identifier supplied in the {@code HANDSHAKE} frame.
+     * Determines which {@link RoomContext} this session is routed to.
+     * Remains empty until the first valid HANDSHAKE is processed.
+     */
+    volatile String roomId = "";
+
+    /**
      * Accumulation buffer for inbound bytes.
      * 64 KiB covers any realistic single MUTATION frame; the server never
      * receives SNAPSHOT messages (only sends them).
