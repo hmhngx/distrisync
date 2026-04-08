@@ -60,3 +60,72 @@
     -fx-text-fill: #10b981;
     -fx-font-size: 12px;
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   Lobby scene (room discovery)
+   ═══════════════════════════════════════════════════════════════ */
+
+.lobby-root {
+    -fx-background-color: #0f172a;
+}
+
+.lobby-header {
+    -fx-text-fill: #f8fafc;
+    -fx-font-size: 26px;
+    -fx-font-weight: bold;
+}
+
+.lobby-subtitle {
+    -fx-text-fill: #94a3b8;
+    -fx-font-size: 14px;
+}
+
+.lobby-scroll {
+    -fx-background-color: transparent;
+    -fx-background: #0f172a;
+}
+
+.lobby-scroll > .viewport {
+    -fx-background-color: #0f172a;
+}
+
+.lobby-card {
+    -fx-background-color: #1e293b;
+    -fx-background-radius: 10;
+    -fx-padding: 14 18 14 18;
+    -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 12, 0.2, 0, 2);
+}
+
+.lobby-room-title {
+    -fx-text-fill: #f8fafc;
+    -fx-font-size: 16px;
+    -fx-font-weight: bold;
+}
+
+.lobby-meta {
+    -fx-text-fill: #94a3b8;
+    -fx-font-size: 12px;
+}
+
+.lobby-textfield {
+    -fx-background-color: #1e293b;
+    -fx-text-fill: #f8fafc;
+    -fx-prompt-text-fill: #64748b;
+    -fx-background-radius: 8;
+    -fx-padding: 10 14 10 14;
+}
+
+.lobby-status-muted {
+    -fx-text-fill: #94a3b8;
+    -fx-font-size: 13px;
+}
+
+.lobby-status-connected {
+    -fx-text-fill: #34d399;
+    -fx-font-size: 13px;
+}
+
+.lobby-status-disconnected {
+    -fx-text-fill: #f87171;
+    -fx-font-size: 13px;
+}
