@@ -2,12 +2,18 @@ package com.distrisync.protocol;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.UUID;
+
+import com.google.gson.reflect.TypeToken;
 
 /**
  * Stateless utility that encodes/decodes DistriSync binary frames.
@@ -202,6 +208,119 @@ public final class MessageCodec {
         if (message == null) throw new IllegalArgumentException("message must not be null");
         if (clazz   == null) throw new IllegalArgumentException("clazz must not be null");
         return GSON.fromJson(message.payload(), clazz);
+    }
+
+    // -------------------------------------------------------------------------
+    // HANDSHAKE helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * JSON payload of a {@link MessageType#HANDSHAKE} frame: display name and
+     * stable client id. Room membership is established with {@link MessageType#JOIN_ROOM}.
+     *
+     * @param authorName human-readable display name; never {@code null} after decode
+     * @param clientId   session-scoped stable identifier from the client
+     */
+    public record HandshakePayload(String authorName, String clientId) {}
+
+    /**
+     * Encodes a {@code HANDSHAKE} frame with the given fields.
+     *
+     * @param authorName may be {@code null} (stored as empty string)
+     * @param clientId   may be {@code null} (stored as empty string)
+     */
+    public static ByteBuffer encodeHandshake(String authorName, String clientId) {
+        HandshakePayload payload = new HandshakePayload(
+                authorName != null ? authorName : "",
+                clientId != null ? clientId : "");
+        return encodeObject(MessageType.HANDSHAKE, payload);
+    }
+
+    /**
+     * Parses a {@code HANDSHAKE} message payload into a {@link HandshakePayload}.
+     * Malformed JSON falls back to {@code ("", "")}. Legacy {@code roomId} in JSON
+     * is ignored (room is chosen via {@code JOIN_ROOM}).
+     *
+     * @param msg a decoded message whose type is {@link MessageType#HANDSHAKE}
+     * @return normalized handshake fields
+     * @throws IllegalArgumentException if {@code msg} is {@code null} or not a HANDSHAKE
+     */
+    public static HandshakePayload decodeHandshake(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.HANDSHAKE) {
+            throw new IllegalArgumentException("expected HANDSHAKE, got " + msg.type());
+        }
+        try {
+            JsonObject p = JsonParser.parseString(msg.payload()).getAsJsonObject();
+            String an = "";
+            if (p.has("authorName") && !p.get("authorName").isJsonNull()) {
+                an = p.get("authorName").getAsString();
+            }
+            String cid = "";
+            if (p.has("clientId") && !p.get("clientId").isJsonNull()) {
+                cid = p.get("clientId").getAsString();
+            }
+            return new HandshakePayload(an, cid);
+        } catch (Exception e) {
+            return new HandshakePayload("", "");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // LOBBY_STATE / JOIN_ROOM / LEAVE_ROOM
+    // -------------------------------------------------------------------------
+
+    /**
+     * One row in a {@link MessageType#LOBBY_STATE} payload JSON array.
+     *
+     * @param roomId    non-null room identifier
+     * @param userCount number of TCP clients currently in that room (not in lobby)
+     */
+    public record LobbyRoomEntry(String roomId, int userCount) {}
+
+    private static final Type LOBBY_LIST_TYPE = new TypeToken<List<LobbyRoomEntry>>() {}.getType();
+
+    /**
+     * Encodes a {@code LOBBY_STATE} frame: JSON array of {@link LobbyRoomEntry}.
+     */
+    public static ByteBuffer encodeLobbyState(List<LobbyRoomEntry> rooms) {
+        if (rooms == null) throw new IllegalArgumentException("rooms must not be null");
+        String json = GSON.toJson(rooms);
+        return encode(new Message(MessageType.LOBBY_STATE, json));
+    }
+
+    /**
+     * Decodes the payload of a {@link MessageType#LOBBY_STATE} message.
+     */
+    public static List<LobbyRoomEntry> decodeLobbyState(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.LOBBY_STATE) {
+            throw new IllegalArgumentException("expected LOBBY_STATE, got " + msg.type());
+        }
+        List<LobbyRoomEntry> list = GSON.fromJson(msg.payload(), LOBBY_LIST_TYPE);
+        return list != null ? List.copyOf(list) : List.of();
+    }
+
+    /**
+     * Encodes {@code JOIN_ROOM} with a JSON string literal payload (same pattern as
+     * {@link #encodeClearUserShapes}).
+     */
+    public static ByteBuffer encodeJoinRoom(String roomId) {
+        if (roomId == null) throw new IllegalArgumentException("roomId must not be null");
+        return encode(new Message(MessageType.JOIN_ROOM, GSON.toJson(roomId)));
+    }
+
+    public static String decodeJoinRoom(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.JOIN_ROOM) {
+            throw new IllegalArgumentException("expected JOIN_ROOM, got " + msg.type());
+        }
+        return GSON.fromJson(msg.payload(), String.class);
+    }
+
+    /** Encodes {@code LEAVE_ROOM} with an empty UTF-8 payload body. */
+    public static ByteBuffer encodeLeaveRoom() {
+        return encode(new Message(MessageType.LEAVE_ROOM, ""));
     }
 
     // -------------------------------------------------------------------------

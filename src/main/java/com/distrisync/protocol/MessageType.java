@@ -10,7 +10,7 @@ import java.util.Map;
  * <pre>
  * Wire value  Meaning
  * ----------  -------
- * 0x01        HANDSHAKE    – initial client→server greeting (authorName, clientId)
+ * 0x01        HANDSHAKE    – initial client→server greeting (authorName, clientId); room via JOIN_ROOM
  * 0x02        SNAPSHOT     – full board state sent by server on join
  * 0x03        MUTATION     – incremental shape add / update
  * 0x04        UDP_POINTER  – ephemeral cursor-position broadcast (fire-and-forget)
@@ -22,6 +22,9 @@ import java.util.Map;
  * 0x0A        SHAPE_DELETE  – server confirms deletion; broadcast to all peers (payload: shapeId)
  * 0x0B        TEXT_UPDATE   – ephemeral live-typing event; relayed to all peers without persistence
  *                             payload: { objectId, clientId, x, y, currentText }
+ * 0x0C        LOBBY_STATE   – server→client: JSON list of { roomId, userCount } for discovery
+ * 0x0D        JOIN_ROOM     – client→server: JSON string roomId to leave lobby and enter a room
+ * 0x0E        LEAVE_ROOM    – client→server: return to lobby (empty payload)
  * </pre>
  */
 public enum MessageType {
@@ -36,7 +39,10 @@ public enum MessageType {
     CLEAR_USER_SHAPES((byte) 0x08),
     UNDO_REQUEST((byte) 0x09),
     SHAPE_DELETE((byte) 0x0A),
-    TEXT_UPDATE ((byte) 0x0B);
+    TEXT_UPDATE ((byte) 0x0B),
+    LOBBY_STATE ((byte) 0x0C),
+    JOIN_ROOM   ((byte) 0x0D),
+    LEAVE_ROOM  ((byte) 0x0E);
 
     private final byte wireCode;
 
