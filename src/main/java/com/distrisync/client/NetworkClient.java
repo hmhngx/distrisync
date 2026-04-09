@@ -86,8 +86,9 @@ public final class NetworkClient implements AutoCloseable {
      * Read accumulation buffer capacity per channel.
      *
      * Must be able to hold the largest single frame in one contiguous buffer.
-     * Snapshots for rooms with many persisted shapes can exceed 64 KiB, so use
-     * protocol max payload + header to avoid permanent partial-frame stalls.
+     * Snapshots for rooms with many persisted shapes can exceed
+     * {@link MessageCodec#LEGACY_CLIENT_READ_BUFFER_BYTES}, so use protocol max
+     * payload + header to avoid permanent partial-frame stalls.
      */
     private static final int READ_BUFFER_CAPACITY =
             MessageCodec.MAX_PAYLOAD_BYTES + MessageCodec.HEADER_BYTES;

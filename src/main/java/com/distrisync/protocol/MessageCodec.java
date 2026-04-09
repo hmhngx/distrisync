@@ -14,6 +14,8 @@ import java.util.List;
 import java.util.UUID;
 
 import com.google.gson.reflect.TypeToken;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Stateless utility that encodes/decodes DistriSync binary frames.
@@ -41,6 +43,8 @@ import com.google.gson.reflect.TypeToken;
  */
 public final class MessageCodec {
 
+    private static final Logger log = LoggerFactory.getLogger(MessageCodec.class);
+
     /** Fixed header size: 1 byte type + 4 bytes length. */
     public static final int HEADER_BYTES = 5;
 
@@ -49,6 +53,13 @@ public final class MessageCodec {
      * that declare an absurdly large length before we attempt an allocation.
      */
     public static final int MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
+
+    /**
+     * Historical {@link com.distrisync.client.NetworkClient} read accumulator size.
+     * Frames with a UTF-8 payload larger than this could not be decoded until the
+     * buffer was enlarged; we log a warning so logs point at the failure mode.
+     */
+    public static final int LEGACY_CLIENT_READ_BUFFER_BYTES = 64 * 1024;
 
     private static final Gson GSON = new GsonBuilder()
             .serializeNulls()
@@ -181,6 +192,16 @@ public final class MessageCodec {
 
             // --- Resolve type (after all reads so partial-read rewind stays valid)
             MessageType type = MessageType.fromWireCode(typeByte);
+
+            if (payloadLength > LEGACY_CLIENT_READ_BUFFER_BYTES) {
+                log.warn(
+                        "Inbound frame payload {} bytes exceeds legacy {} KiB client read buffer — "
+                                + "SNAPSHOT/join can stall on old clients (type={}, totalFrame≈{} bytes)",
+                        payloadLength,
+                        LEGACY_CLIENT_READ_BUFFER_BYTES / 1024,
+                        type,
+                        HEADER_BYTES + payloadLength);
+            }
 
             return new Message(type, payload);
 
