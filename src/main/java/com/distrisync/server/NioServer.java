@@ -19,6 +19,7 @@ import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -48,9 +49,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *   <li><b>LEAVE_ROOM</b> – client returns to the lobby and receives a fresh
  *       {@code LOBBY_STATE}.</li>
  *   <li><b>Read / mutation</b> – subsequent frames are dispatched to the
- *       room identified by {@code session.roomId}.  Mutations go through
- *       the room's own {@link CanvasStateManager} and are broadcast only to
- *       other clients in the <em>same room</em>.</li>
+ *       room ({@code session.roomId}) and board ({@code session.currentBoardId}).
+ *       Durable canvas ops use {@link RoomContext#getBoard}; relayed frames are
+ *       broadcast only to peers in the same room <em>and</em> board.</li>
  *   <li><b>Write</b> – {@code OP_WRITE} is armed only when a previous write
  *       was partial (TCP send-buffer full).</li>
  *   <li><b>Disconnect</b> – the key is removed from the lobby or its canvas
@@ -274,6 +275,7 @@ public final class NioServer implements Runnable {
                 session.authorName = hp.authorName();
                 session.clientId   = hp.clientId();
                 session.roomId     = "";
+                session.currentBoardId = "";
                 session.handshakeComplete = true;
 
                 roomManager.registerHandshakeToLobby(senderKey);
@@ -287,14 +289,14 @@ public final class NioServer implements Runnable {
                     log.warn("JOIN_ROOM before HANDSHAKE session={}", session.sessionId);
                     break;
                 }
-                String raw;
+                MessageCodec.JoinRoomPayload jp;
                 try {
-                    raw = MessageCodec.decodeJoinRoom(msg);
+                    jp = MessageCodec.decodeJoinRoom(msg);
                 } catch (Exception e) {
                     log.warn("Malformed JOIN_ROOM session={}: {}", session.sessionId, e.getMessage());
                     break;
                 }
-                String rid = raw != null ? raw.strip() : "";
+                String rid = jp.roomId();
                 if (rid.isBlank()) {
                     log.warn("Blank JOIN_ROOM session={}", session.sessionId);
                     break;
@@ -302,8 +304,11 @@ public final class NioServer implements Runnable {
                 try {
                     RoomContext room = roomManager.assignClientToRoom(senderKey, rid, session.roomId);
                     session.roomId = rid;
+                    session.currentBoardId = jp.initialBoardId();
                     sendSnapshot(session, senderKey, room);
-                    log.info("JOIN_ROOM session={} roomId='{}'", session.sessionId, rid);
+                    broadcastBoardList(room);
+                    log.info("JOIN_ROOM session={} roomId='{}' boardId='{}'",
+                            session.sessionId, rid, session.currentBoardId);
                 } catch (IllegalArgumentException e) {
                     log.warn("JOIN_ROOM rejected session={}: {}", session.sessionId, e.getMessage());
                 }
@@ -320,12 +325,17 @@ public final class NioServer implements Runnable {
                 String cur = session.roomId;
                 roomManager.returnClientToLobby(senderKey, cur);
                 session.roomId = "";
+                session.currentBoardId = "";
                 log.info("LEAVE_ROOM session={} → lobby", session.sessionId);
             }
 
             case MUTATION -> {
                 RoomContext room = resolveRoom(session, senderKey);
                 if (room == null) return;
+                if (session.currentBoardId.isBlank()) {
+                    log.warn("MUTATION with no active board session={} — ignoring", session.sessionId);
+                    return;
+                }
 
                 Shape shape;
                 try {
@@ -336,19 +346,21 @@ public final class NioServer implements Runnable {
                     return;
                 }
 
-                boolean applied = room.stateManager.applyMutation(shape);
+                CanvasStateManager board = room.getBoard(session.currentBoardId);
+                boolean applied = board.applyMutation(shape);
 
                 if (applied) {
-                    log.info("MUTATION accepted  type={} id={} ts={} author='{}' room='{}' from={}",
+                    log.info("MUTATION accepted  type={} id={} ts={} author='{}' room='{}' board='{}' from={}",
                             shape.getClass().getSimpleName(), shape.objectId(),
-                            shape.timestamp(), shape.authorName(), session.roomId, session.sessionId);
+                            shape.timestamp(), shape.authorName(), session.roomId, session.currentBoardId,
+                            session.sessionId);
 
                     // Persist to WAL before broadcasting so the record survives a crash
                     // between the apply and the broadcast.
-                    roomManager.appendToWal(session.roomId, msg);
+                    roomManager.appendToWal(session.roomId, session.currentBoardId, msg);
 
                     ByteBuffer frame = MessageCodec.encode(msg);
-                    broadcastToRoom(session.roomId, frame, senderKey);
+                    broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey);
                 } else {
                     log.debug("MUTATION rejected (stale)  id={} from={}", shape.objectId(), session.sessionId);
                 }
@@ -357,22 +369,36 @@ public final class NioServer implements Runnable {
             case SHAPE_START, SHAPE_UPDATE, SHAPE_COMMIT -> {
                 RoomContext room = resolveRoom(session, senderKey);
                 if (room == null) return;
-                log.debug("{} relayed  room='{}' from session={}", msg.type(), session.roomId, session.sessionId);
+                if (session.currentBoardId.isBlank()) {
+                    log.warn("{} with no active board session={} — ignoring", msg.type(), session.sessionId);
+                    return;
+                }
+                log.debug("{} relayed  room='{}' board='{}' from session={}",
+                        msg.type(), session.roomId, session.currentBoardId, session.sessionId);
                 ByteBuffer frame = MessageCodec.encode(msg);
-                broadcastToRoom(session.roomId, frame, senderKey);
+                broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey);
             }
 
             case TEXT_UPDATE -> {
                 RoomContext room = resolveRoom(session, senderKey);
                 if (room == null) return;
-                log.debug("TEXT_UPDATE relayed  room='{}' from session={}", session.roomId, session.sessionId);
+                if (session.currentBoardId.isBlank()) {
+                    log.warn("TEXT_UPDATE with no active board session={} — ignoring", session.sessionId);
+                    return;
+                }
+                log.debug("TEXT_UPDATE relayed  room='{}' board='{}' from session={}",
+                        session.roomId, session.currentBoardId, session.sessionId);
                 ByteBuffer frame = MessageCodec.encode(msg);
-                broadcastToRoom(session.roomId, frame, senderKey);
+                broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey);
             }
 
             case CLEAR_USER_SHAPES -> {
                 RoomContext room = resolveRoom(session, senderKey);
                 if (room == null) return;
+                if (session.currentBoardId.isBlank()) {
+                    log.warn("CLEAR_USER_SHAPES with no active board session={} — ignoring", session.sessionId);
+                    return;
+                }
 
                 String targetClientId;
                 try {
@@ -381,20 +407,25 @@ public final class NioServer implements Runnable {
                     log.warn("Malformed CLEAR_USER_SHAPES payload from session={}: {}", session.sessionId, e.getMessage());
                     return;
                 }
-                room.stateManager.clearUserShapes(targetClientId);
-                log.info("CLEAR_USER_SHAPES  room='{}' from session={} targetClientId='{}'",
-                        session.roomId, session.sessionId, targetClientId);
+                CanvasStateManager board = room.getBoard(session.currentBoardId);
+                board.clearUserShapes(targetClientId);
+                log.info("CLEAR_USER_SHAPES  room='{}' board='{}' from session={} targetClientId='{}'",
+                        session.roomId, session.currentBoardId, session.sessionId, targetClientId);
 
                 // Persist to WAL so the per-user purge survives a restart.
-                roomManager.appendToWal(session.roomId, msg);
+                roomManager.appendToWal(session.roomId, session.currentBoardId, msg);
 
                 ByteBuffer frame = MessageCodec.encodeClearUserShapes(targetClientId);
-                broadcastToRoom(session.roomId, frame, senderKey);
+                broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey);
             }
 
             case UNDO_REQUEST -> {
                 RoomContext room = resolveRoom(session, senderKey);
                 if (room == null) return;
+                if (session.currentBoardId.isBlank()) {
+                    log.warn("UNDO_REQUEST with no active board session={} — ignoring", session.sessionId);
+                    return;
+                }
 
                 UUID shapeId;
                 try {
@@ -405,10 +436,11 @@ public final class NioServer implements Runnable {
                     return;
                 }
 
-                boolean deleted = room.stateManager.deleteShape(shapeId);
+                CanvasStateManager board = room.getBoard(session.currentBoardId);
+                boolean deleted = board.deleteShape(shapeId);
                 if (deleted) {
-                    log.info("UNDO_REQUEST accepted  shapeId={} room='{}' author='{}' session={}",
-                            shapeId, session.roomId, session.authorName, session.sessionId);
+                    log.info("UNDO_REQUEST accepted  shapeId={} room='{}' board='{}' author='{}' session={}",
+                            shapeId, session.roomId, session.currentBoardId, session.authorName, session.sessionId);
                     record ShapeDeletePayload(String shapeId) {}
                     var deletePayload = new ShapeDeletePayload(shapeId.toString());
                     Message deleteMsg = new Message(
@@ -416,14 +448,42 @@ public final class NioServer implements Runnable {
 
                     // Persist the SHAPE_DELETE outcome (not the UNDO_REQUEST trigger) so
                     // recovery can apply a clean deleteShape() without re-evaluating intent.
-                    roomManager.appendToWal(session.roomId, deleteMsg);
+                    roomManager.appendToWal(session.roomId, session.currentBoardId, deleteMsg);
 
                     ByteBuffer frame = MessageCodec.encode(deleteMsg);
-                    broadcastToRoom(session.roomId, frame, senderKey);
+                    broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey);
                 } else {
                     log.debug("UNDO_REQUEST no-op (shape not found)  shapeId={} session={}",
                             shapeId, session.sessionId);
                 }
+            }
+
+            case SWITCH_BOARD -> {
+                if (!session.handshakeComplete) {
+                    log.warn("SWITCH_BOARD before HANDSHAKE session={}", session.sessionId);
+                    break;
+                }
+                RoomContext room = resolveRoom(session, senderKey);
+                if (room == null) return;
+                String boardId;
+                try {
+                    boardId = MessageCodec.decodeSwitchBoard(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed SWITCH_BOARD session={}: {}", session.sessionId, e.getMessage());
+                    break;
+                }
+                String bid = boardId != null ? boardId.strip() : "";
+                if (bid.isBlank()) {
+                    log.warn("Blank SWITCH_BOARD session={}", session.sessionId);
+                    break;
+                }
+                boolean boardExisted = room.getActiveBoardIds().contains(bid);
+                session.currentBoardId = bid;
+                sendSnapshot(session, senderKey, room);
+                if (!boardExisted) {
+                    broadcastBoardList(room);
+                }
+                log.info("SWITCH_BOARD session={} room='{}' boardId='{}'", session.sessionId, session.roomId, bid);
             }
 
             case LOBBY_STATE -> log.trace("Ignoring client-originated LOBBY_STATE echo session={}", session.sessionId);
@@ -461,7 +521,7 @@ public final class NioServer implements Runnable {
      * enqueues it for delivery to the newly joined session.
      */
     private void sendSnapshot(ClientSession session, SelectionKey key, RoomContext room) {
-        List<Shape> shapes = room.stateManager.snapshot();
+        List<Shape> shapes = room.getBoard(session.currentBoardId).snapshot();
         String payload = ShapeCodec.encodeSnapshot(shapes);
         Message snapshotMsg = new Message(MessageType.SNAPSHOT, payload);
         ByteBuffer frame = MessageCodec.encode(snapshotMsg);
@@ -513,7 +573,7 @@ public final class NioServer implements Runnable {
     }
 
     // =========================================================================
-    // Room-scoped broadcast
+    // Room + board scoped broadcast
     // =========================================================================
 
     /**
@@ -526,14 +586,15 @@ public final class NioServer implements Runnable {
      * to avoid a {@link java.util.ConcurrentModificationException}.
      *
      * @param roomId    the target room identifier
+     * @param boardId   only clients whose {@link ClientSession#currentBoardId} matches
      * @param frame     the encoded binary frame to deliver (read-mode)
      * @param senderKey the originating client's key; excluded from delivery
      */
-    private void broadcastToRoom(String roomId, ByteBuffer frame, SelectionKey senderKey) {
+    private void broadcastToBoard(String roomId, String boardId, ByteBuffer frame, SelectionKey senderKey) {
         var activeKeys = roomManager.getActiveClientKeys(roomId);
         if (activeKeys.isEmpty()) {
             if (roomManager.getRoom(roomId) == null) {
-                log.warn("broadcastToRoom called for unknown roomId='{}'", roomId);
+                log.warn("broadcastToBoard called for unknown roomId='{}'", roomId);
             }
             return;
         }
@@ -547,6 +608,10 @@ public final class NioServer implements Runnable {
             }
 
             ClientSession session = (ClientSession) key.attachment();
+            if (!boardId.equals(session.currentBoardId)) {
+                continue;
+            }
+
             session.enqueue(frame);
 
             if (!flushWriteQueue(session, key)) {
@@ -556,7 +621,39 @@ public final class NioServer implements Runnable {
             }
         }
 
-        log.debug("Room broadcast  roomId='{}' recipients={}", roomId, recipientCount);
+        log.debug("Board broadcast  roomId='{}' boardId='{}' recipients={}", roomId, boardId, recipientCount);
+        toClose.forEach(this::closeKey);
+    }
+
+    /**
+     * Broadcasts {@link MessageType#BOARD_LIST_UPDATE} to every TCP client currently in
+     * {@code room} (all boards). Uses a deterministic lexicographic ordering of ids on the wire.
+     */
+    private void broadcastBoardList(RoomContext room) {
+        List<String> ids = new ArrayList<>(room.getActiveBoardIds());
+        Collections.sort(ids);
+        ByteBuffer frame = MessageCodec.encodeBoardListUpdate(ids);
+
+        List<SelectionKey> toClose = new ArrayList<>();
+        int recipientCount = 0;
+
+        for (SelectionKey key : room.getActiveKeys()) {
+            if (!key.isValid()) {
+                continue;
+            }
+            if (!(key.attachment() instanceof ClientSession peer)) {
+                continue;
+            }
+            peer.enqueue(frame);
+            if (!flushWriteQueue(peer, key)) {
+                toClose.add(key);
+            } else {
+                recipientCount++;
+            }
+        }
+
+        log.debug("BOARD_LIST_UPDATE fan-out  roomId='{}' boardCount={} recipients={}",
+                room.roomId, ids.size(), recipientCount);
         toClose.forEach(this::closeKey);
     }
 

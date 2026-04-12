@@ -13,7 +13,9 @@
 
 DistriSync is a peer-class distributed collaborative whiteboard built entirely on a custom Java NIO server — no third-party real-time framework. The server runs a single-threaded `java.nio.channels.Selector` event loop that accepts connections, multiplexes reads and writes, and fans out shape mutations to all connected clients with zero blocking I/O on the hot path. Accepted `SocketChannel` instances are configured with `TCP_NODELAY = true` and 64 KiB socket buffers to minimise Nagle-induced latency, enabling sub-frame delivery of stroke data across a local network. A length-prefixed binary frame (1-byte type tag + 4-byte big-endian payload length + UTF-8 JSON body) with a 16 MiB hard ceiling governs every exchange between server and clients, providing deterministic parse complexity regardless of payload size.
 
-The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.css` design system — a flat, neutral-toned control panel with uniform spacing and hover states. A layered canvas architecture (base paint layer → remote transient layer → local transient layer → cursor overlay → control pane) ensures that in-progress strokes from remote peers are rendered live without flickering or compositing artefacts. A parallel UDP multicast channel (`239.255.42.42:9292`) carries ephemeral pointer positions at 20 Hz, giving all peers real-time cursor presence without touching the TCP state machine. Shared canvas authority is implemented via last-writer-wins using Lamport-ish per-shape timestamps enforced atomically inside a `ConcurrentHashMap`, so concurrent edits converge without a central lock. Room-scoped state is durably persisted to a per-room Write-Ahead Log (WAL) so that a server restart reconstructs every room's canvas from the on-disk record before the first reconnecting client joins.
+The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.css` design system — a flat, neutral-toned control panel with uniform spacing and hover states. A layered canvas architecture (base paint layer → remote transient layer → local transient layer → cursor overlay → control pane) ensures that in-progress strokes from remote peers are rendered live without flickering or compositing artefacts. A parallel UDP multicast channel (`239.255.42.42:9292`) carries ephemeral pointer positions at 20 Hz, giving all peers real-time cursor presence without touching the TCP state machine. Shared canvas authority is implemented via last-writer-wins using Lamport-ish per-shape timestamps enforced atomically inside a `ConcurrentHashMap`, so concurrent edits converge without a central lock.
+
+**Workspace Boards:** Rooms now support multiple isolated boards within a single shared space. Each board maintains its own independent `CanvasStateManager` and Write-Ahead Log (`{roomId}_{boardId}.wal`), enabling zero-overhead board creation and persistent recovery. Clients receive a `BOARD_LIST_UPDATE` on join and whenever a new board is created; the `SWITCH_BOARD` message allows in-room navigation between boards. Shape mutations are scoped to the active board and broadcast only to connected peers viewing the same board, preventing cross-board interference. A Figma-style Task View board switcher with live thumbnails facilitates rapid board discovery and navigation.
 
 ---
 
@@ -41,9 +43,9 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Pointer State Management** — `PointerStateManager` maintains a `ConcurrentHashMap<String, PointerState>` of active remote cursors with a clock-injectable eviction model. `PointerState` is an immutable record (`clientId`, `x`, `y`, `lastUpdatedAt`). Entries older than 500 ms are removed by `evictStalePointers()`, which is driven by the JavaFX `AnimationTimer` render loop, keeping cursor overlays consistent with actual presence.
 
-- **Session Multiplexing (Rooms)** — `RoomManager` maintains a `ConcurrentHashMap<String, RoomContext>` of isolated rooms, each owning a dedicated `CanvasStateManager` and a `ConcurrentHashMap`-backed `Set<SelectionKey>`. Rooms are created lazily on first client join and become quiescent (not garbage-collected) when their last client disconnects, so rejoining clients always receive the canvas they left. `RoomContext` scopes all broadcasts so that mutations in one room are never visible to clients in another.
+- **Session Multiplexing (Rooms & Boards)** — `RoomManager` maintains a `ConcurrentHashMap<String, RoomContext>` of isolated rooms; each `RoomContext` hosts a `ConcurrentHashMap<String, CanvasStateManager>` of independent boards (created lazily per board ID on first access). Rooms are created on first client join and persist even when empty, allowing clients to rejoin and find their original canvas state. Within each room, clients switch boards via `SWITCH_BOARD`, triggering a fresh `SNAPSHOT` and optional `BOARD_LIST_UPDATE`. `NioServer` routes all mutations, live strokes, and relayed frames to peers on the same board (not just the room), providing true board-level isolation.
 
-- **Write-Ahead Log (WAL) with Crash Recovery** — `WalManager` appends every accepted state-mutating frame (`MUTATION`, `SHAPE_DELETE`, `CLEAR_USER_SHAPES`) to a per-room `{roomId}.wal` file under `distrisync-data/` using `FileChannel` in `APPEND` mode. On server restart, `RoomContext` calls `WalManager.recover(roomId)` before any client joins: frames are decoded sequentially from a heap `ByteBuffer`; a truncated tail frame — the typical artefact of a mid-write crash — is silently tolerated and recovery stops at the corrupt offset, returning the clean prefix. Room identifiers are sanitised (`[^a-zA-Z0-9_\-]` → `_`) before use as filenames to prevent path traversal.
+- **Write-Ahead Log (WAL) with Crash Recovery** — `WalManager` appends every accepted state-mutating frame (`MUTATION`, `SHAPE_DELETE`, `CLEAR_USER_SHAPES`) to a per-room, per-board `{roomId}_{boardId}.wal` file under `distrisync-data/` using `FileChannel` in `APPEND` mode. Boards are replayed lazily when first opened via `RoomContext.getBoard(boardId)`: frames are decoded sequentially from a heap `ByteBuffer`; a truncated tail frame — the typical artefact of a mid-write crash — is silently tolerated and recovery stops at the corrupt offset, returning the clean prefix. Room and board identifiers are sanitised (`[^a-zA-Z0-9_\-]` → `_`) before use as filenames to prevent path traversal.
 
 - **Last-Writer-Wins Convergence** — `CanvasStateManager` uses `ConcurrentHashMap.compute` with a strictly-greater-timestamp guard, so concurrent mutations from multiple peers converge without server-side locking or operational transforms.
 
@@ -51,7 +53,7 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Lobby Discovery & Room Management (`LOBBY_STATE` / `JOIN_ROOM` / `LEAVE_ROOM`)** — clients connect to a lobby state and receive periodic `LOBBY_STATE` broadcasts listing all active rooms with live user counts. `JOIN_ROOM` transitions a client from lobby into a specific room's canvas; `LEAVE_ROOM` returns to the lobby. The server maintains a single global lobby session for discovery and scoped room sessions for drawing, allowing efficient multi-room deployments with isolated state per room.
 
-- **Idle Room Eviction & Storage Lifecycle** — `StorageLifecycleManager` is a background daemon that runs a garbage-collection sweep every 60 seconds, evicting rooms with zero active clients and idle longer than 5 minutes. Evicted rooms are removed from the in-memory `RoomManager` registry to reclaim heap, while their WAL files are preserved on disk for potential manual recovery. Connected clients are never evicted regardless of inactivity, ensuring users in an open drawing session are never interrupted.
+- **Idle Room Eviction & Storage Lifecycle** — `StorageLifecycleManager` is a background daemon that runs a garbage-collection sweep every 60 seconds, evicting rooms with zero active clients and idle longer than 5 minutes. Evicted rooms are removed from the in-memory `RoomManager` registry to reclaim heap, while all per-board WAL files are preserved on disk for potential manual recovery. Connected clients are never evicted regardless of inactivity, ensuring users in an open drawing session are never interrupted. New boards within an existing room are created on-demand with no eviction overhead.
 
 ---
 
@@ -116,19 +118,21 @@ distrisync/
 | `MessageType` | Byte | Direction | Persisted to WAL | Description |
 |---|---|---|---|---|
 | `HANDSHAKE` | `0x01` | C → S | No | Client identification (`clientId`, `authorName`) |
-| `SNAPSHOT` | `0x02` | S → C | No | Full canvas state on connect / reconnect |
-| `MUTATION` | `0x03` | C ↔ S | **Yes** | Committed shape add/update; broadcast to room peers |
+| `SNAPSHOT` | `0x02` | S → C | No | Full canvas state on connect / reconnect / board switch |
+| `MUTATION` | `0x03` | C ↔ S | **Yes** | Committed shape add/update; broadcast to board peers |
 | `UDP_POINTER` | `0x04` | UDP only | No | Ephemeral cursor position (multicast, not TCP) |
-| `SHAPE_START` | `0x05` | C ↔ S | No | Begin live stroke; relayed, not persisted |
-| `SHAPE_UPDATE` | `0x06` | C ↔ S | No | Incremental stroke points; relayed, not persisted |
+| `SHAPE_START` | `0x05` | C ↔ S | No | Begin live stroke; relayed to board peers, not persisted |
+| `SHAPE_UPDATE` | `0x06` | C ↔ S | No | Incremental stroke points; relayed to board peers, not persisted |
 | `SHAPE_COMMIT` | `0x07` | C ↔ S | No | Finalise live stroke; peer dismisses transient layer |
-| `CLEAR_USER_SHAPES` | `0x08` | C ↔ S | **Yes** | Remove all shapes owned by a specific `clientId` |
-| `UNDO_REQUEST` | `0x09` | C → S | No | Request last-shape deletion |
+| `CLEAR_USER_SHAPES` | `0x08` | C ↔ S | **Yes** | Remove all shapes owned by a specific `clientId` on active board |
+| `UNDO_REQUEST` | `0x09` | C → S | No | Request last-shape deletion from active board |
 | `SHAPE_DELETE` | `0x0A` | S → C | **Yes** | Broadcast shape removal after undo |
-| `TEXT_UPDATE` | `0x0B` | C ↔ S | No | Live text ghost preview; relayed, not persisted |
+| `TEXT_UPDATE` | `0x0B` | C ↔ S | No | Live text ghost preview; relayed to board peers, not persisted |
 | `LOBBY_STATE` | `0x0C` | S → C | No | JSON array of `{ roomId, userCount }` for room discovery |
-| `JOIN_ROOM` | `0x0D` | C → S | No | Transition from lobby to a named room |
+| `JOIN_ROOM` | `0x0D` | C → S | No | JSON object `{ roomId, initialBoardId? }` (legacy JSON string roomId accepted); defaults to `Board-1` |
 | `LEAVE_ROOM` | `0x0E` | C → S | No | Return from a room to lobby (empty payload) |
+| `SWITCH_BOARD` | `0x0F` | C → S | No | JSON string target board id; server responds with SNAPSHOT |
+| `BOARD_LIST_UPDATE` | `0x10` | S → C | No | JSON array of board id strings actively in use within the room |
 
 ---
 
@@ -163,7 +167,7 @@ The server binds on TCP port **9090** by default. An optional positional argumen
 **Default port (9090):**
 
 ```powershell
-mvn exec:java -Dexec.mainClass=com.distrisync.server.WhiteboardServer
+mvn exec:java "-Dexec.mainClass=com.distrisync.server.WhiteboardServer"
 ```
 
 **Custom port (e.g., 8080):**
