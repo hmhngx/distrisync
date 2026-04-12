@@ -5,8 +5,12 @@ import com.distrisync.model.EraserPath;
 import com.distrisync.model.Line;
 import com.distrisync.model.Shape;
 import com.distrisync.model.TextNode;
+import javafx.animation.Animation;
 import javafx.animation.AnimationTimer;
+import javafx.animation.FadeTransition;
+import javafx.animation.Interpolator;
 import javafx.animation.PauseTransition;
+import javafx.animation.TranslateTransition;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
@@ -15,13 +19,18 @@ import javafx.geometry.Rectangle2D;
 import javafx.scene.Cursor;
 import javafx.scene.Scene;
 import javafx.scene.canvas.Canvas;
+import javafx.scene.effect.GaussianBlur;
+import javafx.scene.image.Image;
+import javafx.scene.image.ImageView;
 import javafx.scene.canvas.GraphicsContext;
 import javafx.scene.control.Button;
 import javafx.scene.control.ColorPicker;
+import javafx.scene.control.DialogPane;
 import javafx.scene.control.Label;
 import javafx.scene.control.ScrollPane;
 import javafx.scene.control.Slider;
 import javafx.scene.control.TextField;
+import javafx.scene.control.TextInputDialog;
 import javafx.scene.control.ToggleButton;
 import javafx.scene.control.ToggleGroup;
 import javafx.scene.control.Tooltip;
@@ -29,6 +38,7 @@ import javafx.scene.input.KeyCode;
 import javafx.util.Duration;
 import javafx.scene.Parent;
 import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.FlowPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Pane;
 import javafx.scene.layout.Priority;
@@ -53,8 +63,11 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -154,6 +167,22 @@ public class WhiteboardApp extends Application {
     private Scene   loginScene;
     private Scene   lobbyScene;
     private Scene   canvasScene;
+    /** Root {@link StackPane} of {@link #canvasScene} — hosts overlay and floating board switcher control. */
+    private StackPane canvasSceneRoot;
+    /** Full-screen Task View–style board picker; added/removed from {@link #canvasSceneRoot} when toggled. */
+    private StackPane switcherOverlay;
+    private FlowPane  switcherBoardGrid;
+    /** Thumbnails captured from {@link #baseCanvas} before leaving each board (FX thread only). */
+    private final Map<String, Image> boardSnapshots = new HashMap<>();
+    private final GaussianBlur boardSwitcherCanvasBlur = new GaussianBlur(14);
+    /** Canvas layer stack — target for snapshot fade transitions. */
+    private StackPane canvasStackPane;
+    /** In-flight snapshot hydration fade; stopped when a newer SNAPSHOT arrives. */
+    private Animation snapshotHydrationAnimation;
+    /** Bumped on each SNAPSHOT so stale fade callbacks do not paint after a newer snapshot. */
+    private long snapshotHydrationToken;
+    /** Collapsible tools sidebar — open by default; slides off-screen when collapsed. */
+    private boolean isSidebarOpen = true;
     private VBox    lobbyRoomList;
     private Label   lobbyEmptyStateLabel;
     private Label   lobbyStatusLabel;
@@ -232,26 +261,82 @@ public class WhiteboardApp extends Application {
         controlPane.setStyle("-fx-background-color: transparent;");
 
         // ── Stack all five layers ─────────────────────────────────────────────
-        StackPane canvasStack = new StackPane(
+        canvasStackPane = new StackPane(
                 baseCanvas, remoteTransientCanvas, transientCanvas, cursorPane, controlPane);
 
         // Bind canvas dimensions to the StackPane so they resize with the window
-        baseCanvas.widthProperty().bind(canvasStack.widthProperty());
-        baseCanvas.heightProperty().bind(canvasStack.heightProperty());
-        remoteTransientCanvas.widthProperty().bind(canvasStack.widthProperty());
-        remoteTransientCanvas.heightProperty().bind(canvasStack.heightProperty());
-        transientCanvas.widthProperty().bind(canvasStack.widthProperty());
-        transientCanvas.heightProperty().bind(canvasStack.heightProperty());
-        cursorPane.prefWidthProperty().bind(canvasStack.widthProperty());
-        cursorPane.prefHeightProperty().bind(canvasStack.heightProperty());
-        controlPane.prefWidthProperty().bind(canvasStack.widthProperty());
-        controlPane.prefHeightProperty().bind(canvasStack.heightProperty());
+        baseCanvas.widthProperty().bind(canvasStackPane.widthProperty());
+        baseCanvas.heightProperty().bind(canvasStackPane.heightProperty());
+        remoteTransientCanvas.widthProperty().bind(canvasStackPane.widthProperty());
+        remoteTransientCanvas.heightProperty().bind(canvasStackPane.heightProperty());
+        transientCanvas.widthProperty().bind(canvasStackPane.widthProperty());
+        transientCanvas.heightProperty().bind(canvasStackPane.heightProperty());
+        cursorPane.prefWidthProperty().bind(canvasStackPane.widthProperty());
+        cursorPane.prefHeightProperty().bind(canvasStackPane.heightProperty());
+        controlPane.prefWidthProperty().bind(canvasStackPane.widthProperty());
+        controlPane.prefHeightProperty().bind(canvasStackPane.heightProperty());
 
-        // ── Root layout ───────────────────────────────────────────────────────
-        BorderPane root = new BorderPane();
-        root.setLeft(buildToolbar());
-        root.setCenter(canvasStack);
-        root.setStyle("-fx-background-color: " + BG_BASE + ";");
+        VBox canvasColumn = new VBox(canvasStackPane);
+        VBox.setVgrow(canvasStackPane, Priority.ALWAYS);
+        canvasColumn.setMaxWidth(Double.MAX_VALUE);
+        canvasColumn.setMaxHeight(Double.MAX_VALUE);
+
+        // ── Root layout — StackPane: canvas fills; sidebar + toggle float TOP_LEFT ─
+        canvasSceneRoot = new StackPane();
+        canvasSceneRoot.setStyle("-fx-background-color: " + BG_BASE + ";");
+
+        BorderPane sidebarPane = buildToolbar();
+
+        ToggleButton sidebarToggle = new ToggleButton("<<");
+        sidebarToggle.setFocusTraversable(false);
+        sidebarToggle.getStyleClass().add("sidebar-toggle-btn");
+        sidebarToggle.setMnemonicParsing(false);
+        sidebarToggle.setSelected(true);
+
+        HBox sidebarOverlay = new HBox(0, sidebarPane, sidebarToggle);
+        sidebarOverlay.setAlignment(Pos.TOP_LEFT);
+        sidebarOverlay.setPickOnBounds(false);
+        sidebarOverlay.prefHeightProperty().bind(canvasSceneRoot.heightProperty());
+        sidebarPane.prefHeightProperty().bind(canvasSceneRoot.heightProperty());
+        sidebarPane.maxHeightProperty().bind(canvasSceneRoot.heightProperty());
+        sidebarPane.minHeightProperty().bind(canvasSceneRoot.heightProperty());
+
+        TranslateTransition sidebarSlide = new TranslateTransition(Duration.millis(250), sidebarOverlay);
+        sidebarSlide.setInterpolator(Interpolator.EASE_BOTH);
+        sidebarToggle.setOnAction(e -> {
+            sidebarSlide.stop();
+            double w = sidebarPane.getWidth();
+            if (w <= 0 || Double.isNaN(w)) {
+                w = TOOLBAR_WIDTH;
+            }
+            isSidebarOpen = sidebarToggle.isSelected();
+            if (isSidebarOpen) {
+                sidebarSlide.setToX(0);
+                sidebarToggle.setText("<<");
+            } else {
+                sidebarSlide.setToX(-w);
+                sidebarToggle.setText(">>");
+            }
+            sidebarSlide.play();
+        });
+
+        buildBoardSwitcherOverlay();
+
+        StackPane boardsBtnLayer = new StackPane();
+        boardsBtnLayer.setPickOnBounds(false);
+        boardsBtnLayer.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
+        Button boardsTrigger = new Button("Boards ▾");
+        boardsTrigger.setFocusTraversable(false);
+        boardsTrigger.setMnemonicParsing(false);
+        boardsTrigger.getStyleClass().add("boards-switcher-trigger");
+        StackPane.setAlignment(boardsTrigger, Pos.TOP_CENTER);
+        StackPane.setMargin(boardsTrigger, new Insets(10, 0, 0, 0));
+        boardsTrigger.setOnAction(e -> toggleBoardSwitcher());
+        boardsBtnLayer.getChildren().add(boardsTrigger);
+
+        canvasSceneRoot.getChildren().addAll(canvasColumn, sidebarOverlay, boardsBtnLayer);
+        StackPane.setAlignment(canvasColumn, Pos.TOP_LEFT);
+        StackPane.setAlignment(sidebarOverlay, Pos.TOP_LEFT);
 
         // ── Ownership tooltip — shown when hovering over a committed shape ────
         ownerTooltip = new Tooltip();
@@ -266,13 +351,23 @@ public class WhiteboardApp extends Application {
         double canvasH = Math.clamp(visual.getHeight() * 0.90, 420, 920);
         canvasW = Math.min(canvasW, visual.getWidth() - 8);
         canvasH = Math.min(canvasH, visual.getHeight() - 32);
-        canvasScene = new Scene(root, canvasW, canvasH);
+        canvasScene = new Scene(canvasSceneRoot, canvasW, canvasH);
         canvasScene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
 
-        // ── Ctrl+Z keyboard shortcut for undo (canvas scene only) ─────────────
+        // ── Canvas scene shortcuts: undo, board switcher, dismiss overlay ───────
         canvasScene.setOnKeyPressed(e -> {
             if (e.isControlDown() && e.getCode() == KeyCode.Z) {
                 undoLastShape();
+                return;
+            }
+            if (e.getCode() == KeyCode.ESCAPE && isBoardSwitcherShowing()) {
+                hideBoardSwitcher();
+                e.consume();
+                return;
+            }
+            if (e.isControlDown() && e.getCode() == KeyCode.TAB) {
+                toggleBoardSwitcher();
+                e.consume();
             }
         });
 
@@ -339,9 +434,297 @@ public class WhiteboardApp extends Application {
         setupEraserCursor();
 
         // Wire all mouse events to the StackPane (always hit-testable)
-        wireMouseEvents(canvasStack);
+        wireMouseEvents(canvasStackPane);
 
         startRenderLoop();
+    }
+
+    /**
+     * Ordered board ids for the switcher grid: server list plus current board if missing
+     * (race between SNAPSHOT and {@code BOARD_LIST_UPDATE}).
+     */
+    private List<String> resolveKnownBoardIdsForSwitcher() {
+        List<String> boards = new ArrayList<>();
+        if (networkClient != null) {
+            for (String boardId : networkClient.getKnownBoards()) {
+                if (boardId == null || boardId.isBlank()) {
+                    continue;
+                }
+                boards.add(boardId.strip());
+            }
+            String curRaw = networkClient.getCurrentBoardId();
+            final String curNorm = curRaw != null ? curRaw.strip() : "";
+            if (!curNorm.isEmpty() && boards.stream().noneMatch(id -> Objects.equals(id, curNorm))) {
+                boards.add(curNorm);
+            }
+        }
+        return boards;
+    }
+
+    private void buildBoardSwitcherOverlay() {
+        Region backdrop = new Region();
+        backdrop.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
+        backdrop.setStyle("-fx-background-color: rgba(15, 23, 42, 0.8);");
+        backdrop.setOnMouseClicked(e -> hideBoardSwitcher());
+
+        switcherBoardGrid = new FlowPane();
+        switcherBoardGrid.setHgap(20);
+        switcherBoardGrid.setVgap(20);
+        switcherBoardGrid.setAlignment(Pos.CENTER);
+        switcherBoardGrid.setMaxWidth(Region.USE_PREF_SIZE);
+
+        switcherOverlay = new StackPane(backdrop, switcherBoardGrid);
+        switcherOverlay.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
+        StackPane.setAlignment(switcherBoardGrid, Pos.CENTER);
+        switcherOverlay.setOpacity(0);
+        switcherOverlay.setVisible(false);
+        switcherOverlay.setMouseTransparent(false);
+        switcherOverlay.setPickOnBounds(true);
+    }
+
+    private boolean isBoardSwitcherShowing() {
+        return canvasSceneRoot != null
+                && switcherOverlay != null
+                && canvasSceneRoot.getChildren().contains(switcherOverlay);
+    }
+
+    private Animation boardSwitcherVisibilityAnimation;
+
+    private void toggleBoardSwitcher() {
+        if (isBoardSwitcherShowing()) {
+            hideBoardSwitcher();
+        } else {
+            showBoardSwitcher();
+        }
+    }
+
+    private void showBoardSwitcher() {
+        if (canvasSceneRoot == null || switcherOverlay == null || switcherBoardGrid == null) {
+            return;
+        }
+        if (canvasSceneRoot.getChildren().contains(switcherOverlay)) {
+            return;
+        }
+        refreshSwitcherBoardGrid();
+        Animation a = boardSwitcherVisibilityAnimation;
+        boardSwitcherVisibilityAnimation = null;
+        if (a != null) {
+            a.stop();
+        }
+        if (canvasStackPane != null) {
+            canvasStackPane.setEffect(boardSwitcherCanvasBlur);
+        }
+        switcherOverlay.setOpacity(0);
+        switcherOverlay.setVisible(true);
+        canvasSceneRoot.getChildren().add(switcherOverlay);
+        FadeTransition fadeIn = new FadeTransition(Duration.millis(150), switcherOverlay);
+        fadeIn.setFromValue(0);
+        fadeIn.setToValue(1);
+        fadeIn.setOnFinished(ev -> {
+            if (boardSwitcherVisibilityAnimation == fadeIn) {
+                boardSwitcherVisibilityAnimation = null;
+            }
+        });
+        boardSwitcherVisibilityAnimation = fadeIn;
+        fadeIn.play();
+    }
+
+    private void hideBoardSwitcher() {
+        if (!isBoardSwitcherShowing() || switcherOverlay == null) {
+            if (canvasStackPane != null) {
+                canvasStackPane.setEffect(null);
+            }
+            return;
+        }
+        Animation a = boardSwitcherVisibilityAnimation;
+        boardSwitcherVisibilityAnimation = null;
+        if (a != null) {
+            a.stop();
+        }
+        FadeTransition fadeOut = new FadeTransition(Duration.millis(150), switcherOverlay);
+        fadeOut.setFromValue(switcherOverlay.getOpacity());
+        fadeOut.setToValue(0);
+        fadeOut.setOnFinished(ev -> {
+            if (canvasSceneRoot != null && switcherOverlay != null) {
+                canvasSceneRoot.getChildren().remove(switcherOverlay);
+            }
+            if (switcherOverlay != null) {
+                switcherOverlay.setVisible(false);
+            }
+            if (canvasStackPane != null) {
+                canvasStackPane.setEffect(null);
+            }
+            if (boardSwitcherVisibilityAnimation == fadeOut) {
+                boardSwitcherVisibilityAnimation = null;
+            }
+        });
+        boardSwitcherVisibilityAnimation = fadeOut;
+        fadeOut.play();
+    }
+
+    private void refreshSwitcherBoardGrid() {
+        if (switcherBoardGrid == null) {
+            return;
+        }
+        switcherBoardGrid.getChildren().clear();
+        for (String boardId : resolveKnownBoardIdsForSwitcher()) {
+            switcherBoardGrid.getChildren().add(createBoardSwitcherCard(boardId));
+        }
+        VBox newBoardCard = createNewBoardSwitcherCard();
+        switcherBoardGrid.getChildren().add(newBoardCard);
+    }
+
+    private VBox createBoardSwitcherCard(String boardId) {
+        VBox card = new VBox(10);
+        card.setPadding(new Insets(14));
+        card.setAlignment(Pos.TOP_CENTER);
+        card.setMinWidth(220);
+        card.setStyle(
+                "-fx-background-color: #1e293b; -fx-background-radius: 12; -fx-cursor: hand;");
+        String normalShadow = "-fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 10, 0.2, 0, 2);";
+        String hoverShadow = "-fx-effect: dropshadow(gaussian, rgba(148,163,184,0.45), 14, 0.25, 0, 2);";
+        card.setStyle(card.getStyle() + normalShadow);
+
+        StackPane thumb = new StackPane();
+        thumb.setPrefSize(200, 150);
+        thumb.setMinSize(200, 150);
+        thumb.setMaxSize(200, 150);
+        thumb.setStyle("-fx-background-color: #334155; -fx-background-radius: 8;");
+
+        Image snap = boardSnapshots.get(boardId);
+        if (snap != null) {
+            ImageView iv = new ImageView(snap);
+            iv.setFitWidth(200);
+            iv.setFitHeight(150);
+            iv.setPreserveRatio(true);
+            iv.setSmooth(true);
+            thumb.getChildren().add(iv);
+        } else {
+            Rectangle placeholder = new Rectangle(200, 150);
+            placeholder.setArcWidth(8);
+            placeholder.setArcHeight(8);
+            placeholder.setFill(Color.web("#334155"));
+            placeholder.setStroke(Color.web("#475569"));
+            placeholder.setStrokeWidth(1);
+            thumb.getChildren().add(placeholder);
+        }
+
+        Label name = new Label(boardId);
+        name.setWrapText(true);
+        name.setMaxWidth(200);
+        name.setStyle("-fx-text-fill: #e2e8f0; -fx-font-size: 13px; -fx-font-weight: bold;");
+
+        card.getChildren().addAll(thumb, name);
+
+        card.setOnMouseEntered(e -> card.setStyle(
+                "-fx-background-color: #273549; -fx-background-radius: 12; -fx-cursor: hand;" + hoverShadow));
+        card.setOnMouseExited(e -> card.setStyle(
+                "-fx-background-color: #1e293b; -fx-background-radius: 12; -fx-cursor: hand;" + normalShadow));
+        card.setOnMouseClicked(e -> {
+            e.consume();
+            if (networkClient == null) {
+                return;
+            }
+            if (Objects.equals(boardId, networkClient.getCurrentBoardId())) {
+                hideBoardSwitcher();
+                return;
+            }
+            switchBoard(boardId);
+            hideBoardSwitcher();
+        });
+        return card;
+    }
+
+    private VBox createNewBoardSwitcherCard() {
+        VBox card = new VBox(10);
+        card.setPadding(new Insets(14));
+        card.setAlignment(Pos.CENTER);
+        card.setMinWidth(220);
+        card.setPrefHeight(Region.USE_COMPUTED_SIZE);
+        card.setStyle(
+                "-fx-background-color: #1e293b; -fx-background-radius: 12; -fx-cursor: hand;"
+                        + "-fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 10, 0.2, 0, 2);");
+        StackPane thumb = new StackPane();
+        thumb.setPrefSize(200, 150);
+        thumb.setMinSize(200, 150);
+        Label plus = new Label("+");
+        plus.setStyle("-fx-text-fill: #94a3b8; -fx-font-size: 42px; -fx-font-weight: bold;");
+        thumb.getChildren().add(plus);
+        Label hint = new Label("New board");
+        hint.setStyle("-fx-text-fill: #cbd5e1; -fx-font-size: 13px;");
+        card.getChildren().addAll(thumb, hint);
+        card.setOnMouseEntered(e -> card.setStyle(
+                "-fx-background-color: #273549; -fx-background-radius: 12; -fx-cursor: hand;"
+                        + "-fx-effect: dropshadow(gaussian, rgba(148,163,184,0.45), 14, 0.25, 0, 2);"));
+        card.setOnMouseExited(e -> card.setStyle(
+                "-fx-background-color: #1e293b; -fx-background-radius: 12; -fx-cursor: hand;"
+                        + "-fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 10, 0.2, 0, 2);"));
+        card.setOnMouseClicked(e -> {
+            e.consume();
+            hideBoardSwitcher();
+            promptNewWorkspaceBoard();
+        });
+        return card;
+    }
+
+    /**
+     * Captures {@link #baseCanvas} for the board we are leaving, then sends {@code SWITCH_BOARD}.
+     * Call from the JavaFX Application Thread only.
+     */
+    private void switchBoard(String targetBoardId) {
+        if (networkClient == null || targetBoardId == null) {
+            return;
+        }
+        String target = targetBoardId.strip();
+        if (target.isEmpty()) {
+            return;
+        }
+        String curRaw = networkClient.getCurrentBoardId();
+        String cur = curRaw != null ? curRaw.strip() : "";
+        if (!cur.isEmpty() && !cur.equals(target) && baseCanvas != null) {
+            double bw = baseCanvas.getWidth();
+            double bh = baseCanvas.getHeight();
+            if (bw > 1 && bh > 1) {
+                try {
+                    Image snap = baseCanvas.snapshot(null, null);
+                    boardSnapshots.put(cur, snap);
+                } catch (RuntimeException ex) {
+                    log.debug("Board snapshot failed: {}", ex.getMessage());
+                }
+            }
+        }
+        networkClient.sendSwitchBoard(target);
+    }
+
+    private void stopSnapshotHydrationAndResetOpacity() {
+        Animation a = snapshotHydrationAnimation;
+        snapshotHydrationAnimation = null;
+        if (a != null) {
+            a.stop();
+        }
+        if (canvasStackPane != null) {
+            canvasStackPane.setOpacity(1.0);
+        }
+    }
+
+    /**
+     * Dark-themed name entry for creating a board via {@code SWITCH_BOARD}.
+     */
+    private void promptNewWorkspaceBoard() {
+        TextInputDialog dialog = new TextInputDialog();
+        dialog.setTitle("New board");
+        dialog.setHeaderText(null);
+        dialog.setGraphic(null);
+        dialog.setContentText("New Board Name");
+        DialogPane pane = dialog.getDialogPane();
+        if (canvasScene != null && canvasScene.getStylesheets() != null) {
+            pane.getStylesheets().addAll(canvasScene.getStylesheets());
+        }
+        pane.getStyleClass().add("workspace-input-dialog");
+        Optional<String> result = dialog.showAndWait();
+        result.map(String::strip)
+                .filter(s -> !s.isEmpty())
+                .ifPresent(this::switchBoard);
     }
 
     @Override
@@ -365,9 +748,6 @@ public class WhiteboardApp extends Application {
         sidebar.setPrefWidth(TOOLBAR_WIDTH);
         sidebar.setMinWidth(TOOLBAR_WIDTH);
         sidebar.setMaxWidth(TOOLBAR_WIDTH);
-        sidebar.setMinHeight(0);
-        sidebar.setMaxHeight(Double.MAX_VALUE);
-        sidebar.setPadding(new Insets(16));
         sidebar.getStyleClass().add("sidebar");
 
         // App title
@@ -450,7 +830,7 @@ public class WhiteboardApp extends Application {
 
         Button clearBtn = new Button("Clear Board");
         clearBtn.setMaxWidth(Double.MAX_VALUE);
-        clearBtn.getStyleClass().add("danger-button");
+        clearBtn.getStyleClass().add("ghost-danger-button");
         clearBtn.setOnAction(e -> clearBoard());
         clearBtn.setTooltip(new Tooltip("Remove all shapes on this board for everyone"));
 
@@ -699,6 +1079,8 @@ public class WhiteboardApp extends Application {
 
     private void leaveCanvasRoom() {
         cancelLobbyJoinWatchdog();
+        hideBoardSwitcher();
+        boardSnapshots.clear();
         if (networkClient != null) {
             networkClient.sendLeaveRoom();
         }
@@ -1257,12 +1639,6 @@ public class WhiteboardApp extends Application {
                 Platform.runLater(() -> {
                     cancelLobbyJoinWatchdog();
                     List<Shape> list = incoming != null ? incoming : List.of();
-                    shapes.clear();
-                    for (Shape s : list) {
-                        if (s != null) {
-                            shapes.put(s.objectId(), s);
-                        }
-                    }
                     roomId = networkClient != null ? networkClient.getActiveRoomId() : "";
                     Scene cur = primaryStage != null ? primaryStage.getScene() : null;
                     // Switch scenes before redraw: while the lobby is showing, the canvas may
@@ -1274,12 +1650,60 @@ public class WhiteboardApp extends Application {
                         controlPane.toFront();
                         setStatus("⬤ Connected", GREEN);
                     }
-                    try {
-                        redrawBaseCanvas(shapes.values());
-                    } catch (RuntimeException ex) {
-                        log.error("redrawBaseCanvas after SNAPSHOT failed", ex);
+
+                    if (canvasStackPane == null) {
+                        shapes.clear();
+                        for (Shape s : list) {
+                            if (s != null) {
+                                shapes.put(s.objectId(), s);
+                            }
+                        }
+                        try {
+                            redrawBaseCanvas(shapes.values());
+                        } catch (RuntimeException ex) {
+                            log.error("redrawBaseCanvas after SNAPSHOT failed", ex);
+                        }
+                        log.info("Snapshot applied — {} shape(s) on canvas", shapes.size());
+                        return;
                     }
-                    log.info("Snapshot applied — {} shape(s) on canvas", shapes.size());
+
+                    stopSnapshotHydrationAndResetOpacity();
+                    final long hydrationToken = ++snapshotHydrationToken;
+                    FadeTransition fadeOut = new FadeTransition(Duration.millis(150), canvasStackPane);
+                    fadeOut.setFromValue(1.0);
+                    fadeOut.setToValue(0.0);
+                    fadeOut.setOnFinished(ev -> {
+                        if (hydrationToken != snapshotHydrationToken) {
+                            return;
+                        }
+                        shapes.clear();
+                        for (Shape s : list) {
+                            if (s != null) {
+                                shapes.put(s.objectId(), s);
+                            }
+                        }
+                        try {
+                            redrawBaseCanvas(shapes.values());
+                        } catch (RuntimeException ex) {
+                            log.error("redrawBaseCanvas after SNAPSHOT failed", ex);
+                        }
+                        log.info("Snapshot applied — {} shape(s) on canvas", shapes.size());
+                        FadeTransition fadeIn = new FadeTransition(Duration.millis(150), canvasStackPane);
+                        fadeIn.setFromValue(0.0);
+                        fadeIn.setToValue(1.0);
+                        fadeIn.setOnFinished(e2 -> {
+                            if (hydrationToken != snapshotHydrationToken) {
+                                return;
+                            }
+                            if (snapshotHydrationAnimation == fadeIn) {
+                                snapshotHydrationAnimation = null;
+                            }
+                        });
+                        snapshotHydrationAnimation = fadeIn;
+                        fadeIn.play();
+                    });
+                    snapshotHydrationAnimation = fadeOut;
+                    fadeOut.play();
                 });
             }
 
