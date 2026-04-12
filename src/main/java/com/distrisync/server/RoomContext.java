@@ -16,124 +16,89 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Per-room runtime context: authoritative canvas state + active-key routing table.
+ * Per-room runtime context: workspace boards (each with authoritative canvas state) + active-key table.
  *
- * <h2>WAL replay on construction</h2>
- * When a {@link WalManager} is supplied the constructor immediately replays
- * every persisted frame into the blank {@link CanvasStateManager}.  Only
- * {@code MUTATION}, {@code SHAPE_DELETE}, and {@code CLEAR_USER_SHAPES} frames
- * alter canvas state; all other frame types (e.g. {@code SHAPE_COMMIT}) are
- * silently skipped — they carry no durable state.
+ * <p>Board state is created lazily via {@link #getBoard(String)}; each new board replays
+ * {@link WalManager#recover(String, String)} for that room/board pair when a {@link WalManager} is configured.
  *
- * <h2>Activity timestamp</h2>
- * {@link #lastActivityTimestamp} is refreshed on every {@link #addKey} and
- * explicit {@link #touchActivity()} call.  {@link StorageLifecycleManager}
- * reads this via {@link #getLastActivityTimestamp()} to decide whether an
- * idle room has aged past the GC TTL.
- *
- * <h2>Thread safety</h2>
- * The active-key set is backed by {@link ConcurrentHashMap#newKeySet()}.
- * {@code lastActivityTimestamp} is {@code volatile}.  {@link CanvasStateManager}
- * is independently thread-safe.
+ * <p>{@link #lastActivityTimestamp} is refreshed on {@link #addKey} and {@link #touchActivity()}.
  */
 final class RoomContext {
 
     private static final Logger log = LoggerFactory.getLogger(RoomContext.class);
 
-    /** Stable room identifier; written once at construction. */
     final String roomId;
 
-    /** Authoritative in-memory canvas; replayed from WAL on construction. */
-    final CanvasStateManager stateManager;
+    private final WalManager wal;
 
-    /** Keys of currently connected clients routing to this room. */
+    private final ConcurrentHashMap<String, CanvasStateManager> boards = new ConcurrentHashMap<>();
+
     private final Set<SelectionKey> activeKeys = ConcurrentHashMap.newKeySet();
 
-    /**
-     * Wall-clock milliseconds of the most recent client activity for this room.
-     *
-     * <p>Marked {@code volatile} for visibility across the NIO loop and the
-     * lifecycle daemon.
-     *
-     * <p><strong>Test note:</strong> integration tests back-date this field via
-     * reflection ({@code getDeclaredField("lastActivityTimestamp")}) to simulate
-     * an idle room without real-time waiting.  The field name must not be renamed
-     * without updating those tests.
-     */
     private volatile long lastActivityTimestamp = System.currentTimeMillis();
 
-    /**
-     * Creates a new context and replays any persisted WAL for this room.
-     *
-     * @param roomId the stable room identifier; must not be {@code null}
-     * @param wal    WAL engine to replay from; {@code null} means no persistence
-     */
     RoomContext(String roomId, WalManager wal) {
         if (roomId == null) throw new IllegalArgumentException("roomId must not be null");
-        this.roomId       = roomId;
-        this.stateManager = new CanvasStateManager();
-        replayWal(wal);
+        this.roomId = roomId;
+        this.wal   = wal;
     }
 
-    // =========================================================================
-    // Key management
-    // =========================================================================
+    /**
+     * Returns the {@link CanvasStateManager} for {@code boardId}, creating it if needed and
+     * replaying the WAL for this room/board when {@link WalManager} is non-null.
+     */
+    CanvasStateManager getBoard(String boardId) {
+        if (boardId == null || boardId.isBlank()) {
+            throw new IllegalArgumentException("boardId must not be null or blank");
+        }
+        return boards.computeIfAbsent(boardId, id -> {
+            CanvasStateManager csm = new CanvasStateManager();
+            replayWalForBoard(id, csm);
+            return csm;
+        });
+    }
 
     /**
-     * Registers a client {@link SelectionKey} and refreshes the activity timestamp.
+     * Snapshot of workspace board ids that currently have a {@link CanvasStateManager}
+     * (including empty boards created via {@link #getBoard(String)}).
      */
+    Set<String> getActiveBoardIds() {
+        return Set.copyOf(boards.keySet());
+    }
+
     void addKey(SelectionKey key) {
         activeKeys.add(key);
         touchActivity();
     }
 
-    /**
-     * Removes a client {@link SelectionKey} on disconnect.
-     *
-     * @return {@code true} if the key was present and removed
-     */
     boolean removeKey(SelectionKey key) {
         return activeKeys.remove(key);
     }
 
-    /**
-     * Returns an unmodifiable view of the active-key set.
-     */
     Set<SelectionKey> getActiveKeys() {
         return Collections.unmodifiableSet(activeKeys);
     }
 
-    /** Number of currently connected clients in this room. */
     int getActiveClientCount() {
         return activeKeys.size();
     }
 
-    // =========================================================================
-    // Activity tracking
-    // =========================================================================
-
-    /** Updates the activity timestamp to the current wall clock. */
     void touchActivity() {
         lastActivityTimestamp = System.currentTimeMillis();
     }
 
-    /** Returns the last-activity timestamp (ms). Package-private for GC. */
     long getLastActivityTimestamp() {
         return lastActivityTimestamp;
     }
 
-    // =========================================================================
-    // WAL replay
-    // =========================================================================
-
-    private void replayWal(WalManager wal) {
+    private void replayWalForBoard(String boardId, CanvasStateManager stateManager) {
         if (wal == null) return;
 
         List<Message> frames;
         try {
-            frames = wal.recover(roomId);
+            frames = wal.recover(roomId, boardId);
         } catch (IOException e) {
-            log.error("WAL replay failed  room='{}': {}", roomId, e.getMessage(), e);
+            log.error("WAL replay failed  room='{}' board='{}': {}", roomId, boardId, e.getMessage(), e);
             return;
         }
 
@@ -146,8 +111,8 @@ final class RoomContext {
                             applied++;
                         }
                     } catch (Exception e) {
-                        log.warn("WAL replay: skipping malformed MUTATION  room='{}': {}",
-                                roomId, e.getMessage());
+                        log.warn("WAL replay: skipping malformed MUTATION  room='{}' board='{}': {}",
+                                roomId, boardId, e.getMessage());
                     }
                 }
                 case SHAPE_DELETE -> {
@@ -156,8 +121,8 @@ final class RoomContext {
                         UUID shapeId = UUID.fromString(p.get("shapeId").getAsString());
                         if (stateManager.deleteShape(shapeId)) applied++;
                     } catch (Exception e) {
-                        log.warn("WAL replay: skipping malformed SHAPE_DELETE  room='{}': {}",
-                                roomId, e.getMessage());
+                        log.warn("WAL replay: skipping malformed SHAPE_DELETE  room='{}' board='{}': {}",
+                                roomId, boardId, e.getMessage());
                     }
                 }
                 case CLEAR_USER_SHAPES -> {
@@ -166,15 +131,15 @@ final class RoomContext {
                         stateManager.clearUserShapes(clientId);
                         applied++;
                     } catch (Exception e) {
-                        log.warn("WAL replay: skipping malformed CLEAR_USER_SHAPES  room='{}': {}",
-                                roomId, e.getMessage());
+                        log.warn("WAL replay: skipping malformed CLEAR_USER_SHAPES  room='{}' board='{}': {}",
+                                roomId, boardId, e.getMessage());
                     }
                 }
-                default -> { /* SHAPE_COMMIT and others carry no durable canvas state */ }
+                default -> { /* non-durable */ }
             }
         }
 
-        log.info("WAL replay complete  room='{}' framesRead={} framesApplied={} shapes={}",
-                roomId, frames.size(), applied, stateManager.size());
+        log.info("WAL replay complete  room='{}' board='{}' framesRead={} framesApplied={} shapes={}",
+                roomId, boardId, frames.size(), applied, stateManager.size());
     }
 }

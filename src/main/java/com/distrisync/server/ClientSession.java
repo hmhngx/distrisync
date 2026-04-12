@@ -46,6 +46,13 @@ final class ClientSession {
     volatile String roomId = "";
 
     /**
+     * Active workspace board within {@link #roomId}, set on {@code JOIN_ROOM}
+     * (default {@value com.distrisync.protocol.MessageCodec#DEFAULT_INITIAL_BOARD_ID})
+     * or {@code SWITCH_BOARD}; empty in the lobby.
+     */
+    volatile String currentBoardId = "";
+
+    /**
      * Set after the first {@code HANDSHAKE} is accepted; duplicate handshakes are ignored.
      */
     volatile boolean handshakeComplete = false;
