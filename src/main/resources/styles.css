@@ -230,6 +230,31 @@
     -fx-border-color: #be123c;
 }
 
+/* Lobby room row — faint destructive default, solid red on hover */
+.danger-btn {
+    -fx-background-color: rgba(239, 68, 68, 0.1);
+    -fx-text-fill: #ef4444;
+    -fx-border-color: rgba(239, 68, 68, 0.3);
+    -fx-border-width: 1px;
+    -fx-border-radius: 8px;
+    -fx-background-radius: 8px;
+    -fx-padding: 8 14 8 14;
+    -fx-cursor: hand;
+    -fx-font-size: 13px;
+}
+
+.danger-btn:hover {
+    -fx-background-color: #ef4444;
+    -fx-text-fill: #ffffff;
+    -fx-border-color: #ef4444;
+}
+
+.danger-btn:armed {
+    -fx-background-color: #dc2626;
+    -fx-text-fill: #ffffff;
+    -fx-border-color: #dc2626;
+}
+
 /* ── Connection status indicator ────────────────────────────── */
 .status-text {
     -fx-text-fill: #10b981;
@@ -319,6 +344,28 @@
 .lobby-status-disconnected {
     -fx-text-fill: #f87171;
     -fx-font-size: 13px;
+}
+
+/* Manual lobby refresh — blue outline, solid fill on hover */
+.refresh-btn {
+    -fx-background-color: rgba(59, 130, 246, 0.1);
+    -fx-text-fill: #3b82f6;
+    -fx-border-color: rgba(59, 130, 246, 0.3);
+    -fx-border-width: 1;
+    -fx-background-radius: 6;
+    -fx-border-radius: 6;
+    -fx-padding: 8 14 8 14;
+    -fx-cursor: hand;
+}
+
+.refresh-btn:hover {
+    -fx-background-color: #3b82f6;
+    -fx-text-fill: #ffffff;
+}
+
+.refresh-btn:disabled {
+    -fx-opacity: 0.5;
+    -fx-cursor: default;
 }
 
 /* Live telemetry strip — bottom-right canvas HUD */

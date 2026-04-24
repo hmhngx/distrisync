@@ -25,7 +25,9 @@ import javafx.scene.effect.GaussianBlur;
 import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
 import javafx.scene.canvas.GraphicsContext;
+import javafx.scene.control.Alert;
 import javafx.scene.control.Button;
+import javafx.scene.control.ButtonType;
 import javafx.scene.control.ColorPicker;
 import javafx.scene.control.DialogPane;
 import javafx.scene.control.Label;
@@ -57,6 +59,7 @@ import javafx.scene.shape.StrokeLineJoin;
 import javafx.scene.text.Font;
 import javafx.scene.text.FontPosture;
 import javafx.scene.text.FontWeight;
+import javafx.stage.Modality;
 import javafx.stage.Screen;
 import javafx.stage.Stage;
 import org.slf4j.Logger;
@@ -75,6 +78,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Main JavaFX entry point for the DistriSync collaborative whiteboard client.
@@ -980,7 +984,7 @@ public class WhiteboardApp extends Application {
         leaveRoomBtn.getStyleClass().add("ghost-danger-button");
         leaveRoomBtn.setFocusTraversable(false);
         leaveRoomBtn.setMnemonicParsing(false);
-        leaveRoomBtn.setOnAction(e -> leaveCanvasRoom());
+        leaveRoomBtn.setOnAction(e -> leaveCanvasRoom(true));
         leaveRoomBtn.setTooltip(new Tooltip("Return to the lobby"));
 
         statusLabel = new Label("⬤ Offline");
@@ -1035,6 +1039,36 @@ public class WhiteboardApp extends Application {
     // Lobby scene
     // =========================================================================
 
+    /**
+     * Wires the lobby refresh control: each successful activation runs {@code fetchLobbyAction}
+     * once, disables the button for 1s, then restores label and enabled state.
+     * Package-private for unit tests ({@code WhiteboardAppLobbyTest}).
+     */
+    static void wireLobbyRefreshButton(Button refreshBtn, Runnable fetchLobbyAction) {
+        Objects.requireNonNull(refreshBtn, "refreshBtn");
+        Objects.requireNonNull(fetchLobbyAction, "fetchLobbyAction");
+        if (!refreshBtn.getStyleClass().contains("refresh-btn")) {
+            refreshBtn.getStyleClass().add("refresh-btn");
+        }
+        AtomicBoolean inCooldown = new AtomicBoolean(false);
+        refreshBtn.setText("Refresh ↻");
+        refreshBtn.setOnAction(e -> {
+            if (!inCooldown.compareAndSet(false, true)) {
+                return;
+            }
+            fetchLobbyAction.run();
+            refreshBtn.setDisable(true);
+            refreshBtn.setText("Refreshing...");
+            PauseTransition cooldown = new PauseTransition(Duration.millis(1000));
+            cooldown.setOnFinished(ev -> {
+                inCooldown.set(false);
+                refreshBtn.setDisable(false);
+                refreshBtn.setText("Refresh ↻");
+            });
+            cooldown.play();
+        });
+    }
+
     private Parent buildLobbyRoot() {
         StackPane root = new StackPane();
         root.getStyleClass().add("lobby-root");
@@ -1063,6 +1097,21 @@ public class WhiteboardApp extends Application {
         createRow.setAlignment(Pos.CENTER_LEFT);
         HBox.setHgrow(newRoomField, Priority.ALWAYS);
 
+        Label availableRoomsLabel = new Label("Available Rooms");
+        availableRoomsLabel.getStyleClass().add("lobby-room-title");
+        availableRoomsLabel.setMaxWidth(Double.MAX_VALUE);
+
+        Button refreshBtn = new Button("Refresh ↻");
+        wireLobbyRefreshButton(refreshBtn, () -> {
+            if (networkClient != null && networkClient.isRunning()) {
+                networkClient.sendFetchLobby();
+            }
+        });
+
+        HBox lobbyRoomsHeaderRow = new HBox(12, availableRoomsLabel, refreshBtn);
+        lobbyRoomsHeaderRow.setAlignment(Pos.CENTER_LEFT);
+        HBox.setHgrow(availableRoomsLabel, Priority.ALWAYS);
+
         lobbyRoomList = new VBox(10);
         lobbyRoomList.setFillWidth(true);
 
@@ -1075,7 +1124,7 @@ public class WhiteboardApp extends Application {
 
         VBox roomsSection = new VBox(10);
         roomsSection.setFillWidth(true);
-        roomsSection.getChildren().addAll(lobbyEmptyStateLabel, lobbyRoomList);
+        roomsSection.getChildren().addAll(lobbyRoomsHeaderRow, lobbyEmptyStateLabel, lobbyRoomList);
         VBox.setVgrow(lobbyRoomList, Priority.ALWAYS);
 
         ScrollPane scroll = new ScrollPane(roomsSection);
@@ -1123,6 +1172,51 @@ public class WhiteboardApp extends Application {
         }
         networkClient.sendJoinRoom(name);
         scheduleLobbyJoinWatchdog();
+    }
+
+    /**
+     * Lobby-only destructive action: confirms then sends {@link MessageType#DELETE_ROOM}.
+     */
+    private void confirmDeleteRoomFromLobby(String roomId, Label roomNameLabel, Button joinBtn, Button deleteBtn) {
+        if (networkClient == null || !networkClient.isRunning()) {
+            return;
+        }
+        String rid = roomId != null ? roomId.strip() : "";
+        if (rid.isBlank()) {
+            return;
+        }
+        Alert confirm = new Alert(Alert.AlertType.CONFIRMATION);
+        confirm.setTitle("Delete Room");
+        confirm.setHeaderText("Are you sure you want to delete '" + rid + "'?");
+        confirm.setContentText(
+                "This will permanently delete all boards and drawings. Active users will be kicked out.");
+        confirm.initModality(Modality.APPLICATION_MODAL);
+        if (primaryStage != null) {
+            confirm.initOwner(primaryStage);
+        }
+        Optional<ButtonType> response = confirm.showAndWait();
+        if (response.isPresent() && response.get() == ButtonType.OK) {
+            networkClient.sendDeleteRoom(rid);
+            applyLobbyRoomDeletingState(rid, roomNameLabel, joinBtn, deleteBtn);
+        }
+    }
+
+    /**
+     * Optimistically locks a lobby room row after delete confirmation and request dispatch.
+     * Package-private for UI logic tests ({@code WhiteboardAppOptimisticUITest}).
+     */
+    static void applyLobbyRoomDeletingState(String roomId, Label roomNameLabel, Button joinBtn, Button deleteBtn) {
+        String rid = roomId != null ? roomId.strip() : "";
+        if (!rid.isBlank() && roomNameLabel != null) {
+            roomNameLabel.setText(rid + " (Deleting...)");
+            roomNameLabel.setOpacity(0.5);
+        }
+        if (joinBtn != null) {
+            joinBtn.setDisable(true);
+        }
+        if (deleteBtn != null) {
+            deleteBtn.setDisable(true);
+        }
     }
 
     private void cancelLobbyJoinWatchdog() {
@@ -1191,7 +1285,16 @@ public class WhiteboardApp extends Application {
             String rid = info.roomId();
             joinBtn.setOnAction(e -> joinRoomFromLobby(rid));
 
-            card.getChildren().addAll(textCol, joinBtn);
+            Button deleteBtn = new Button("Delete");
+            deleteBtn.getStyleClass().add("danger-btn");
+            deleteBtn.setDisable(networkClient == null || !networkClient.isRunning());
+            deleteBtn.setOnAction(e -> confirmDeleteRoomFromLobby(rid, idLab, joinBtn, deleteBtn));
+
+            HBox actions = new HBox(8);
+            actions.setAlignment(Pos.CENTER_RIGHT);
+            actions.getChildren().addAll(joinBtn, deleteBtn);
+
+            card.getChildren().addAll(textCol, actions);
             lobbyRoomList.getChildren().add(card);
         }
     }
@@ -1218,7 +1321,7 @@ public class WhiteboardApp extends Application {
         redrawBaseCanvas(shapes.values());
     }
 
-    private void leaveCanvasRoom() {
+    private void leaveCanvasRoom(boolean sendLeaveRoomToServer) {
         cancelLobbyJoinWatchdog();
         hideBoardSwitcher();
         boardSnapshots.clear();
@@ -1226,7 +1329,7 @@ public class WhiteboardApp extends Application {
         if (udpTracker != null) {
             udpTracker.clearPeerCursors();
         }
-        if (networkClient != null) {
+        if (networkClient != null && sendLeaveRoomToServer) {
             networkClient.sendLeaveRoom();
         }
         clearLocalCanvasState();
@@ -1235,6 +1338,22 @@ public class WhiteboardApp extends Application {
             primaryStage.setTitle("DistriSync – Lobby");
         }
         setStatus("⬤ In lobby", FG_MUTED);
+    }
+
+    /**
+     * Server destroyed the canvas room; return to lobby without sending {@code LEAVE_ROOM}
+     * (session was already cleared on the wire).
+     */
+    private void onRoomDeletedByServer() {
+        leaveCanvasRoom(false);
+        Alert info = new Alert(Alert.AlertType.INFORMATION);
+        info.setTitle("Room deleted");
+        info.setHeaderText(null);
+        info.setContentText("The room was deleted by an administrator.");
+        if (primaryStage != null) {
+            info.initOwner(primaryStage);
+        }
+        info.show();
     }
 
     // =========================================================================
@@ -1940,6 +2059,8 @@ public class WhiteboardApp extends Application {
                 Platform.runLater(() -> onRemoteUserSpeaking(speakerId)));
         networkClient.addLobbyListener(rooms ->
                 Platform.runLater(() -> refreshLobbyRooms(rooms)));
+        networkClient.addRoomDeletedListener(() ->
+                Platform.runLater(this::onRoomDeletedByServer));
 
         // Callbacks arrive on distrisync-read; marshal to FX thread before touching state
         networkClient.addListener(new CanvasUpdateListener() {

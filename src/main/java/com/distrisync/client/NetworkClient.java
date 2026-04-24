@@ -144,6 +144,12 @@ public final class NetworkClient implements AutoCloseable {
     private final CopyOnWriteArrayList<LobbyUpdateListener> lobbyListeners =
             new CopyOnWriteArrayList<>();
 
+    /**
+     * Invoked on the read thread when {@link MessageType#ROOM_DELETED} is received
+     * (server destroyed the room). UI should use {@link javafx.application.Platform#runLater}.
+     */
+    private final CopyOnWriteArrayList<Runnable> roomDeletedListeners = new CopyOnWriteArrayList<>();
+
     /** Opaque UDP relay token from the latest {@link MessageType#UDP_ADMISSION}; empty until admitted. */
     private volatile String udpToken = "";
 
@@ -523,6 +529,21 @@ public final class NetworkClient implements AutoCloseable {
     }
 
     /**
+     * Registers a callback for {@link MessageType#ROOM_DELETED}. Duplicate registrations are ignored.
+     */
+    public void addRoomDeletedListener(Runnable listener) {
+        if (listener != null) {
+            roomDeletedListeners.addIfAbsent(listener);
+        }
+    }
+
+    public void removeRoomDeletedListener(Runnable listener) {
+        if (listener != null) {
+            roomDeletedListeners.remove(listener);
+        }
+    }
+
+    /**
      * Stops both I/O threads and closes the underlying channel.  Safe to call
      * from any thread.  After this returns the client instance must not be
      * reused.
@@ -753,6 +774,44 @@ public final class NetworkClient implements AutoCloseable {
         publishUdpActive(false);
         enqueueFrame(MessageCodec.encodeLeaveRoom());
         log.debug("LEAVE_ROOM enqueued");
+        sendFetchLobby();
+    }
+
+    /**
+     * Requests durable deletion of {@code roomId} on the server ({@link MessageType#DELETE_ROOM}).
+     * No-op when not connected, protocol is not ready, or {@code roomId} is blank.
+     */
+    public void sendDeleteRoom(String roomId) {
+        if (!running.get()) {
+            return;
+        }
+        String rid = roomId != null ? roomId.strip() : "";
+        if (rid.isBlank()) {
+            log.debug("sendDeleteRoom ignored — blank roomId");
+            return;
+        }
+        if (!protocolReady.get()) {
+            log.debug("sendDeleteRoom ignored — protocol not ready roomId='{}'", rid);
+            return;
+        }
+        enqueueFrame(MessageCodec.encodeDeleteRoom(rid));
+        log.debug("DELETE_ROOM enqueued roomId='{}'", rid);
+    }
+
+    /**
+     * Requests a pull-based {@code LOBBY_STATE} refresh from the server (client → server
+     * {@link MessageType#FETCH_LOBBY}). No-op when not connected or before the protocol is ready.
+     */
+    public void sendFetchLobby() {
+        if (!running.get()) {
+            return;
+        }
+        if (!protocolReady.get()) {
+            log.debug("sendFetchLobby ignored — protocol not ready");
+            return;
+        }
+        enqueueFrame(MessageCodec.encodeFetchLobby());
+        log.debug("FETCH_LOBBY enqueued");
     }
 
     /**
@@ -1055,6 +1114,20 @@ public final class NetworkClient implements AutoCloseable {
             }
             case JOIN_ROOM, LEAVE_ROOM ->
                     log.trace("Ignoring echoed client-bound message type: {}", msg.type());
+            case ROOM_DELETED -> {
+                log.info("ROOM_DELETED received — clearing local room state");
+                activeRoomId = "";
+                resetWorkspaceForLobby();
+                publishUdpActive(false);
+                for (Runnable listener : roomDeletedListeners) {
+                    try {
+                        listener.run();
+                    } catch (Exception e) {
+                        log.warn("roomDeletedListener failed: {}", e.getMessage());
+                    }
+                }
+                runOnFxThreadIfPossible(this::sendFetchLobby);
+            }
             case BOARD_LIST_UPDATE -> {
                 if (activeRoomId == null || activeRoomId.isBlank()) {
                     log.trace("BOARD_LIST_UPDATE ignored — not in a room");
@@ -1098,9 +1171,43 @@ public final class NetworkClient implements AutoCloseable {
                     log.debug("Malformed PONG ignored: {}", e.getMessage());
                 }
             }
+            case FETCH_LOBBY ->
+                    log.trace("Ignoring unexpected inbound FETCH_LOBBY (client-originated type)");
             default -> log.warn("Ignoring unexpected inbound message type={} — check client/server versions",
                     msg.type());
         }
+    }
+
+    /**
+     * Feeds an inbound {@code ROOM_DELETED} through {@link #dispatchMessage} with {@code running}
+     * and {@code protocolReady} forced on, for unit tests that assert outbound behaviour without TCP.
+     */
+    void ingestRoomDeletedForStateTest() {
+        running.set(true);
+        protocolReady.set(true);
+        dispatchMessage(new Message(MessageType.ROOM_DELETED, ""));
+        // Leaves {@code running} / {@code protocolReady} armed so async eviction UI can call
+        // {@link #sendFetchLobby()}; {@link #close()} when the harness is done.
+    }
+
+    /**
+     * Returns whether the async write queue currently holds at least one frame whose wire type
+     * matches {@code type} (package-private for {@link NetworkClientStateTest}).
+     */
+    boolean outboundQueueContainsFrameOfTypeForTest(MessageType type) {
+        if (type == null) {
+            return false;
+        }
+        byte code = type.wireCode();
+        for (ByteBuffer buf : writeQueue) {
+            if (buf == null || buf.remaining() < 1) {
+                continue;
+            }
+            if (buf.duplicate().get() == code) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
