@@ -65,9 +65,17 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x09`    | `UNDO_REQUEST`     | Client → Server      | No               | Delete one shape by UUID. Payload: `{ "shapeId": "<uuid>" }`. Server responds with `SHAPE_DELETE`. |
 | `0x0A`    | `SHAPE_DELETE`     | Server → All peers   | **Yes**          | Server confirms deletion. Payload: `{ "shapeId": "<uuid>" }`. Broadcast to all peers except originator. |
 | `0x0B`    | `TEXT_UPDATE`      | Client → All peers   | No               | Ephemeral live-typing event. Payload: `{ objectId, clientId, authorName, x, y, currentText }`. Never written to `shapeMap`; final committed `TextNode` arrives as a `MUTATION`. |
+| `0x0C`    | `LOBBY_STATE`      | Server → Client      | No               | Room discovery snapshot. Payload: JSON array of `{ roomId, userCount }`, merged from active rooms plus persisted WAL stems. |
+| `0x0D`    | `JOIN_ROOM`        | Client → Server      | No               | Enter a room workspace. Payload: `{ roomId, initialBoardId? }` (legacy JSON string roomId accepted). |
+| `0x0E`    | `LEAVE_ROOM`       | Client → Server      | No               | Leave the active room and return to lobby. Empty payload. |
 | `0x0F`    | `SWITCH_BOARD`     | Client → Server      | No               | Switches the active board within the current room workspace. Payload: `{ boardId }`. |
 | `0x10`    | `BOARD_LIST_UPDATE`| Server → Client      | No               | Announces room board-index changes for multi-board workspaces. Payload contains authoritative board metadata. |
 | `0x11`    | `UDP_ADMISSION`    | Server → Client      | No               | Grants access to the UDP audio data plane; payload contains `{ udpToken }`. |
+| `0x12`    | `PING`             | Client → Server      | No               | Heartbeat RTT probe. Payload: `{ "t": <originMillis> }`; accepted only post-handshake. |
+| `0x13`    | `PONG`             | Server → Client      | No               | Echo of `PING` origin timestamp. Payload: `{ "t": <originMillis> }`; client computes RTT as `now - t`. |
+| `0x14`    | `DELETE_ROOM`      | Client → Server      | No               | Durable room teardown request. Payload: `{ roomId }`; allowed from lobby or from the same active room only. |
+| `0x15`    | `ROOM_DELETED`     | Server → Client      | No               | Forced room-eviction event. Empty payload; clients clear room/board state and return to lobby UI. |
+| `0x16`    | `FETCH_LOBBY`      | Client → Server      | No               | Pull-based lobby refresh request. Payload must be exactly `{}` (ignoring surrounding whitespace). |
 
 #### Shape Envelope Format (MUTATION / SNAPSHOT)
 
@@ -307,6 +315,22 @@ A client in Room A will never receive a frame from Room B, even if both rooms ar
 - `IOException` from the underlying `FileChannel` write is logged at `WARN` but not re-thrown — the mutation has already been applied in memory; dropping a single WAL record degrades durability without breaking the live session.
 - The call is made **before** the broadcast so that the WAL record exists even if the subsequent write to one or more clients fails.
 
+### 5.5 Lobby Merge + Durable Room Teardown
+
+`RoomManager` now treats lobby discovery as a merged view of two sources:
+
+1. **Active rooms in memory** (`rooms` map), with live `userCount`.
+2. **Persisted room stems from WAL files** (`WalManager.getPersistedRoomIds()`), exposed with `userCount = 0` when no in-memory room currently exists.
+
+The merge path (`mergePersistedWalStemsWithActiveRooms`) removes duplicates by comparing active room IDs after `WalManager.sanitize(...)`, then sorts rows by `roomId` before encoding `LOBBY_STATE`.
+
+Room deletion is a first-class lifecycle event:
+
+- Client sends `DELETE_ROOM { roomId }`.
+- `NioServer` validates scope (from lobby, or from the same active room only) and calls `RoomManager.deleteRoom(roomId, walManager)`.
+- `RoomManager` removes the room from routing, enqueues `ROOM_DELETED` to each room member, clears each member's active room/board fields, and reclassifies those sessions into the lobby set.
+- `NioServer.broadcastLobbyState()` emits a fresh merged `LOBBY_STATE` snapshot after deletion completes.
+
 ---
 
 ## 6. Write-Ahead Log — WalManager
@@ -319,6 +343,8 @@ distrisync-data/
 ```
 
 WALs are partitioned per board. This allows lazy, zero-overhead board creation: a board that has never received a durable mutation has no file, no open channel, and no recovery scan cost. It also enables independent state recovery, so one board's WAL lifecycle is isolated from every other board in the same room.
+
+`WalManager.getPersistedRoomIds()` scans `dataDir` for `*.wal` files and extracts the room stem from `{sanitisedRoom}_{sanitisedBoard}.wal`. This enables lobby discovery to surface durable rooms even when they are currently inactive.
 
 ### 6.2 Frame Format
 
@@ -380,6 +406,17 @@ Server restart
 ### 6.5 Thread Safety
 
 `WalManager.channels` is a `ConcurrentHashMap<String, FileChannel>` keyed by room-board partition path. Channel creation is protected by `computeIfAbsent`. Individual `FileChannel.write` calls from the single-threaded NIO event loop are inherently serialised per file, so no additional lock is needed around write operations.
+
+### 6.6 Room Deletion Barrier (`deleteRoomFiles`)
+
+`WalManager.deleteRoomFiles(roomId)` provides a synchronous delete barrier for durable room teardown:
+
+1. Close and evict all cached `FileChannel`s whose keys begin with `sanitize(roomId) + "_"`.
+2. Delete all matching `*.wal` files in `dataDir`.
+3. Re-scan both filesystem and `getPersistedRoomIds()` to verify no matching room stem remains.
+4. Retry once if the barrier is not met; throw `IOException` if still not satisfied.
+
+This barrier prevents "ghost rooms" from reappearing in lobby discovery immediately after `DELETE_ROOM`.
 
 ---
 

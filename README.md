@@ -51,7 +51,7 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Reconnect with Back-off** — `NetworkClient` reconnects automatically after EOF or I/O errors using a synchronised `reconnect()` cycle that re-executes the full `HANDSHAKE` → `SNAPSHOT` flow to restore canvas state.
 
-- **Lobby Discovery & Room Management (`LOBBY_STATE` / `JOIN_ROOM` / `LEAVE_ROOM`)** — clients connect to a lobby and receive periodic `LOBBY_STATE` broadcasts listing all active rooms with live user counts. `JOIN_ROOM` transitions a client from lobby into a specific room's canvas (accepting a `roomId` and optional `initialBoardId`); `LEAVE_ROOM` returns to the lobby with an empty payload. The server maintains a single global lobby session for discovery and scoped `RoomContext` sessions for drawing, enabling efficient multi-room deployments with fully isolated state per room.
+- **Lobby Discovery, Pull Refresh, and Durable Room Deletion (`LOBBY_STATE` / `FETCH_LOBBY` / `DELETE_ROOM` / `ROOM_DELETED`)** — lobby discovery now supports both push (`LOBBY_STATE` fan-out) and pull (`FETCH_LOBBY`) refresh flows so clients can force an immediate room list update. `LOBBY_STATE` merges in-memory active rooms with persisted WAL room stems (showing `userCount = 0` when no users are connected), so durable rooms remain discoverable after restart. Admin-style room teardown is now first-class: `DELETE_ROOM` removes the room from routing, deletes all matching WAL files, emits `ROOM_DELETED` to connected occupants (who are moved back to lobby), and then broadcasts a fresh lobby snapshot.
 
 - **Push-to-Talk Voice Chat (`AudioEngine` / `UDP_ADMISSION`)** — `AudioEngine` implements a UDP audio data plane using `javax.sound.sampled` at 8 kHz / 16-bit signed PCM / mono / big-endian (`AUDIO_FORMAT`). Each 10 ms capture frame produces 160 bytes of PCM (`PAYLOAD_SIZE`). Wire datagrams are 196 bytes: a 36-byte null-padded UTF-8 identity token followed by the 160-byte PCM payload. Before audio can flow, the server sends a `UDP_ADMISSION` frame on the TCP channel carrying a `udpToken`; `AudioEngine.onUdpAdmission()` opens a connected `DatagramSocket`, sends a 36-byte registration punch packet, and starts the receive daemon. A dedicated capture thread (`distrisync-audio-capture`) runs at `MAX_PRIORITY`; a permanent receive daemon (`distrisync-audio-recv`) plays back incoming PCM via a lazily opened `SourceDataLine` with a 1 600-byte hardware buffer. The `UserSpeakingListener` functional interface fires on each received packet so the UI can highlight the active speaker.
 
@@ -128,6 +128,8 @@ distrisync/
 │               ├── RoomManagerTest.java
 │               ├── ServerMetricsTest.java
 │               └── WalManagerTest.java
+├── docs/
+│   └── Architecture.md
 ├── Dockerfile              # Multi-stage backend image (Maven → Temurin 21 JRE)
 ├── docker-compose.yml      # distrisync-server: TCP+UDP 9090, WAL volume, restart policy
 └── pom.xml
@@ -158,6 +160,9 @@ distrisync/
 | `UDP_ADMISSION` | `0x11` | S → C | No | JSON object `{ udpToken }` granting access to the UDP audio data plane; client calls `AudioEngine.onUdpAdmission()` on receipt |
 | `PING` | `0x12` | C → S | No | JSON object `{ "t": <originMillis> }` sent every 2 000 ms by `distrisync-ping` thread; server must be post-handshake |
 | `PONG` | `0x13` | S → C | No | JSON object `{ "t": <originMillis> }` — server echoes the origin timestamp unchanged; client computes `RTT = now - t` |
+| `DELETE_ROOM` | `0x14` | C → S | No | JSON object `{ roomId }` requesting durable room teardown; valid from lobby or the same active room |
+| `ROOM_DELETED` | `0x15` | S → C | No | Empty payload notifying occupants that their room was deleted; clients clear room/board state and return to lobby |
+| `FETCH_LOBBY` | `0x16` | C → S | No | Empty JSON object `{}` requesting an immediate `LOBBY_STATE` response for this connection |
 
 ---
 
