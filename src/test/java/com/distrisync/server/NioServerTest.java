@@ -5,6 +5,11 @@ import com.distrisync.client.NetworkClient;
 import com.distrisync.model.Circle;
 import com.distrisync.model.Line;
 import com.distrisync.model.Shape;
+import com.distrisync.protocol.Message;
+import com.distrisync.protocol.MessageCodec;
+import com.distrisync.protocol.MessageCodec.LobbyRoomEntry;
+import com.distrisync.protocol.MessageType;
+import com.distrisync.protocol.PartialMessageException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -14,7 +19,9 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
 import java.nio.channels.SelectionKey;
+import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -72,12 +79,179 @@ class NioServerTest {
         return null;
     }
 
+    private static ClientSession findLobbySession(RoomManager rm, String clientId) {
+        for (SelectionKey key : rm.snapshotLobbyKeys()) {
+            if (key.attachment() instanceof ClientSession s && clientId.equals(s.clientId)) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    private static void writeFullyBlocking(SocketChannel ch, ByteBuffer src) throws IOException {
+        ByteBuffer dup = src.duplicate();
+        while (dup.hasRemaining()) {
+            ch.write(dup);
+        }
+    }
+
+    /**
+     * Decodes every complete frame held in {@code acc} (flip/compact). Leaves a trailing partial
+     * frame compacted at the front of {@code acc}.
+     */
+    private static List<Message> tryDecodeFromAccumulator(ByteBuffer acc) {
+        List<Message> decoded = new ArrayList<>();
+        acc.flip();
+        while (acc.hasRemaining()) {
+            int start = acc.position();
+            try {
+                decoded.add(MessageCodec.decode(acc));
+            } catch (PartialMessageException e) {
+                acc.position(start);
+                break;
+            }
+        }
+        acc.compact();
+        return decoded;
+    }
+
+    /**
+     * Reads until {@code quietMs} elapses with no new bytes or {@code maxWaitMs} total.
+     * Discards all decoded frames (used to settle post-handshake LOBBY_STATE fan-out).
+     */
+    private static void drainTcpUntilQuiet(SocketChannel ch, ByteBuffer acc, long quietMs, long maxWaitMs)
+            throws IOException, InterruptedException {
+        ch.configureBlocking(false);
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxWaitMs);
+        long lastRead = System.nanoTime();
+        while (System.nanoTime() < deadline) {
+            int n = ch.read(acc);
+            if (n == -1) {
+                throw new IOException("unexpected EOF while draining");
+            }
+            if (n > 0) {
+                lastRead = System.nanoTime();
+                tryDecodeFromAccumulator(acc);
+            }
+            if (System.nanoTime() - lastRead > TimeUnit.MILLISECONDS.toNanos(quietMs)) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+    }
+
+    /** Reads until {@code acc} holds no undecoded bytes (no stranded partial frame). */
+    private static void finishAccumulatorWithoutPartial(SocketChannel ch, ByteBuffer acc, long maxWaitMs)
+            throws IOException, InterruptedException {
+        ch.configureBlocking(false);
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxWaitMs);
+        while (acc.position() > 0 && System.nanoTime() < deadline) {
+            ch.read(acc);
+            tryDecodeFromAccumulator(acc);
+            Thread.sleep(5);
+        }
+        assertThat(acc.position())
+                .as("accumulator must not retain a partial frame before FETCH_LOBBY")
+                .isZero();
+    }
+
     private static ByteBuffer tokenUtf8(String token) {
         byte[] raw = token.getBytes(StandardCharsets.UTF_8);
         assertThat(raw.length)
                 .as("test tokens must be exactly 36 UTF-8 bytes (standard UUID string)")
                 .isEqualTo(36);
         return ByteBuffer.wrap(raw);
+    }
+
+    /**
+     * {@code FETCH_LOBBY} must synthesize the same {@code LOBBY_STATE} rows as a lobby broadcast
+     * but deliver that frame only to the requesting TCP session — not to other lobby peers.
+     */
+    @Test
+    @DisplayName("FETCH_LOBBY returns targeted LOBBY_STATE to one client only")
+    void testFetchLobby_returnsTargetedLobbyState() throws Exception {
+        startServer();
+        roomManager.getOrCreateRoom("FetchLobbyRoom");
+
+        try (SocketChannel chA = SocketChannel.open();
+             SocketChannel chB = SocketChannel.open()) {
+            chA.configureBlocking(true);
+            chB.configureBlocking(true);
+            chA.connect(new InetSocketAddress(HOST, serverPort));
+            chB.connect(new InetSocketAddress(HOST, serverPort));
+
+            writeFullyBlocking(chA, MessageCodec.encodeHandshake("UserA", "client-fetch-a"));
+            writeFullyBlocking(chB, MessageCodec.encodeHandshake("UserB", "client-fetch-b"));
+
+            await("both clients registered in lobby on server")
+                    .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
+                    .pollInterval(POLL_MS, TimeUnit.MILLISECONDS)
+                    .until(() -> findLobbySession(roomManager, "client-fetch-a") != null
+                            && findLobbySession(roomManager, "client-fetch-b") != null);
+
+            ByteBuffer accA = ByteBuffer.allocate(256 * 1024);
+            ByteBuffer accB = ByteBuffer.allocate(256 * 1024);
+            drainTcpUntilQuiet(chA, accA, 250, SETUP_TIMEOUT_S * 1000L);
+            drainTcpUntilQuiet(chB, accB, 250, SETUP_TIMEOUT_S * 1000L);
+            finishAccumulatorWithoutPartial(chA, accA, SETUP_TIMEOUT_S * 1000L);
+            finishAccumulatorWithoutPartial(chB, accB, SETUP_TIMEOUT_S * 1000L);
+
+            ClientSession sessionA = findLobbySession(roomManager, "client-fetch-a");
+            ClientSession sessionB = findLobbySession(roomManager, "client-fetch-b");
+            assertThat(sessionA).isNotNull();
+            assertThat(sessionB).isNotNull();
+            int queuedA = sessionA.writeQueue.size();
+            int queuedB = sessionB.writeQueue.size();
+
+            chB.configureBlocking(false);
+            accB.clear();
+            int strayOnB = chB.read(accB);
+            assertThat(strayOnB)
+                    .as("peer B must have no pending TCP bytes before FETCH_LOBBY")
+                    .isEqualTo(0);
+
+            chA.configureBlocking(true);
+            writeFullyBlocking(chA, MessageCodec.encodeFetchLobby());
+
+            AtomicReference<Message> pulledLobby = new AtomicReference<>();
+            await("requesting client receives exactly one pulled LOBBY_STATE")
+                    .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
+                    .pollInterval(POLL_MS, TimeUnit.MILLISECONDS)
+                    .until(() -> {
+                        chA.configureBlocking(false);
+                        try {
+                            chA.read(accA);
+                        } finally {
+                            chA.configureBlocking(true);
+                        }
+                        for (Message m : tryDecodeFromAccumulator(accA)) {
+                            if (m.type() == MessageType.LOBBY_STATE) {
+                                if (!pulledLobby.compareAndSet(null, m)) {
+                                    fail("unexpected second LOBBY_STATE on requesting client (should be single pull)");
+                                }
+                            }
+                        }
+                        return pulledLobby.get() != null;
+                    });
+
+            assertThat(pulledLobby.get().type()).isEqualTo(MessageType.LOBBY_STATE);
+            List<LobbyRoomEntry> expected = roomManager.snapshotLobbyRoomEntries();
+            assertThat(MessageCodec.decodeLobbyState(pulledLobby.get())).isEqualTo(expected);
+
+            assertThat(sessionA.writeQueue.size())
+                    .as("FETCH_LOBBY path must flush LOBBY_STATE from the requesting session write queue")
+                    .isEqualTo(queuedA);
+            assertThat(sessionB.writeQueue.size())
+                    .as("non-requesting lobby peer must not receive a targeted enqueue")
+                    .isEqualTo(queuedB);
+
+            Thread.sleep(400);
+            accB.clear();
+            int lateOnB = chB.read(accB);
+            assertThat(lateOnB)
+                    .as("FETCH_LOBBY must not fan out LOBBY_STATE to other lobby TCP clients")
+                    .isEqualTo(0);
+        }
     }
 
     /**

@@ -18,9 +18,14 @@ import java.nio.ByteBuffer;
 import java.nio.channels.SelectableChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
+import java.nio.channels.Pipe;
+import java.nio.channels.Selector;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -132,6 +137,38 @@ class RoomManagerTest {
     }
 
     /**
+     * Strict union contract for lobby rows: persisted WAL stems minus stems already covered by an
+     * active room id (via {@link WalManager#sanitize}), merged with all active rooms and their
+     * live counts. The {@code Set}/{@code Map} arguments stand in for mocked
+     * {@code WalManager#getPersistedRoomIds()} and an active-room occupancy snapshot.
+     */
+    @Test
+    void testLobbyState_combinesActiveAndPersistedRooms() {
+        Set<String> persistedFromWal = Set.of("roomA", "roomB", "roomC");
+        Map<String, Integer> activeOccupancy = new HashMap<>();
+        activeOccupancy.put("roomA", 3);
+        activeOccupancy.put("roomD", 1);
+
+        List<LobbyRoomEntry> merged =
+                RoomManager.mergePersistedWalStemsWithActiveRooms(persistedFromWal, activeOccupancy);
+
+        assertThat(merged)
+                .as("union must list four rooms with exact userCount semantics")
+                .containsExactly(
+                        new LobbyRoomEntry("roomA", 3),
+                        new LobbyRoomEntry("roomB", 0),
+                        new LobbyRoomEntry("roomC", 0),
+                        new LobbyRoomEntry("roomD", 1));
+
+        ByteBuffer frame = MessageCodec.encodeLobbyState(merged);
+        Message onWire = MessageCodec.decode(frame);
+        assertThat(onWire.type()).isEqualTo(MessageType.LOBBY_STATE);
+        assertThat(MessageCodec.decodeLobbyState(onWire))
+                .as("LOBBY_STATE JSON round-trip must preserve the merged lobby rows exactly")
+                .isEqualTo(merged);
+    }
+
+    /**
      * <h2>Scenario</h2>
      * Client A is in {@code Room1} (sole occupant). A {@code LEAVE_ROOM} is modeled
      * as {@link RoomManager#returnClientToLobby(SelectionKey, String)}.
@@ -203,6 +240,72 @@ class RoomManagerTest {
                 .containsExactly(keyB);
         assertThat(roomManager.isInLobby(keyA)).isTrue();
         assertThat(roomManager.isInLobby(keyB)).isFalse();
+    }
+
+    /**
+     * Forced room deletion must notify every occupant with {@link MessageType#ROOM_DELETED},
+     * clear their {@link ClientSession} room fields, remove the routing entry, and invoke WAL teardown.
+     *
+     * <p>Uses real {@link Pipe} channels so {@link SelectionKey#attach} works on modern JDKs where
+     * {@code SelectionKey} attachment accessors are {@code final}.
+     */
+    @Test
+    void testDeleteRoom_evictsUsersAndClearsState(@TempDir Path tempDir) throws Exception {
+        Path walFile = tempDir.resolve("EvictMe_" + MessageCodec.DEFAULT_INITIAL_BOARD_ID + ".wal");
+        Files.createFile(walFile);
+
+        try (WalManager wal = new WalManager(tempDir)) {
+            RoomManager rm = new RoomManager(wal);
+            rm.setRoomDeletionClientHooks(null, null);
+
+            RoomContext ctx = new RoomContext("EvictMe", wal);
+            ClientSession s1 = new ClientSession();
+            ClientSession s2 = new ClientSession();
+            s1.handshakeComplete = true;
+            s2.handshakeComplete = true;
+            s1.roomId = "EvictMe";
+            s2.roomId = "EvictMe";
+
+            Selector sel = Selector.open();
+            Pipe p1 = Pipe.open();
+            Pipe p2 = Pipe.open();
+            try {
+                p1.source().configureBlocking(false);
+                p2.source().configureBlocking(false);
+                SelectionKey k1 = p1.source().register(sel, SelectionKey.OP_READ);
+                SelectionKey k2 = p2.source().register(sel, SelectionKey.OP_READ);
+                k1.attach(s1);
+                k2.attach(s2);
+                ctx.addKey(k1);
+                ctx.addKey(k2);
+                rm.getRooms().put("EvictMe", ctx);
+
+                rm.deleteRoom("EvictMe", wal);
+
+                assertThat(walFile)
+                        .as("deleteRoom must invoke WalManager.deleteRoomFiles — the on-disk WAL is removed")
+                        .doesNotExist();
+                assertThat(rm.getRoom("EvictMe")).isNull();
+
+                assertThat(s1.writeQueue).as("client 1 write queue").hasSize(1);
+                assertThat(s2.writeQueue).as("client 2 write queue").hasSize(1);
+                Message m1 = MessageCodec.decode(s1.writeQueue.peek().duplicate());
+                Message m2 = MessageCodec.decode(s2.writeQueue.peek().duplicate());
+                assertThat(m1.type()).isEqualTo(MessageType.ROOM_DELETED);
+                assertThat(m2.type()).isEqualTo(MessageType.ROOM_DELETED);
+
+                assertThat(s1.roomId).isEmpty();
+                assertThat(s2.roomId).isEmpty();
+                assertThat(s1.currentBoardId).isEmpty();
+                assertThat(s2.currentBoardId).isEmpty();
+            } finally {
+                sel.close();
+                p1.source().close();
+                p1.sink().close();
+                p2.source().close();
+                p2.sink().close();
+            }
+        }
     }
 
     // =========================================================================

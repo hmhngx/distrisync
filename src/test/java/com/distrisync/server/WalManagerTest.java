@@ -9,13 +9,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -303,6 +307,103 @@ class WalManagerTest {
                     .as("room 'Beta' must NOT contain the Alpha message")
                     .extracting(Message::payload)
                     .doesNotContain(alphaMsg.payload());
+        }
+    }
+
+    /**
+     * {@link WalManager#deleteRoomFiles} must close open {@link FileChannel}s for the room (releasing
+     * locks) before removing {@code {room}_*.wal} files, and must not affect other rooms.
+     */
+    @Test
+    void testDeleteRoomFiles_closesChannelsAndRemovesFiles() throws Exception {
+        Path roomAWal1 = tempDir.resolve("RoomA_Board-1.wal");
+        Path roomAWal2 = tempDir.resolve("RoomA_other-board.wal");
+        Path roomBWal  = tempDir.resolve("RoomB_Board-1.wal");
+        Files.createFile(roomAWal1);
+        Files.createFile(roomAWal2);
+        Files.createFile(roomBWal);
+
+        try (WalManager wal = new WalManager(tempDir)) {
+            @SuppressWarnings("resource")
+            FileChannel roomAChannel = FileChannel.open(
+                    roomAWal1,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE);
+
+            ConcurrentHashMap<String, FileChannel> chMap = walChannelsMap(wal);
+            chMap.put("RoomA_Board-1", roomAChannel);
+
+            wal.deleteRoomFiles("RoomA");
+
+            assertThat(roomAChannel.isOpen())
+                    .as("channel for RoomA must be closed before/after WAL deletion")
+                    .isFalse();
+            assertThat(chMap.keySet())
+                    .as("no WAL channel keys may remain for the deleted room stem")
+                    .noneMatch(k -> k.startsWith("RoomA_"));
+
+            assertThat(roomAWal1).doesNotExist();
+            assertThat(roomAWal2).doesNotExist();
+            assertThat(roomBWal).exists();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ConcurrentHashMap<String, FileChannel> walChannelsMap(WalManager wal) throws Exception {
+        Field f = WalManager.class.getDeclaredField("channels");
+        f.setAccessible(true);
+        return (ConcurrentHashMap<String, FileChannel>) f.get(wal);
+    }
+
+    /**
+     * {@link WalManager#getPersistedRoomIds} must discover every room stem from {@code *.wal}
+     * files (deduping multiple boards per room) without opening WAL contents.
+     */
+    @Test
+    void getPersistedRoomIds_scansWalFiles_dedupesMultipleBoardsPerRoom() throws IOException {
+        try (WalManager wal = new WalManager(tempDir)) {
+            wal.append("Alpha", BOARD, shapeCommit(1));
+            wal.append("Beta", BOARD, shapeCommit(2));
+            wal.append("Alpha", "other-board", shapeCommit(3));
+        }
+        try (WalManager reader = new WalManager(tempDir)) {
+            Set<String> ids = reader.getPersistedRoomIds();
+            assertThat(ids).containsExactlyInAnyOrder("Alpha", "Beta");
+        }
+    }
+
+    /**
+     * Room ids that sanitise to stems containing internal underscores must split on the
+     * last underscore only (room vs board), matching on-disk layout.
+     */
+    @Test
+    void getPersistedRoomIds_handlesSanitisedRoomStemWithTrailingUnderscores() throws IOException {
+        String unsafeRoomId = "Room/Sub:Name!";
+        try (WalManager wal = new WalManager(tempDir)) {
+            wal.append(unsafeRoomId, BOARD, shapeCommit(1));
+        }
+        try (WalManager reader = new WalManager(tempDir)) {
+            assertThat(reader.getPersistedRoomIds()).containsExactly("Room_Sub_Name_");
+        }
+    }
+
+    /**
+     * {@link WalManager#getPersistedRoomIds} must parse {@code *.wal} basenames using the
+     * final underscore as the room/board boundary, ignore non-{@code .wal} files, and tolerate
+     * malformed {@code .wal} names without throwing.
+     */
+    @Test
+    void testRetrievePersistedRoomIds_handlesComplexFilenames() throws IOException {
+        Files.createFile(tempDir.resolve("normal_Board-1.wal"));
+        Files.createFile(tempDir.resolve("room_with_underscores_Board-2.wal"));
+        Files.createFile(tempDir.resolve("another-room_Board-1.wal"));
+        Files.createFile(tempDir.resolve("invalid-file.txt"));
+        Files.createFile(tempDir.resolve("corrupted.wal"));
+
+        try (WalManager wal = new WalManager(tempDir)) {
+            assertThatCode(wal::getPersistedRoomIds).doesNotThrowAnyException();
+            assertThat(wal.getPersistedRoomIds())
+                    .containsExactlyInAnyOrder("normal", "room_with_underscores", "another-room");
         }
     }
 
