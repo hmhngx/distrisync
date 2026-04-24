@@ -429,6 +429,88 @@ public final class MessageCodec {
         return encode(new Message(MessageType.LEAVE_ROOM, ""));
     }
 
+    /**
+     * Encodes {@code FETCH_LOBBY} with the required empty JSON object body {@code {}}.
+     */
+    public static ByteBuffer encodeFetchLobby() {
+        return encode(new Message(MessageType.FETCH_LOBBY, "{}"));
+    }
+
+    /**
+     * Validates a {@code FETCH_LOBBY} frame: payload must be exactly {@code {}} (optional surrounding whitespace).
+     *
+     * @throws IllegalArgumentException if {@code msg} is wrong type or payload is not {@code {}}
+     */
+    public static void decodeFetchLobby(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.FETCH_LOBBY) {
+            throw new IllegalArgumentException("expected FETCH_LOBBY, got " + msg.type());
+        }
+        String raw = msg.payload();
+        if (raw == null) {
+            throw new IllegalArgumentException("FETCH_LOBBY payload is null");
+        }
+        String p = raw.strip();
+        if (!p.equals("{}")) {
+            throw new IllegalArgumentException("FETCH_LOBBY payload must be empty JSON object {}");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // DELETE_ROOM / ROOM_DELETED
+    // -------------------------------------------------------------------------
+
+    /**
+     * JSON body for {@link MessageType#DELETE_ROOM}: room to remove from durable storage.
+     *
+     * @param roomId non-blank room identifier (same logical id as {@link #JOIN_ROOM})
+     */
+    public record DeleteRoomPayload(String roomId) {}
+
+    /**
+     * Encodes {@code DELETE_ROOM} as {@code {"roomId":"..."}}.
+     */
+    public static ByteBuffer encodeDeleteRoom(String roomId) {
+        if (roomId == null) throw new IllegalArgumentException("roomId must not be null");
+        JsonObject o = new JsonObject();
+        o.addProperty("roomId", roomId);
+        return encode(new Message(MessageType.DELETE_ROOM, GSON.toJson(o)));
+    }
+
+    /**
+     * Parses {@code DELETE_ROOM} payload: JSON object {@code { "roomId": "..." }}.
+     */
+    public static DeleteRoomPayload decodeDeleteRoom(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.DELETE_ROOM) {
+            throw new IllegalArgumentException("expected DELETE_ROOM, got " + msg.type());
+        }
+        String raw = msg.payload();
+        if (raw == null || raw.isBlank()) {
+            throw new IllegalArgumentException("DELETE_ROOM payload is blank");
+        }
+        try {
+            JsonObject o = JsonParser.parseString(raw.strip()).getAsJsonObject();
+            if (!o.has("roomId") || o.get("roomId").isJsonNull()) {
+                throw new IllegalArgumentException("DELETE_ROOM missing roomId");
+            }
+            String rid = o.get("roomId").getAsString().strip();
+            if (rid.isBlank()) {
+                throw new IllegalArgumentException("DELETE_ROOM room id is blank");
+            }
+            return new DeleteRoomPayload(rid);
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Malformed DELETE_ROOM: " + e.getMessage(), e);
+        }
+    }
+
+    /** Encodes {@code ROOM_DELETED} with an empty UTF-8 payload (server notifies clients the room is gone). */
+    public static ByteBuffer encodeRoomDeleted() {
+        return encode(new Message(MessageType.ROOM_DELETED, ""));
+    }
+
     // -------------------------------------------------------------------------
     // BOARD_LIST_UPDATE (server → client)
     // -------------------------------------------------------------------------

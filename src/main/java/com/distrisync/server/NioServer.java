@@ -28,7 +28,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -89,6 +91,12 @@ public final class NioServer implements Runnable {
 
     private final int port;
     private final RoomManager roomManager;
+
+    /**
+     * Optional WAL engine for {@link com.distrisync.protocol.MessageType#DELETE_ROOM} durable teardown;
+     * {@code null} in tests that only exercise in-memory routing.
+     */
+    private final WalManager walManager;
 
     /**
      * Maps {@link ClientSession#udpToken} to the owning session for UDP registration and audio relay.
@@ -156,10 +164,18 @@ public final class NioServer implements Runnable {
      * @param roomManager the multi-tenant routing registry
      */
     public NioServer(int port, RoomManager roomManager) {
+        this(port, roomManager, null);
+    }
+
+    /**
+     * @param walManager  WAL used when servicing {@link MessageType#DELETE_ROOM}; may be {@code null}
+     */
+    public NioServer(int port, RoomManager roomManager, WalManager walManager) {
         if (port < 0 || port > 65535) throw new IllegalArgumentException("Invalid port: " + port);
         if (roomManager == null)       throw new IllegalArgumentException("roomManager must not be null");
         this.port        = port;
         this.roomManager = roomManager;
+        this.walManager  = walManager;
     }
 
     // =========================================================================
@@ -185,6 +201,7 @@ public final class NioServer implements Runnable {
                 pendingLobbyFrames.offer(frame);
                 selectorRef.wakeup();
             });
+            roomManager.setRoomDeletionClientHooks(this::revokeUdpAdmission, (s, k) -> flushWriteQueue(s, k));
 
             serverChannel.configureBlocking(false);
             serverChannel.bind(new InetSocketAddress(port));
@@ -432,6 +449,55 @@ public final class NioServer implements Runnable {
                 log.info("LEAVE_ROOM session={} → lobby", session.sessionId);
             }
 
+            case FETCH_LOBBY -> {
+                if (!session.handshakeComplete) {
+                    log.trace("FETCH_LOBBY before HANDSHAKE ignored session={}", session.sessionId);
+                    break;
+                }
+                try {
+                    MessageCodec.decodeFetchLobby(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed FETCH_LOBBY session={}: {}", session.sessionId, e.getMessage());
+                    break;
+                }
+                ByteBuffer lobbyFrame = MessageCodec.encodeLobbyState(roomManager.snapshotLobbyRoomEntries());
+                session.enqueue(lobbyFrame);
+                if (!flushWriteQueue(session, senderKey)) {
+                    log.error("FETCH_LOBBY LOBBY_STATE flush failed for session={} — closing connection",
+                            session.sessionId);
+                    closeKey(senderKey);
+                }
+            }
+
+            case DELETE_ROOM -> {
+                if (!session.handshakeComplete) {
+                    log.warn("DELETE_ROOM before HANDSHAKE session={}", session.sessionId);
+                    break;
+                }
+                MessageCodec.DeleteRoomPayload dp;
+                try {
+                    dp = MessageCodec.decodeDeleteRoom(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed DELETE_ROOM session={}: {}", session.sessionId, e.getMessage());
+                    break;
+                }
+                String rid = dp.roomId();
+                if (rid.isBlank()) {
+                    log.warn("Blank DELETE_ROOM session={}", session.sessionId);
+                    break;
+                }
+                // In a canvas room: only the current room may be deleted. From the lobby: allow
+                // deleting any listed room (lobby UI sends DELETE_ROOM before JOIN).
+                if (!session.roomId.isBlank() && !rid.equals(session.roomId)) {
+                    log.warn("DELETE_ROOM room mismatch session={} rid='{}' currentRoom='{}'",
+                            session.sessionId, rid, session.roomId);
+                    break;
+                }
+                roomManager.deleteRoom(rid, walManager);
+                broadcastLobbyState();
+                log.info("DELETE_ROOM completed  roomId='{}' session={}", rid, session.sessionId);
+            }
+
             case MUTATION -> {
                 RoomContext room = resolveRoom(session, senderKey);
                 if (room == null) return;
@@ -643,7 +709,7 @@ public final class NioServer implements Runnable {
      * Encodes the room's current canvas state as a {@code SNAPSHOT} frame and
      * enqueues it for delivery to the newly joined session.
      */
-    private void revokeUdpAdmission(ClientSession session) {
+    void revokeUdpAdmission(ClientSession session) {
         String tok = session.udpToken;
         if (tok != null && !tok.isBlank()) {
             udpTokenToSession.remove(tok, session);
@@ -831,6 +897,30 @@ public final class NioServer implements Runnable {
         toClose.forEach(this::closeKey);
     }
 
+    /**
+     * Builds and fans out a fresh {@code LOBBY_STATE} from current in-memory rooms + persisted WAL stems.
+     * Must run after lifecycle-changing operations (e.g. DELETE_ROOM) and on the selector thread.
+     */
+    private void broadcastLobbyState() {
+        Set<String> persistedStems = Set.of();
+        if (walManager != null) {
+            try {
+                persistedStems = walManager.getPersistedRoomIds();
+            } catch (IOException e) {
+                log.warn("Failed to list persisted WAL room ids during lobby broadcast: {}", e.getMessage());
+            }
+        }
+
+        Map<String, Integer> activeCounts = new HashMap<>(roomManager.getRooms().size());
+        for (var entry : roomManager.getRooms().entrySet()) {
+            activeCounts.put(entry.getKey(), entry.getValue().getActiveClientCount());
+        }
+
+        List<MessageCodec.LobbyRoomEntry> entries =
+                RoomManager.mergePersistedWalStemsWithActiveRooms(persistedStems, activeCounts);
+        deliverLobbyStateFrame(MessageCodec.encodeLobbyState(entries));
+    }
+
     // =========================================================================
     // Room + board scoped broadcast
     // =========================================================================
@@ -935,7 +1025,7 @@ public final class NioServer implements Runnable {
      * @return {@code true} on success; {@code false} if an {@link IOException}
      *         occurred (caller should close the key)
      */
-    private boolean flushWriteQueue(ClientSession session, SelectionKey key) {
+    boolean flushWriteQueue(ClientSession session, SelectionKey key) {
         SocketChannel channel = (SocketChannel) key.channel();
 
         try {

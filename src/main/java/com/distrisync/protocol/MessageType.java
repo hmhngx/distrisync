@@ -30,6 +30,9 @@ import java.util.Map;
  * 0x11        UDP_ADMISSION     – server→client: JSON object { udpToken } for joining the UDP audio data plane
  * 0x12        PING              – client→server: JSON object { t } — origin {@code System.currentTimeMillis()}
  * 0x13        PONG              – server→client: JSON object { t } — echoes the ping origin timestamp for RTT
+ * 0x14        DELETE_ROOM       – client→server: JSON object { roomId } — request durable room removal
+ * 0x15        ROOM_DELETED      – server→client: empty payload — room was destroyed; clients should return to lobby
+ * 0x16        FETCH_LOBBY       – client→server: empty JSON object {} — pull current LOBBY_STATE for this connection only
  * </pre>
  */
 public enum MessageType {
@@ -52,7 +55,10 @@ public enum MessageType {
     BOARD_LIST_UPDATE((byte) 0x10),
     UDP_ADMISSION    ((byte) 0x11),
     PING             ((byte) 0x12),
-    PONG             ((byte) 0x13);
+    PONG             ((byte) 0x13),
+    DELETE_ROOM      ((byte) 0x14),
+    ROOM_DELETED     ((byte) 0x15),
+    FETCH_LOBBY      ((byte) 0x16);
 
     private final byte wireCode;
 

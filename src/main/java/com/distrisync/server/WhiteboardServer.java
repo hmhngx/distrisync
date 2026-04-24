@@ -72,7 +72,7 @@ public final class WhiteboardServer {
 
         RoomManager            roomManager = new RoomManager(walManager);
         StorageLifecycleManager lifecycle  = new StorageLifecycleManager(roomManager, walManager);
-        NioServer               server     = new NioServer(port, roomManager);
+        NioServer               server     = new NioServer(port, roomManager, walManager);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("Shutdown hook — stopping server and flushing WAL");

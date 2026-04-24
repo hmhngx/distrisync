@@ -12,9 +12,13 @@ import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
@@ -35,6 +39,8 @@ import java.util.function.Consumer;
  * An optional {@link WalManager} may be supplied at construction.  When present
  * each {@link #appendToWal} call persists the message before it is broadcast;
  * per-board state is replayed lazily when a board is first opened.
+ * {@code LOBBY_STATE} also lists room ids discovered from {@code *.wal} on disk
+ * (with {@code userCount = 0} when no in-memory room exists yet).
  *
  * <h2>Thread safety</h2>
  * All public methods are safe to call from multiple threads concurrently.
@@ -55,6 +61,14 @@ public final class RoomManager {
      * the storage lifecycle daemon after GC.
      */
     private volatile Consumer<ByteBuffer> lobbyFanout;
+
+    /**
+     * Optional hooks installed by {@link NioServer} on the selector thread so
+     * forced room teardown can revoke UDP admission and arm immediate TCP flushes
+     * after {@code ROOM_DELETED} is enqueued.
+     */
+    private volatile Consumer<ClientSession> sessionEvictionHook;
+    private volatile BiConsumer<ClientSession, SelectionKey> flushAfterRoomDeletedHook;
 
     /** Creates a room manager with no WAL persistence (rooms are ephemeral). */
     public RoomManager() {
@@ -78,6 +92,68 @@ public final class RoomManager {
      */
     public void setLobbyFanout(Consumer<ByteBuffer> fanout) {
         this.lobbyFanout = fanout;
+    }
+
+    /**
+     * Installs optional per-session hooks used during {@link #deleteRoom(String, WalManager)}.
+     * Either argument may be {@code null} (e.g. in unit tests that only assert queue contents).
+     *
+     * @param sessionEvictionHook      typically revokes UDP tokens (same as {@code LEAVE_ROOM})
+     * @param flushAfterRoomDeletedHook typically flushes the TCP write queue / arms {@code OP_WRITE}
+     */
+    public void setRoomDeletionClientHooks(
+            Consumer<ClientSession> sessionEvictionHook,
+            BiConsumer<ClientSession, SelectionKey> flushAfterRoomDeletedHook) {
+        this.sessionEvictionHook = sessionEvictionHook;
+        this.flushAfterRoomDeletedHook = flushAfterRoomDeletedHook;
+    }
+
+    /**
+     * Removes {@code roomId} from the routing table, notifies every connected client in that room
+     * with {@link com.distrisync.protocol.MessageType#ROOM_DELETED}, clears their active room/board
+     * fields (and optional UDP hooks), deletes durable {@code .wal} files via {@code walManager},
+     * and pushes an updated {@code LOBBY_STATE} to lobby subscribers.
+     *
+     * @param roomId     non-blank room id to tear down
+     * @param walManager WAL engine for {@link WalManager#deleteRoomFiles(String)}; {@code null} skips disk delete
+     */
+    public void deleteRoom(String roomId, WalManager walManager) {
+        if (roomId == null || roomId.isBlank()) {
+            throw new IllegalArgumentException("roomId must not be null or blank");
+        }
+        RoomContext ctx = rooms.remove(roomId);
+        if (ctx != null) {
+            ByteBuffer roomDeletedFrame = MessageCodec.encodeRoomDeleted();
+            List<SelectionKey> keys = new ArrayList<>(ctx.activeKeysForSelectorIteration());
+            for (SelectionKey key : keys) {
+                if (key == null || !key.isValid()) {
+                    continue;
+                }
+                Object att = key.attachment();
+                if (att instanceof ClientSession session) {
+                    session.enqueue(roomDeletedFrame);
+                    Consumer<ClientSession> evict = sessionEvictionHook;
+                    if (evict != null) {
+                        evict.accept(session);
+                    }
+                    session.roomId = "";
+                    session.currentBoardId = "";
+                    lobbyClients.add(key);
+                    BiConsumer<ClientSession, SelectionKey> flush = flushAfterRoomDeletedHook;
+                    if (flush != null) {
+                        flush.accept(session, key);
+                    }
+                }
+                ctx.removeKey(key);
+            }
+        }
+        if (walManager != null) {
+            try {
+                walManager.deleteRoomFiles(roomId);
+            } catch (IOException e) {
+                log.error("deleteRoomFiles failed  roomId='{}': {}", roomId, e.getMessage(), e);
+            }
+        }
     }
 
     /** @return {@code true} if {@code key} is registered in the discovery lobby */
@@ -240,13 +316,54 @@ public final class RoomManager {
         return List.copyOf(lobbyClients);
     }
 
-    private List<LobbyRoomEntry> buildLobbyRoomEntries() {
-        List<LobbyRoomEntry> list = new ArrayList<>(rooms.size());
-        for (var e : rooms.entrySet()) {
-            list.add(new LobbyRoomEntry(e.getKey(), e.getValue().getActiveClientCount()));
+    /**
+     * Pure merge used by {@link #buildLobbyRoomEntries()}: every in-memory room with its live
+     * {@code userCount}, plus any persisted WAL room stem not already covered by
+     * {@link WalManager#sanitize} of an active room id (those appear with {@code userCount = 0}).
+     */
+    static List<LobbyRoomEntry> mergePersistedWalStemsWithActiveRooms(
+            Set<String> persistedStemsFromWal,
+            Map<String, Integer> activeRoomIdToUserCount) {
+
+        Set<String> persistedOnly = new HashSet<>(persistedStemsFromWal);
+        for (String activeRoomId : activeRoomIdToUserCount.keySet()) {
+            persistedOnly.remove(WalManager.sanitize(activeRoomId));
+        }
+
+        List<LobbyRoomEntry> list =
+                new ArrayList<>(activeRoomIdToUserCount.size() + persistedOnly.size());
+        for (var e : activeRoomIdToUserCount.entrySet()) {
+            list.add(new LobbyRoomEntry(e.getKey(), e.getValue()));
+        }
+        for (String stem : persistedOnly) {
+            list.add(new LobbyRoomEntry(stem, 0));
         }
         list.sort(Comparator.comparing(LobbyRoomEntry::roomId));
         return list;
+    }
+
+    private List<LobbyRoomEntry> buildLobbyRoomEntries() {
+        Set<String> persistedStems = Set.of();
+        if (walManager != null) {
+            try {
+                persistedStems = walManager.getPersistedRoomIds();
+            } catch (IOException e) {
+                log.warn("Failed to list persisted WAL room ids: {}", e.getMessage());
+            }
+        }
+        Map<String, Integer> activeCounts = new HashMap<>(rooms.size());
+        for (var e : rooms.entrySet()) {
+            activeCounts.put(e.getKey(), e.getValue().getActiveClientCount());
+        }
+        return mergePersistedWalStemsWithActiveRooms(persistedStems, activeCounts);
+    }
+
+    /**
+     * Point-in-time snapshot of merged active and persisted lobby rows — the same list
+     * {@link #notifyLobbySubscribers()} encodes into {@code LOBBY_STATE} for lobby broadcasts.
+     */
+    public List<LobbyRoomEntry> snapshotLobbyRoomEntries() {
+        return List.copyOf(buildLobbyRoomEntries());
     }
 
     private void notifyLobbySubscribers() {
@@ -254,7 +371,7 @@ public final class RoomManager {
         if (fan == null) {
             return;
         }
-        ByteBuffer frame = MessageCodec.encodeLobbyState(buildLobbyRoomEntries());
+        ByteBuffer frame = MessageCodec.encodeLobbyState(snapshotLobbyRoomEntries());
         fan.accept(frame);
     }
 

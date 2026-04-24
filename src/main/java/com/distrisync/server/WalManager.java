@@ -18,9 +18,13 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 /**
  * Append-only Write-Ahead Log engine for per-room, per-board canvas durability.
@@ -107,6 +111,43 @@ final class WalManager implements Closeable {
         return messages;
     }
 
+    /**
+     * Lists every room id that has at least one persisted {@code .wal} file under {@link #dataDir}.
+     *
+     * <p>Filenames follow {@code {sanitisedRoomId}_{sanitisedBoardId}.wal}. The returned id is the
+     * sanitised room prefix (everything before the last {@code '_'} in the basename), so it matches
+     * the stem used by {@link #walPath} and may differ from the original room string when the latter
+     * contained filename-unsafe characters.
+     */
+    public Set<String> getPersistedRoomIds() throws IOException {
+        Set<String> ids = new HashSet<>();
+        try (Stream<Path> stream = Files.list(dataDir)) {
+            stream.filter(Files::isRegularFile)
+                    .map(p -> p.getFileName().toString())
+                    .filter(name -> name.endsWith(".wal"))
+                    .map(WalManager::roomStemFromWalFilename)
+                    .filter(Objects::nonNull)
+                    .forEach(ids::add);
+        }
+        return Set.copyOf(ids);
+    }
+
+    /**
+     * Parses {@code sanitisedRoom_sanitisedBoard.wal} → sanitised room stem (substring before last
+     * {@code '_'}), or {@code null} if the name does not match the expected pattern.
+     */
+    private static String roomStemFromWalFilename(String fileName) {
+        if (fileName.length() <= 4) {
+            return null;
+        }
+        String base = fileName.substring(0, fileName.length() - ".wal".length());
+        int last = base.lastIndexOf('_');
+        if (last <= 0 || last >= base.length() - 1) {
+            return null;
+        }
+        return base.substring(0, last);
+    }
+
     void compactWal(String roomId, String boardId, List<Shape> snapshot) throws IOException {
         validateNonBlank(roomId, "roomId");
         validateNonBlank(boardId, "boardId");
@@ -164,6 +205,73 @@ final class WalManager implements Closeable {
         return Files.exists(path) ? Files.size(path) : 0L;
     }
 
+    /**
+     * Releases WAL {@link FileChannel}s for this room and deletes matching {@code .wal} files under
+     * {@link #dataDir}. Channels must be closed before file deletion so the OS lock is dropped.
+     *
+     * <p>Keys and filenames use {@link #sanitize(String)} for the room segment, matching
+     * {@link #walMapKey(String, String)} — the effective prefix is {@code sanitize(roomId) + '_'}.
+     */
+    public void deleteRoomFiles(String roomId) throws IOException {
+        validateNonBlank(roomId, "roomId");
+        String sanitizedRoomId = sanitize(roomId);
+        String prefix = sanitizedRoomId + "_";
+        for (String key : new ArrayList<>(channels.keySet())) {
+            if (key.startsWith(prefix)) {
+                FileChannel ch = channels.get(key);
+                if (ch != null) {
+                    try {
+                        ch.close();
+                    } catch (IOException e) {
+                        log.warn("Error closing WAL channel during room delete  key='{}': {}", key, e.getMessage());
+                    }
+                }
+                channels.remove(key);
+            }
+        }
+
+        int deletePasses = 0;
+        boolean roomRemoved = false;
+        while (deletePasses < 2 && !roomRemoved) {
+            deletePasses++;
+            try (Stream<Path> stream = Files.list(dataDir)) {
+                List<Path> walPaths = stream
+                        .filter(Files::isRegularFile)
+                        .filter(p -> {
+                            String name = p.getFileName().toString();
+                            return name.endsWith(".wal") && name.startsWith(prefix);
+                        })
+                        .toList();
+                for (Path p : walPaths) {
+                    Files.deleteIfExists(p);
+                }
+            }
+
+            boolean filesRemain;
+            try (Stream<Path> stream = Files.list(dataDir)) {
+                filesRemain = stream
+                        .filter(Files::isRegularFile)
+                        .map(p -> p.getFileName().toString())
+                        .anyMatch(name -> name.endsWith(".wal") && name.startsWith(prefix));
+            }
+
+            Set<String> persistedRoomIds = getPersistedRoomIds();
+            boolean roomStillPersisted = persistedRoomIds.contains(roomId) || persistedRoomIds.contains(sanitizedRoomId);
+            roomRemoved = !filesRemain && !roomStillPersisted;
+
+            if (!roomRemoved) {
+                log.error("Synchronous WAL delete barrier not met  roomId='{}' sanitizedRoomId='{}' prefix='{}' filesRemain={} persistedRoomIds={}",
+                        roomId, sanitizedRoomId, prefix, filesRemain, persistedRoomIds);
+            }
+        }
+
+        if (!roomRemoved) {
+            throw new IOException("deleteRoomFiles() failed synchronous barrier for roomId='" + roomId + "'");
+        }
+
+        log.info("WAL room files removed  roomId='{}' prefix='{}' dataDir='{}'", roomId, prefix, dataDir);
+    }
+
     @Override
     public void close() {
         if (closed) return;
@@ -179,7 +287,8 @@ final class WalManager implements Closeable {
         log.info("WalManager closed  dataDir='{}'", dataDir);
     }
 
-    private static String sanitize(String id) {
+    /** Same mapping as WAL basenames; package-private for lobby / discovery alignment. */
+    static String sanitize(String id) {
         return id.replaceAll("[^A-Za-z0-9._-]", "_");
     }
 
