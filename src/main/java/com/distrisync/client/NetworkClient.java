@@ -1,8 +1,11 @@
 package com.distrisync.client;
 
+import com.distrisync.model.ArrowNode;
 import com.distrisync.model.Circle;
+import com.distrisync.model.EllipseNode;
 import com.distrisync.model.EraserPath;
 import com.distrisync.model.Line;
+import com.distrisync.model.RectangleNode;
 import com.distrisync.model.Shape;
 import com.distrisync.model.TextNode;
 import com.distrisync.protocol.Message;
@@ -150,10 +153,15 @@ public final class NetworkClient implements AutoCloseable {
      */
     private final CopyOnWriteArrayList<Runnable> roomDeletedListeners = new CopyOnWriteArrayList<>();
 
+    private final CopyOnWriteArrayList<VoiceStateListener> voiceStateListeners =
+            new CopyOnWriteArrayList<>();
+
     /** Opaque UDP relay token from the latest {@link MessageType#UDP_ADMISSION}; empty until admitted. */
     private volatile String udpToken = "";
 
     private final AudioEngine audioEngine = new AudioEngine();
+
+    private final ParticipantManager participantManager = new ParticipantManager();
 
     /**
      * Outgoing MUTATION frames awaiting dispatch.  Produced by any thread via
@@ -249,6 +257,9 @@ public final class NetworkClient implements AutoCloseable {
         this.port       = port;
         this.authorName = authorName != null ? authorName : "";
         this.clientId   = clientId   != null ? clientId   : "";
+        audioEngine.setVoiceStateSync(this::sendVoiceState);
+        audioEngine.setParticipantManager(participantManager);
+        addVoiceStateListener(participantManager);
     }
 
     // =========================================================================
@@ -473,12 +484,14 @@ public final class NetworkClient implements AutoCloseable {
         return ping;
     }
 
-    /**
-     * Push-to-talk audio engine (mic capture + UDP playback). Configure speaking
-     * highlights via {@link AudioEngine#setUserSpeakingListener(UserSpeakingListener)}.
-     */
+    /** Push-to-talk audio engine (mic capture + UDP playback). */
     public AudioEngine getAudioEngine() {
         return audioEngine;
+    }
+
+    /** Room participant roster and peer audio state for UI binding. */
+    public ParticipantManager getParticipantManager() {
+        return participantManager;
     }
 
     /**
@@ -543,6 +556,34 @@ public final class NetworkClient implements AutoCloseable {
         }
     }
 
+    public void addVoiceStateListener(VoiceStateListener listener) {
+        if (listener != null) {
+            voiceStateListeners.addIfAbsent(listener);
+        }
+    }
+
+    public void removeVoiceStateListener(VoiceStateListener listener) {
+        if (listener != null) {
+            voiceStateListeners.remove(listener);
+        }
+    }
+
+    /**
+     * Publishes this client's hardware microphone mute state to all other peers in the room
+     * via the reliable TCP control plane ({@link MessageType#VOICE_STATE}).
+     *
+     * <p>Silently no-ops when not connected. Not used for voice-activity / speaking detection.
+     *
+     * @param isMuted {@code true} when the local mic is muted
+     */
+    public void sendVoiceState(boolean isMuted) {
+        if (!running.get()) {
+            return;
+        }
+        enqueueFrame(MessageCodec.encodeVoiceState(clientId, isMuted));
+        log.debug("VOICE_STATE enqueued clientId={} muted={}", clientId, isMuted);
+    }
+
     /**
      * Stops both I/O threads and closes the underlying channel.  Safe to call
      * from any thread.  After this returns the client instance must not be
@@ -582,6 +623,7 @@ public final class NetworkClient implements AutoCloseable {
         knownBoards.clear();
         currentBoardId = "";
         lastSnapshotBoardId = "";
+        participantManager.clear();
         notifyWorkspaceListeners();
     }
 
@@ -772,6 +814,7 @@ public final class NetworkClient implements AutoCloseable {
         activeRoomId = "";
         resetWorkspaceForLobby();
         publishUdpActive(false);
+        audioEngine.stopCaptureDaemon();
         enqueueFrame(MessageCodec.encodeLeaveRoom());
         log.debug("LEAVE_ROOM enqueued");
         sendFetchLobby();
@@ -1119,6 +1162,7 @@ public final class NetworkClient implements AutoCloseable {
                 activeRoomId = "";
                 resetWorkspaceForLobby();
                 publishUdpActive(false);
+                audioEngine.stopCaptureDaemon();
                 for (Runnable listener : roomDeletedListeners) {
                     try {
                         listener.run();
@@ -1169,6 +1213,17 @@ public final class NetworkClient implements AutoCloseable {
                     applyPingRtt(origin);
                 } catch (Exception e) {
                     log.debug("Malformed PONG ignored: {}", e.getMessage());
+                }
+            }
+            case VOICE_STATE -> {
+                try {
+                    MessageCodec.VoiceStatePayload p = MessageCodec.decodeVoiceState(msg);
+                    log.debug("VOICE_STATE received clientId={} muted={}", p.clientId(), p.isMuted());
+                    for (VoiceStateListener listener : voiceStateListeners) {
+                        listener.onVoiceState(p.clientId(), p.isMuted());
+                    }
+                } catch (Exception e) {
+                    log.debug("Malformed VOICE_STATE ignored: {}", e.getMessage());
                 }
             }
             case FETCH_LOBBY ->
@@ -1403,10 +1458,13 @@ public final class NetworkClient implements AutoCloseable {
                         "Shape envelope is missing the '" + TYPE_FIELD + "' discriminator field");
             }
             return switch (typeElement.getAsString()) {
-                case "Line"       -> GSON.fromJson(envelope, Line.class);
-                case "Circle"     -> GSON.fromJson(envelope, Circle.class);
-                case "TextNode"   -> GSON.fromJson(envelope, TextNode.class);
-                case "EraserPath" -> GSON.fromJson(envelope, EraserPath.class);
+                case "Line"          -> GSON.fromJson(envelope, Line.class);
+                case "Circle"        -> GSON.fromJson(envelope, Circle.class);
+                case "TextNode"      -> GSON.fromJson(envelope, TextNode.class);
+                case "EraserPath"    -> GSON.fromJson(envelope, EraserPath.class);
+                case "RectangleNode" -> GSON.fromJson(envelope, RectangleNode.class);
+                case "EllipseNode"   -> GSON.fromJson(envelope, EllipseNode.class);
+                case "ArrowNode"     -> GSON.fromJson(envelope, ArrowNode.class);
                 default -> throw new IllegalArgumentException(
                         "Unknown shape type discriminator: '" + typeElement.getAsString() + "'");
             };
