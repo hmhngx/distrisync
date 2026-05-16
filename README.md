@@ -25,13 +25,13 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Binary Length-Prefixed Protocol** — `MessageCodec` frames every message as `[type: 1B][length: 4B big-endian][UTF-8 JSON payload]`; partial-read detection via `PartialMessageException` with buffer compaction; max payload 16 MiB.
 
-- **Sealed Shape Hierarchy** — `Shape` is a Java 21 sealed interface permitting `Line`, `Circle`, `EraserPath`, and `TextNode`; each record carries `objectId` (UUID), Lamport `timestamp`, `color`, `strokeWidth`, `authorName`, and `clientId`. Server-side `ShapeCodec` and a mirrored client `ClientShapeCodec` deserialise via a `"_type"` discriminator field with Gson.
+- **Sealed Shape Hierarchy** — `Shape` is a Java 21 sealed interface permitting `Line`, `Circle`, `RectangleNode`, `EllipseNode`, `ArrowNode`, `TextNode`, and `EraserPath` (legacy render-only). Each record carries `objectId` (UUID), Lamport `timestamp`, `color`, `strokeWidth`, `authorName`, and `clientId`. Server-side `ShapeCodec` and a mirrored client `ClientShapeCodec` deserialise via a `"_type"` discriminator field with Gson. The tool dock exposes **LINE**, **CIRCLE**, **RECTANGLE**, **ELLIPSE**, **ARROW**, **FREEHAND**, **ERASER**, and **TEXT**.
 
 - **Live Collaborative Drawing (`SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT`)** — streaming stroke events are relayed to all peers by the server without persistence; the receiving client renders a `TransientShapeEntry` on the remote transient canvas layer, providing smooth live-ink preview before commit.
 
 - **MS Paint–Style Text Tool** — clicking the canvas in `TEXT` mode opens a floating `TextField` directly on the control pane. Keystrokes are throttled and transmitted as `TEXT_UPDATE` frames (~50 ms interval); peers render a ghost `VBox` with a live caret (`▏`) on their cursor pane. Pressing Enter commits a `TextNode` via `MUTATION` + `SHAPE_COMMIT`, which dismisses all ghost previews.
 
-- **`BlendMode.ERASE` Vector Masking (Eraser Tool)** — each eraser gesture is committed as an `EraserPath` shape (parallel `double[] xs`, `ys` coordinate arrays, `strokeWidth = 3×` the stroke slider, square `StrokeLineCap`). The base canvas redraws all shapes sorted by timestamp; white eraser paths painted last visually erase earlier ink without destroying the underlying vector geometry. Live eraser strokes stream as `SHAPE_UPDATE` frames with tool `"ERASER"` for real-time peer preview.
+- **Object Eraser with Spatial Hit-Testing** — the **ERASER** tool deletes committed shapes by geometry, not white-stroke masking. `EraserSpatialIntersection` hit-tests the canvas at `(x, y)` using `ShapeSpatialQuery` (AABB rejection, then precise intersection for `CIRCLE` or `SQUARE` brush geometry from `EraserType`). The topmost non-`EraserPath` shape by Lamport `timestamp` is removed locally and propagated via `UNDO_REQUEST` → server `SHAPE_DELETE`. `EraserCursorFactory` supplies a brush-sized custom cursor; circle/square mode is toggled through `GlobalCanvasContext.activeEraserTypeProperty()`.
 
 - **Scoped `CLEAR_USER_SHAPES`** — the "Clear Board" button sends a `CLEAR_USER_SHAPES` frame carrying only the issuing client's `clientId`. The server calls `CanvasStateManager.clearUserShapes(clientId)` and broadcasts the scoped clear to peers, who purge only that owner's shapes. No other client's work is affected.
 
@@ -65,6 +65,14 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Idle Room Eviction & Storage Lifecycle** — `StorageLifecycleManager` is a background daemon that sweeps every 60 seconds, evicting rooms with zero active clients that have been idle longer than 5 minutes. Evicted rooms are removed from the in-memory `RoomManager` registry to reclaim heap; all per-board WAL files are preserved on disk for manual recovery. Connected clients are never interrupted regardless of inactivity, and new boards are created on-demand with no eviction overhead.
 
+- **Global Canvas Context & Shape Factory** — `GlobalCanvasContext` centralises active stroke colour (`ObjectProperty<Color>`), stroke width (`DoubleProperty`), and eraser brush geometry (`EraserType` circle vs square). `GlobalCanvasShapeFactory` commits `Line`, `Circle`, `RectangleNode`, `EllipseNode`, `ArrowNode`, and `TextNode` instances using the current context, keeping the properties bar and network payloads consistent.
+
+- **Participant Roster HUD (`ParticipantManager` / `ParticipantListView`)** — each `NetworkClient` owns a `ParticipantManager` that maintains an `ObservableList<Participant>` keyed by `clientId`. `ParticipantListView` binds to the list and renders per-peer rows with mute and speaking indicators. Hardware mute state is synchronised over TCP via `VOICE_STATE` (`0x17`, payload `{ clientId, isMuted }`); live speaking activity remains on the UDP audio path (`UserSpeakingListener` → `setSpeaking`). `wireParticipantHud()` integrates the roster into the in-room chrome.
+
+- **Canvas Viewport Resize Coalescing** — `CanvasViewportResizeHandler` listens to the canvas container's width/height properties and coalesces invalidations into a single `Platform.runLater` redraw, avoiding redundant full-canvas repaints when JavaFX resizes the `Canvas` surface (which would otherwise clear pixel buffers at 0×0 during layout).
+
+- **Properties Bar & Floating Tool Chrome** — `styles.css` defines a Tailwind-inspired properties bar (colour picker, stroke slider, eraser-type toggles) and floating tool-dock layout. Extensive `WhiteboardApp*` TestFX/Mockito tests (`WhiteboardAppPropertiesBarTest`, `WhiteboardAppToolDockTest`, `WhiteboardAppFloatingLayoutTest`, etc.) lock layout IDs and interaction contracts without a manual QA pass.
+
 ---
 
 ## Project Structure
@@ -74,7 +82,7 @@ distrisync/
 ├── src/
 │   ├── main/
 │   │   ├── java/com/distrisync/
-│   │   │   ├── client/              # JavaFX UI, TCP client, audio, UDP pointer tracker
+│   │   │   ├── client/              # JavaFX UI, TCP client, audio, spatial tools, participant HUD
 │   │   │   │   ├── WhiteboardApp.java
 │   │   │   │   ├── NetworkClient.java
 │   │   │   │   ├── WhiteboardClient.java
@@ -86,6 +94,18 @@ distrisync/
 │   │   │   │   ├── PointerStateManager.java
 │   │   │   │   ├── AudioEngine.java
 │   │   │   │   ├── UserSpeakingListener.java
+│   │   │   │   ├── VoiceStateListener.java
+│   │   │   │   ├── Participant.java
+│   │   │   │   ├── ParticipantManager.java
+│   │   │   │   ├── ParticipantListView.java
+│   │   │   │   ├── GlobalCanvasContext.java
+│   │   │   │   ├── GlobalCanvasShapeFactory.java
+│   │   │   │   ├── EraserType.java
+│   │   │   │   ├── EraserSpatialIntersection.java
+│   │   │   │   ├── EraserCursorFactory.java
+│   │   │   │   ├── ShapeSpatialQuery.java
+│   │   │   │   ├── ShapeMathUtils.java
+│   │   │   │   ├── CanvasViewportResizeHandler.java
 │   │   │   │   └── ToolsDrawerToggleModel.java
 │   │   │   ├── server/              # NIO server, room routing, WAL, canvas authority
 │   │   │   │   ├── WhiteboardServer.java
@@ -106,6 +126,9 @@ distrisync/
 │   │   │       ├── Shape.java
 │   │   │       ├── Line.java
 │   │   │       ├── Circle.java
+│   │   │       ├── RectangleNode.java
+│   │   │       ├── EllipseNode.java
+│   │   │       ├── ArrowNode.java
 │   │   │       ├── TextNode.java
 │   │   │       └── EraserPath.java
 │   │   └── resources/
@@ -115,18 +138,29 @@ distrisync/
 │       └── java/com/distrisync/
 │           ├── client/
 │           │   ├── AudioEngineTest.java
+│           │   ├── CanvasViewportResizeHandlerTest.java
+│           │   ├── EraserSpatialIntersectionTest.java
 │           │   ├── NetworkClientTelemetryTest.java
+│           │   ├── ParticipantManagerTest.java
 │           │   ├── PointerStateTrackerTest.java
-│           │   └── ToolsDrawerToggleModelTest.java
-│           ├── integration/ClientServerIntegrationTest.java
+│           │   ├── ShapeMathUtilsTest.java
+│           │   ├── ToolsDrawerToggleModelTest.java
+│           │   ├── WhiteboardAppTestFxSupport.java
+│           │   └── WhiteboardApp*Test.java   # layout, tool dock, properties bar, PTT, HUD, …
+│           ├── integration/
+│           │   ├── ClientServerIntegrationTest.java
+│           │   └── VoiceStateBroadcastTest.java
 │           ├── protocol/MessageCodecTest.java
+│           ├── resources/mockito-extensions/
 │           └── server/
 │               ├── CanvasStateManagerTest.java
 │               ├── NioServerTest.java
+│               ├── NioServerLifecycleTest.java
 │               ├── NioServerUdpRoutingBufferTest.java
 │               ├── RoomContextTest.java
 │               ├── RoomManagerTest.java
 │               ├── ServerMetricsTest.java
+│               ├── ShapeCodecNewShapesTest.java
 │               └── WalManagerTest.java
 ├── docs/
 │   └── Architecture.md
@@ -163,6 +197,7 @@ distrisync/
 | `DELETE_ROOM` | `0x14` | C → S | No | JSON object `{ roomId }` requesting durable room teardown; valid from lobby or the same active room |
 | `ROOM_DELETED` | `0x15` | S → C | No | Empty payload notifying occupants that their room was deleted; clients clear room/board state and return to lobby |
 | `FETCH_LOBBY` | `0x16` | C → S | No | Empty JSON object `{}` requesting an immediate `LOBBY_STATE` response for this connection |
+| `VOICE_STATE` | `0x17` | C ↔ S | No | JSON object `{ clientId, isMuted }` — hardware microphone mute toggle; server validates `clientId` and relays to all room peers (not speaking activity) |
 
 ---
 

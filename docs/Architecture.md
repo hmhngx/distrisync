@@ -17,7 +17,12 @@
 7. [Pointer State Management — PointerStateManager](#7-pointer-state-management--pointerstate--pointerstate-manager)
 8. [Dual-Protocol VoIP Audio Engine](#8-dual-protocol-voip-audio-engine)
 9. [Telemetry & Observability](#9-telemetry--observability)
-10. [Sequence Diagram — Two-Client Collaboration Flow](#10-sequence-diagram--two-client-collaboration-flow)
+10. [Storage Lifecycle — Idle Room GC](#10-storage-lifecycle--idle-room-gc)
+11. [Extended Shape Model & Drawing Pipeline](#11-extended-shape-model--drawing-pipeline)
+12. [Object Eraser & Spatial Hit-Testing](#12-object-eraser--spatial-hit-testing)
+13. [Participant Roster & Voice State](#13-participant-roster--voice-state)
+14. [Canvas Viewport & Global Drawing Context](#14-canvas-viewport--global-drawing-context)
+15. [Sequence Diagram — Two-Client Collaboration Flow](#15-sequence-diagram--two-client-collaboration-flow)
 
 ---
 
@@ -68,14 +73,15 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x0C`    | `LOBBY_STATE`      | Server → Client      | No               | Room discovery snapshot. Payload: JSON array of `{ roomId, userCount }`, merged from active rooms plus persisted WAL stems. |
 | `0x0D`    | `JOIN_ROOM`        | Client → Server      | No               | Enter a room workspace. Payload: `{ roomId, initialBoardId? }` (legacy JSON string roomId accepted). |
 | `0x0E`    | `LEAVE_ROOM`       | Client → Server      | No               | Leave the active room and return to lobby. Empty payload. |
-| `0x0F`    | `SWITCH_BOARD`     | Client → Server      | No               | Switches the active board within the current room workspace. Payload: `{ boardId }`. |
-| `0x10`    | `BOARD_LIST_UPDATE`| Server → Client      | No               | Announces room board-index changes for multi-board workspaces. Payload contains authoritative board metadata. |
+| `0x0F`    | `SWITCH_BOARD`     | Client → Server      | No               | Switches the active board within the current room workspace. Payload: JSON string board id (e.g. `"Board-1"`). |
+| `0x10`    | `BOARD_LIST_UPDATE`| Server → Client      | No               | Announces room board-index changes for multi-board workspaces. Payload is a JSON array of board id strings. |
 | `0x11`    | `UDP_ADMISSION`    | Server → Client      | No               | Grants access to the UDP audio data plane; payload contains `{ udpToken }`. |
 | `0x12`    | `PING`             | Client → Server      | No               | Heartbeat RTT probe. Payload: `{ "t": <originMillis> }`; accepted only post-handshake. |
 | `0x13`    | `PONG`             | Server → Client      | No               | Echo of `PING` origin timestamp. Payload: `{ "t": <originMillis> }`; client computes RTT as `now - t`. |
 | `0x14`    | `DELETE_ROOM`      | Client → Server      | No               | Durable room teardown request. Payload: `{ roomId }`; allowed from lobby or from the same active room only. |
 | `0x15`    | `ROOM_DELETED`     | Server → Client      | No               | Forced room-eviction event. Empty payload; clients clear room/board state and return to lobby UI. |
 | `0x16`    | `FETCH_LOBBY`      | Client → Server      | No               | Pull-based lobby refresh request. Payload must be exactly `{}` (ignoring surrounding whitespace). |
+| `0x17`    | `VOICE_STATE`      | Client ↔ Server      | No               | Hardware mute toggle. Payload: `{ clientId, isMuted }`. Server validates `clientId` against session, then relays to all peers in the room via room-wide broadcast (not board-scoped). |
 
 #### Shape Envelope Format (MUTATION / SNAPSHOT)
 
@@ -95,7 +101,7 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 }
 ```
 
-Supported `_type` discriminators: `Line`, `Circle`, `TextNode`, `EraserPath`.
+Supported `_type` discriminators: `Line`, `Circle`, `RectangleNode`, `EllipseNode`, `ArrowNode`, `TextNode`, `EraserPath` (legacy; object eraser deletes shapes via `UNDO_REQUEST` / `SHAPE_DELETE` instead of appending `EraserPath` mutations).
 
 ---
 
@@ -206,7 +212,7 @@ CanvasStateManager
 └── shapeMap: ConcurrentHashMap<UUID, Shape>
       │
       ├── key:   Shape.objectId()  — random UUID, assigned by the originating client
-      └── value: Shape (sealed hierarchy: Line | Circle | TextNode | EraserPath)
+      └── value: Shape (sealed hierarchy: Line | Circle | RectangleNode | EllipseNode | ArrowNode | TextNode | EraserPath)
                   ├── objectId():   UUID   — stable identity across the network
                   ├── clientId():   String — session-scoped owner (for CLEAR_USER_SHAPES)
                   ├── authorName(): String — human-readable attribution
@@ -289,7 +295,7 @@ RoomManager
 |---|---|
 | **First join** | `RoomManager.getOrCreateRoom(roomId)` calls `rooms.computeIfAbsent`, which atomically creates a `RoomContext`. Boards are lazily created with `boards.computeIfAbsent(boardId, ...)`, so unused boards incur zero allocation cost. |
 | **Active** | Every `MUTATION`, `SHAPE_DELETE`, and `CLEAR_USER_SHAPES` is applied only to the active board's `CanvasStateManager`, appended to that board's WAL partition, then broadcast to all `SelectionKey`s in `RoomContext.activeKeys` except the sender. |
-| **Quiescent** | When the last client disconnects, `activeKeys` becomes empty. The `RoomContext` remains resident, and each instantiated board manager retains state for fast reconnect snapshots. |
+| **Quiescent** | In the explicit `LEAVE_ROOM` path, `RoomManager.returnClientToLobby` removes the room when `activeKeys` reaches zero. In other paths (for example direct room deletion / lifecycle sweeps), empty rooms may exist transiently. |
 | **Restart** | `RoomContext` is re-created on first join. Board state is recovered independently on demand through board-scoped WAL replay (`recover(roomId, boardId)`). |
 
 ### 5.3 Broadcast Scoping
@@ -380,25 +386,23 @@ NioServer.processMessage()
 ### 6.4 Recovery Path
 
 ```
-Server restart
+Client joins or switches to board B
     │
-    └─ RoomManager.getOrCreateRoom(roomId)
-            └─ new RoomContext(roomId, walManager)
-                    └─ replayWal(walManager)
-                            │
-                            ├─ WalManager.recover(roomId, boardId)
-                            │       ├─ FileChannel.open(walPath, READ)
-                            │       ├─ ByteBuffer.allocate(fileSize)  [single heap alloc]
-                            │       └─ decode loop:
-                            │               ┌─ MessageCodec.decode(buf)
-                            │               ├─ on PartialMessageException → stop (truncated tail)
-                            │               └─ on IllegalArgumentException → stop (corrupt record)
-                            │
-                            └─ for each Message:
-                                    MUTATION          → stateManager.applyMutation(shape)
-                                    SHAPE_DELETE      → stateManager.deleteShape(uuid)
-                                    CLEAR_USER_SHAPES → stateManager.clearUserShapes(clientId)
-                                    other             → skip (warn)
+    └─ RoomContext.getBoard(B)  (boards.computeIfAbsent)
+            └─ replayWalForBoard(B)
+                    │
+                    ├─ WalManager.recover(roomId, B)
+                    │       ├─ Files.readAllBytes(walPath)
+                    │       └─ decode loop:
+                    │               ┌─ MessageCodec.decode(buf)
+                    │               ├─ on PartialMessageException → stop (truncated tail)
+                    │               └─ on IllegalArgumentException → stop (corrupt record)
+                    │
+                    └─ for each Message:
+                            MUTATION           → stateManager.applyMutation(shape)
+                            SHAPE_DELETE       → stateManager.deleteShape(uuid)
+                            CLEAR_USER_SHAPES  → stateManager.clearUserShapes(clientId)
+                            other              → skip
 ```
 
 **Crash tolerance:** a hard crash mid-write leaves a truncated final frame in the file. `MessageCodec.decode` throws `PartialMessageException` when the buffer does not contain a complete frame; recovery stops at that offset and returns the clean prefix. This is the standard "truncated tail" pattern used by databases such as SQLite and PostgreSQL WAL.
@@ -432,7 +436,7 @@ record PointerState(String clientId, double x, double y, long lastUpdatedAt) {}
 
 `lastUpdatedAt` is an epoch-millisecond timestamp supplied by the `PointerStateManager`'s injected clock at the moment of the `updatePointer` call — not from the remote client. This makes eviction decisions deterministic with respect to the local wall clock regardless of clock skew between peers.
 
-### 7.2 PointerStateManager
+### 7.2 PointerStateManager (Unit-Tested Utility)
 
 ```
 PointerStateManager
@@ -441,7 +445,9 @@ PointerStateManager
 └── clock: LongSupplier             (default: System::currentTimeMillis)
 ```
 
-**Update path** — called by `UdpPointerTracker` receive thread on each incoming UDP datagram, then dispatched to the JavaFX Application Thread via `Platform.runLater`:
+`PointerStateManager` itself is a thread-safe utility with deterministic clock injection and stale-pointer eviction semantics. It is covered by `PointerStateTrackerTest` and can be used independently of any network transport.
+
+**Update path** — pure in-memory upsert:
 
 ```java
 // PointerStateManager.updatePointer()
@@ -450,7 +456,7 @@ pointers.put(clientId, new PointerState(clientId, x, y, clock.getAsLong()));
 
 `PointerState` is immutable; each update replaces the existing entry atomically via `ConcurrentHashMap.put`.
 
-**Eviction path** — called by the JavaFX `AnimationTimer` render loop on each frame:
+**Eviction path** — pure in-memory stale sweep:
 
 ```java
 // PointerStateManager.evictStalePointers()
@@ -476,9 +482,16 @@ assert mgr.size() == 0;        // alice evicted
 
 This eliminates `Thread.sleep` in pointer eviction tests, making the entire test suite instant and deterministic.
 
-### 7.4 Relationship to UdpPointerTracker
+### 7.4 Current Runtime Cursor Path (`UdpPointerTracker`)
 
-`UdpPointerTracker` is the **transport layer** for cursor positions: it owns the UDP multicast socket, sends outbound datagrams at 20 Hz, and parses inbound datagrams. `PointerStateManager` is the **state layer**: it stores and ages the decoded positions without any I/O knowledge. The separation means `PointerStateManager` can be unit-tested in complete isolation from the network.
+The active cursor implementation used by `WhiteboardApp` is `UdpPointerTracker`, which:
+
+1. Uses UDP multicast (`239.255.42.42:9292`) with datagrams like `UDP_POINTER|clientId|x|y|authorName`.
+2. Sends at 50 ms cadence (20 Hz) only when the mouse moved.
+3. Parses inbound packets on a dedicated receive thread and applies JavaFX node updates via `Platform.runLater`.
+4. Performs stale-cursor cleanup with fade-out animation on a scheduled cleanup loop.
+
+`PointerStateManager` is still valid and tested, but this code path currently manages pointer state directly in `UdpPointerTracker`.
 
 ---
 
@@ -521,9 +534,27 @@ Before audio relay begins, the client transmits a 36-byte UDP registration packe
 1. Opens/refreshes NAT mapping on the client side.
 2. Allows `NioServer` to learn the sender's effective public `InetSocketAddress` for outbound relaying.
 
-Once learned, that endpoint is used for peer audio fan-out within the same room/board scope. If NAT rebinding occurs, the client repeats registration to refresh the relay destination.
+Once learned, that endpoint is used for peer audio fan-out within the same **room**. Board id is not used for UDP audio routing. If NAT rebinding occurs, the client repeats registration to refresh the relay destination.
 
-[INSERT MERMAID SEQUENCE DIAGRAM FOR PUSH-TO-TALK HERE]
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as NioServer
+    participant P as Peers in same room
+
+    C->>S: HANDSHAKE (TCP)
+    C->>S: JOIN_ROOM (TCP)
+    S-->>C: UDP_ADMISSION { udpToken } (TCP)
+    C->>S: [udpToken only] (UDP registration)
+    Note over S: Stores sender InetSocketAddress in session.udpEndpoint
+
+    loop Push-to-talk
+        C->>S: [udpToken][160B PCM] (UDP)
+        Note over S: Validate token + sender endpoint
+        S-->>P: [speakerClientId(36B)][160B PCM] (UDP relay)
+    end
+```
 
 ---
 
@@ -617,7 +648,7 @@ log.info("[METRICS] Traffic routed: {} bytes | Active Rooms: {} | Active Sockets
 
 ```
 ┌─────────────────────────────────┐
-│  TCP: ● Connected  │  UDP: ●  │  Ping: 12ms  │
+│  TCP: Connected  │  UDP: Ready  │  Ping: 12ms  │
 └─────────────────────────────────┘
      .telemetry-hud + .telemetry-pill
      child labels: .telemetry-hud-line
@@ -628,17 +659,158 @@ All three segments are bound via JavaFX property expressions — no polling time
 
 | Segment | Bound to | Displayed value |
 |---|---|---|
-| TCP status | `client.tcpConnectedProperty()` | `"TCP: ● Connected"` / `"TCP: ○ Disconnected"` |
-| UDP status | `client.udpActiveProperty()` | `"UDP: ●"` / `"UDP: ○"` |
+| TCP status | `client.tcpConnectedProperty()` | `"TCP: Connected"` / `"TCP: Disconnected"` |
+| UDP status | `client.udpActiveProperty()` | `"UDP: Ready"` / `"UDP: Waiting"` |
 | Ping | `client.pingProperty()` | `"Ping: —"` (while `< 0`) or `"Ping: Nms"` |
 
 The HUD is positioned using `AnchorPane` constraints and carries no mouse event handlers (`setMouseTransparent(true)`), ensuring it never interferes with canvas interaction. The `.telemetry-hud` CSS class sets a transparent background and 11 px monospace font; `.telemetry-pill` provides a subtle rounded-rectangle container with inner padding.
 
 ---
 
-## 10. Sequence Diagram — Two-Client Collaboration Flow
+## 10. Storage Lifecycle — Idle Room GC
 
-The diagram below shows the complete lifecycle: two clients connecting, snapshot delivery with WAL recovery, Client 1 streaming a live draw gesture, a final committed `MUTATION` (persisted to WAL), and the server broadcasting all of these to Client 2.
+`StorageLifecycleManager` is a background daemon that prevents unbounded room-map growth.
+
+### 10.1 Eviction Policy
+
+A room is GC-eligible only when both conditions hold:
+
+1. `RoomContext.getActiveClientCount() == 0`
+2. `RoomContext.getLastActivityTimestamp() < (now - GC_TTL_MS)`
+
+Default TTL is `GC_TTL_MS = 300_000` (5 minutes).
+
+### 10.2 Sweep Cadence
+
+- A single-threaded scheduler (`storage-lifecycle-daemon`) runs every 60 seconds.
+- Each cycle scans `RoomManager.getRooms()` and calls `roomManager.removeRoom(roomId)` for eligible rooms.
+- `RoomManager.removeRoom` uses a guarded `compute` so rooms that become active during the sweep are not evicted.
+
+### 10.3 WAL Interaction
+
+GC eviction removes in-memory room routing only. It does not delete WAL files. Durable room deletion remains an explicit `DELETE_ROOM` lifecycle operation via `RoomManager.deleteRoom(..., walManager)` and `WalManager.deleteRoomFiles(roomId)`.
+
+---
+
+## 11. Extended Shape Model & Drawing Pipeline
+
+### 11.1 Sealed Hierarchy
+
+`Shape` (Java 21 `sealed interface`) permits seven concrete variants:
+
+| `_type` | Record | Geometry |
+|---|---|---|
+| `Line` | `Line` | Segment `(x1,y1)` → `(x2,y2)` + `strokeWidth` |
+| `Circle` | `Circle` | Centre `(x,y)`, `radius`, optional `filled` interior |
+| `RectangleNode` | `RectangleNode` | Axis-aligned box `(x,y,width,height)` + `strokeWidth` |
+| `EllipseNode` | `EllipseNode` | Axis-aligned ellipse bounding box + `strokeWidth` |
+| `ArrowNode` | `ArrowNode` | Directed segment with arrowhead at `(x2,y2)` |
+| `TextNode` | `TextNode` | Anchored text + `fontSize` |
+| `EraserPath` | `EraserPath` | Legacy polyline (render path only; no longer emitted by the ERASER tool) |
+
+`ShapeCodec` and `NetworkClient.ClientShapeCodec` mirror the same `"_type"` Gson discriminator on encode/decode. `ShapeCodecNewShapesTest` asserts round-trip fidelity for the three new primitives.
+
+### 11.2 Tool → Factory → MUTATION
+
+`WhiteboardApp.Tool` enumerates `LINE`, `CIRCLE`, `RECTANGLE`, `ELLIPSE`, `ARROW`, `FREEHAND`, `ERASER`, and `TEXT`. Drag gestures on the base canvas call `GlobalCanvasShapeFactory` methods, which read colour and stroke width from `GlobalCanvasContext` and stamp `authorName` / `clientId` before `addAndSend(shape)` enqueues a `MUTATION`.
+
+Live preview for vector tools still uses the ephemeral `SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT` relay path; only the final geometry is persisted.
+
+---
+
+## 12. Object Eraser & Spatial Hit-Testing
+
+The **ERASER** tool performs **object deletion**, not white-stroke compositing.
+
+### 12.1 Hit-Test Pipeline
+
+```
+performEraserAt(x, y)
+    │
+    ├─ eraserSize  ← GlobalCanvasContext.getActiveStrokeWidth()
+    ├─ eraserType  ← GlobalCanvasContext.getActiveEraserType()  (CIRCLE | SQUARE)
+    │
+    └─ EraserSpatialIntersection.eraseAt(x, y, eraserSize, eraserType)
+            │
+            ├─ shapesView: local ConcurrentHashMap values (committed shapes)
+            ├─ filter: exclude EraserPath instances
+            ├─ ShapeSpatialQuery.intersectsEraser(...)  — AABB reject, then geometry
+            └─ max(Shape::timestamp)  — topmost shape wins
+                    │
+                    └─ NetworkClient.sendUndoRequest(shapeId)
+                           └─ server deleteShape → SHAPE_DELETE broadcast
+```
+
+`ShapeSpatialQuery` implements per-type bounds (`boundsOf`) and brush intersection tests for lines, circles (filled-aware), rectangles, ellipses, arrows, and text bounding boxes. `ShapeMathUtils` supplies shared segment/ellipse helpers used by the query layer.
+
+`EraserCursorFactory` builds a JavaFX `Cursor` scaled to the active stroke width so the brush footprint matches the hit-test radius.
+
+### 12.2 Gesture De-duplication
+
+`WhiteboardApp` tracks `erasedInGesture` (a `Set<UUID>`) so a single drag does not enqueue multiple `UNDO_REQUEST` frames for the same `objectId`.
+
+---
+
+## 13. Participant Roster & Voice State
+
+DistriSync separates **hardware mute state** (TCP, reliable) from **speaking activity** (UDP audio, ephemeral).
+
+### 13.1 Data Model
+
+```
+NetworkClient
+    └── ParticipantManager  (implements VoiceStateListener)
+            ├── ConcurrentHashMap<String, Participant> byClientId
+            └── ObservableList<Participant> participants  ← FX binding surface
+
+Participant
+    ├── StringProperty name
+    ├── BooleanProperty muted      ← VOICE_STATE
+    └── BooleanProperty speaking   ← UserSpeakingListener / setSpeaking
+```
+
+`ParticipantListView` listens to `ObservableList` changes and maintains a `Map<String, ParticipantRow>` for incremental UI updates (add/remove without rebuilding the entire list).
+
+### 13.2 VOICE_STATE Wire Flow
+
+```
+Client A (mic muted)                NioServer                         Client B
+      │                                  │                                │
+      │── VOICE_STATE { clientId, true }►│                                │
+      │                                  │ validate clientId == session   │
+      │                                  │ broadcastToRoom(except sender) │
+      │                                  │───────────────────────────────►│
+      │                                  │                                │ ParticipantManager.onVoiceState
+      │                                  │                                │ row.mutedIndicator updated
+```
+
+`MessageCodec.encodeVoiceState` / `decodeVoiceState` wrap `{ clientId, isMuted }`. The server rejects frames received before `HANDSHAKE` completion or with a `clientId` mismatch.
+
+`VoiceStateBroadcastTest` (integration) asserts relay semantics across two connected clients.
+
+---
+
+## 14. Canvas Viewport & Global Drawing Context
+
+### 14.1 GlobalCanvasContext
+
+A single application-scoped instance holds JavaFX properties consumed by the properties bar and shape factory:
+
+| Property | Type | Default | Consumers |
+|---|---|---|---|
+| `activeColor` | `ObjectProperty<Color>` | `#89b4fa` | Colour picker, `activeColorHex()` for wire payloads |
+| `activeStrokeWidth` | `DoubleProperty` | `2.0` | Stroke slider, eraser hit radius, line weight |
+| `activeEraserType` | `ObjectProperty<EraserType>` | `CIRCLE` | Eraser toggle buttons (`CIRCLE` / `SQUARE`) |
+
+### 14.2 CanvasViewportResizeHandler
+
+JavaFX clears `Canvas` pixel buffers when width or height change. `CanvasViewportResizeHandler.attachTo(Region)` registers invalidation listeners on both dimensions, coalesces rapid layout pulses into one `Platform.runLater`, and guards against painting at `0×0` (which triggers Prism `NGCanvas` NPEs). The handler invokes `redrawBaseCanvas` so vector state is re-painted after resize.
+
+---
+
+## 15. Sequence Diagram — Two-Client Collaboration Flow
+
+The diagram below shows the current lifecycle: handshake into lobby, explicit room join, board snapshot hydration (with lazy WAL replay on first board open), live draw relay, durable mutation, and distributed undo.
 
 ```mermaid
 sequenceDiagram
@@ -650,37 +822,28 @@ sequenceDiagram
     participant WAL as WalManager
     participant C2 as Client 2
 
-    %% ── Server startup / WAL recovery ─────────────────────────────────────
-    Note over SRV,WAL: Server startup — WAL recovery before first client joins
-    SRV->>RM: getOrCreateRoom("default")
-    RM->>WAL: recover("default")
-    WAL-->>RM: List<Message> (persisted frames)
-    RM->>CSM: applyMutation / deleteShape / clearUserShapes (replay)
-    Note over CSM: Canvas fully restored from WAL
-
     %% ── Client 1 connects ──────────────────────────────────────────────
     C1->>SRV: TCP SYN / connect()
     SRV-->>C1: TCP SYN-ACK (OP_ACCEPT fires)
     Note over SRV: ClientSession₁ created<br/>OP_READ registered
-    SRV->>CSM: snapshot()
-    CSM-->>SRV: List<Shape> (recovered canvas)
-    SRV-->>C1: SNAPSHOT (0x02) — recovered board state
-
     C1->>SRV: HANDSHAKE (0x01)<br/>{ authorName:"Alice", clientId:"alice-uuid" }
-    Note over SRV: session₁.authorName = "Alice"<br/>session₁.clientId  = "alice-uuid"
-    SRV->>RM: addKey(room, key₁)
+    Note over SRV: session₁ metadata stored,<br/>session enters lobby set
+    SRV-->>C1: LOBBY_STATE (0x0C)
+    C1->>SRV: JOIN_ROOM (0x0D)<br/>{ roomId:"default", initialBoardId:"Board-1" }
+    SRV->>RM: assignClientToRoom(key₁, "default")
+    SRV->>WAL: recover("default","Board-1") (lazy, first board open)
+    SRV-->>C1: SNAPSHOT (0x02) — board state
+    SRV-->>C1: UDP_ADMISSION (0x11)
 
     %% ── Client 2 connects ──────────────────────────────────────────────
     C2->>SRV: TCP SYN / connect()
     SRV-->>C2: TCP SYN-ACK (OP_ACCEPT fires)
     Note over SRV: ClientSession₂ created<br/>OP_READ registered
-    SRV->>CSM: snapshot()
-    CSM-->>SRV: List<Shape> (same recovered canvas)
-    SRV-->>C2: SNAPSHOT (0x02) — recovered board state
-
     C2->>SRV: HANDSHAKE (0x01)<br/>{ authorName:"Bob", clientId:"bob-uuid" }
-    Note over SRV: session₂.authorName = "Bob"<br/>session₂.clientId  = "bob-uuid"
-    SRV->>RM: addKey(room, key₂)
+    SRV-->>C2: LOBBY_STATE (0x0C)
+    C2->>SRV: JOIN_ROOM (0x0D)<br/>{ roomId:"default", initialBoardId:"Board-1" }
+    SRV->>RM: assignClientToRoom(key₂, "default")
+    SRV-->>C2: SNAPSHOT (0x02) — board state
 
     %% ── PING/PONG RTT heartbeat ─────────────────────────────────────
     rect rgb(245, 245, 245)
@@ -736,10 +899,9 @@ sequenceDiagram
 
 | Step | What is happening |
 |------|-------------------|
-| 1–5  | On startup, `RoomManager` calls `WalManager.recover` and replays all persisted frames into `CanvasStateManager` before any client is allowed to join. A post-crash restart delivers a fully recovered `SNAPSHOT` to the first reconnecting peer. |
-| 6–12 | Client 1 performs a full TCP handshake. The server immediately delivers a `SNAPSHOT` so the client renders any pre-existing (or recovered) board state before sending its own `HANDSHAKE`. `RoomManager.addKey` registers the connection in the room's broadcast set. |
-| 13–19 | Client 2 connects identically. From this point both clients are in the same room, registered on the same `Selector` and the same `RoomContext.activeKeys`. |
-| 20–22 | After `HANDSHAKE` completes, `NetworkClient` starts the `distrisync-ping` daemon thread. Every 2 000 ms it enqueues a `PING` frame carrying `{ "t": <originMillis> }`. The server echoes the origin timestamp in a `PONG` response; the client computes `RTT = now − t` and updates `pingProperty()`, which the Telemetry HUD reflects immediately via property binding. |
-| 23–30 | The three-phase live draw (`SHAPE_START` → `SHAPE_UPDATE` × N → `SHAPE_COMMIT`) is **purely ephemeral**. The server relays each frame via the room broadcast but never calls `applyMutation()` or `appendToWal()`. Client 2 sees a live preview with zero persistence cost. |
-| 31–37 | The final `MUTATION` triggers `CanvasStateManager.applyMutation()`. Only if the CAS succeeds (newer Lamport timestamp) does the server call `appendToWal` and then broadcast the frame. The WAL write happens **before** the broadcast so the record is durable even if the network write fails. Each broadcast recipient's frame bytes are added to `NioServer.bytesRouted`. |
-| 38–45 | `UNDO_REQUEST` arrives. The server issues one `ConcurrentHashMap.remove()` call, then appends a `SHAPE_DELETE` frame to the WAL so the deletion survives a crash, and broadcasts to room peers. The requesting client is intentionally excluded from the broadcast — it removes the shape optimistically. |
+| 1–10 | Client connects, sends `HANDSHAKE`, enters lobby, and then sends `JOIN_ROOM`. `SNAPSHOT` is sent only after join processing. |
+| 11–16 | Board hydration happens lazily: opening a board triggers `WalManager.recover(roomId, boardId)` replay for that board only. |
+| 17–19 | `PING`/`PONG` runs continuously after handshake; client computes RTT from echoed origin timestamp. |
+| 20–27 | Live draw (`SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT`) is relayed only, not persisted. |
+| 28–34 | `MUTATION` applies LWW CAS in memory, appends to board WAL, then broadcasts to same room + same board peers. |
+| 35–40 | `UNDO_REQUEST` deletes in memory, persists `SHAPE_DELETE`, then broadcasts deletion to peers except originator. |
