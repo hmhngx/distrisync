@@ -24,8 +24,8 @@ import org.slf4j.LoggerFactory;
  * <pre>
  * ┌───────────────┬──────────────────────────┬────────────────────────────┐
  * │  Byte 0       │  Bytes 1-4               │  Bytes 5 … (5 + length-1)  │
- * │  MessageType  │  PayloadLength (int32 BE) │  UTF-8 JSON payload        │
- * │  (1 byte)     │  (4 bytes, big-endian)    │  (variable)                │
+ * │  MessageType  │  PayloadLength (int32 BE) │  UTF-8 JSON payload       │
+ * │  (1 byte)     │  (4 bytes, big-endian)    │  (variable)               │
  * └───────────────┴──────────────────────────┴────────────────────────────┘
  * </pre>
  *
@@ -695,6 +695,32 @@ public final class MessageCodec {
     public static TextUpdatePayload decodeTextUpdate(Message msg) {
         if (msg == null) throw new IllegalArgumentException("msg must not be null");
         return GSON.fromJson(msg.payload(), TextUpdatePayload.class);
+    }
+
+    // -------------------------------------------------------------------------
+    // VOICE_STATE helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * JSON body for {@link MessageType#VOICE_STATE}: hardware microphone mute state for a peer.
+     */
+    public record VoiceStatePayload(String clientId, boolean isMuted) {}
+
+    public static ByteBuffer encodeVoiceState(String clientId, boolean isMuted) {
+        if (clientId == null) throw new IllegalArgumentException("clientId must not be null");
+        return encodeObject(MessageType.VOICE_STATE, new VoiceStatePayload(clientId, isMuted));
+    }
+
+    public static VoiceStatePayload decodeVoiceState(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.VOICE_STATE) {
+            throw new IllegalArgumentException("expected VOICE_STATE, got " + msg.type());
+        }
+        VoiceStatePayload p = GSON.fromJson(msg.payload(), VoiceStatePayload.class);
+        if (p == null || p.clientId() == null) {
+            throw new IllegalArgumentException("VOICE_STATE missing clientId");
+        }
+        return p;
     }
 
     /**
