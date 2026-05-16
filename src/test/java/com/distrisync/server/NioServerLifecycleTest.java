@@ -34,8 +34,10 @@ class NioServerLifecycleTest {
         }
         if (serverThread != null) {
             serverThread.interrupt();
-            serverThread.join(3_000);
+            serverThread.join(10_000);
         }
+        server = null;
+        serverThread = null;
     }
 
     @Test

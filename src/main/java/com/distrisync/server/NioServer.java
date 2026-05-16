@@ -204,12 +204,14 @@ public final class NioServer implements Runnable {
             roomManager.setRoomDeletionClientHooks(this::revokeUdpAdmission, (s, k) -> flushWriteQueue(s, k));
 
             serverChannel.configureBlocking(false);
+            serverChannel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
             serverChannel.bind(new InetSocketAddress(port));
             serverChannel.register(selector, SelectionKey.OP_ACCEPT);
 
             int actualPort = ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
 
             datagramChannel.configureBlocking(false);
+            datagramChannel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
             datagramChannel.bind(new InetSocketAddress(actualPort));
             datagramChannel.register(selector, SelectionKey.OP_READ, UDP_CHANNEL_ATTACHMENT);
 
@@ -677,6 +679,33 @@ public final class NioServer implements Runnable {
                 }
             }
 
+            case VOICE_STATE -> {
+                if (!session.handshakeComplete) {
+                    log.warn("VOICE_STATE before HANDSHAKE session={}", session.sessionId);
+                    break;
+                }
+                RoomContext room = resolveRoom(session, senderKey);
+                if (room == null) {
+                    return;
+                }
+                MessageCodec.VoiceStatePayload vs;
+                try {
+                    vs = MessageCodec.decodeVoiceState(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed VOICE_STATE session={}: {}", session.sessionId, e.getMessage());
+                    break;
+                }
+                if (!session.clientId.equals(vs.clientId())) {
+                    log.warn("VOICE_STATE clientId mismatch session={} payload='{}' sessionClientId='{}'",
+                            session.sessionId, vs.clientId(), session.clientId);
+                    break;
+                }
+                log.debug("VOICE_STATE relayed  room='{}' clientId='{}' muted={}",
+                        session.roomId, vs.clientId(), vs.isMuted());
+                ByteBuffer frame = MessageCodec.encodeVoiceState(vs.clientId(), vs.isMuted());
+                broadcastToRoom(session.roomId, frame, senderKey);
+            }
+
             default -> log.warn("Unexpected message type={} from session={} — ignoring",
                     msg.type(), session.sessionId);
         }
@@ -973,6 +1002,44 @@ public final class NioServer implements Runnable {
         }
 
         log.debug("Board broadcast  roomId='{}' boardId='{}' recipients={}", roomId, boardId, recipientCount);
+        toClose.forEach(this::closeKey);
+    }
+
+    /**
+     * Delivers {@code frame} to every active client in {@code roomId} except the sender.
+     * Used for room-wide control-plane events (e.g. {@link MessageType#VOICE_STATE}) that are
+     * not scoped to a single board.
+     */
+    private void broadcastToRoom(String roomId, ByteBuffer frame, SelectionKey senderKey) {
+        var activeKeys = roomManager.getActiveClientKeys(roomId);
+        if (activeKeys.isEmpty()) {
+            if (roomManager.getRoom(roomId) == null) {
+                log.warn("broadcastToRoom called for unknown roomId='{}'", roomId);
+            }
+            return;
+        }
+
+        int frameBytes = frame.remaining();
+        List<SelectionKey> toClose = new ArrayList<>();
+        int recipientCount = 0;
+
+        for (SelectionKey key : activeKeys) {
+            if (!key.isValid() || key == senderKey) {
+                continue;
+            }
+
+            ClientSession peer = (ClientSession) key.attachment();
+            peer.enqueue(frame);
+
+            if (!flushWriteQueue(peer, key)) {
+                toClose.add(key);
+            } else {
+                bytesRouted.addAndGet(frameBytes);
+                recipientCount++;
+            }
+        }
+
+        log.debug("Room broadcast  roomId='{}' recipients={}", roomId, recipientCount);
         toClose.forEach(this::closeKey);
     }
 
