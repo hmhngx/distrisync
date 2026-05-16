@@ -52,16 +52,25 @@ class NioServerTest {
 
     @AfterEach
     void tearDown() throws InterruptedException {
+        stopServerUnderTest();
+    }
+
+    private void stopServerUnderTest() throws InterruptedException {
         if (server != null) {
             server.stop();
         }
-        if (serverThread != null) {
-            serverThread.interrupt();
-            serverThread.join(3_000);
+        Thread t = serverThread;
+        if (t != null) {
+            t.interrupt();
+            t.join(10_000);
         }
+        server = null;
+        serverThread = null;
+        roomManager = null;
     }
 
     private void startServer() throws Exception {
+        stopServerUnderTest();
         roomManager = new RoomManager();
         server = new NioServer(0, roomManager);
         serverThread = new Thread(server, "nio-server-test");

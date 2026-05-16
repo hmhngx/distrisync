@@ -469,6 +469,17 @@ class MessageCodecTest {
     // =========================================================================
 
     @Test
+    void voiceState_roundTrip() {
+        ByteBuffer frame = MessageCodec.encodeVoiceState("peer-1", true);
+        Message decoded = MessageCodec.decode(frame);
+
+        assertThat(decoded.type()).isEqualTo(MessageType.VOICE_STATE);
+        MessageCodec.VoiceStatePayload p = MessageCodec.decodeVoiceState(decoded);
+        assertThat(p.clientId()).isEqualTo("peer-1");
+        assertThat(p.isMuted()).isTrue();
+    }
+
+    @Test
     void testBufferUnderflow_IncompletePayload() {
         final int declaredPayloadLength = 100;
         final int availablePayloadBytes = 50;

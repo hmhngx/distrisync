@@ -1,663 +1,662 @@
-/* ═══════════════════════════════════════════════════════════════
-   DistriSync — Tailwind-inspired Design System
-   Loaded via scene.getStylesheets() in WhiteboardApp.java
-   ═══════════════════════════════════════════════════════════════ */
+/* DistriSync — premium dark workspace (Slate / Zinc tokens) */
 
-/* ── Global tooltips — glass HUD (see createTooltip in WhiteboardApp) ─ */
-.tooltip {
-    -fx-background-color: rgba(15, 23, 42, 0.95);
-    -fx-text-fill: #f8fafc;
+.root {
+    -fx-bg-canvas: #0E1015;
+    -fx-surface-1: #181B21;
+    -fx-surface-2: #22262F;
+    -fx-border-subtle: #2C313C;
+    -fx-accent: #5C6CFF;
+    -fx-text-main: #EDEDED;
+    -fx-text-muted: #8B93A0;
+
+    -fx-font-family: "Segoe UI", "Inter", "Arial";
+    -fx-base: -fx-surface-2;
+    -fx-background: -fx-surface-1;
+    -fx-text-base-color: -fx-text-main;
+    -fx-control-inner-background: -fx-surface-2;
+    -fx-light-text-color: -fx-text-main;
+    -fx-mid-text-color: -fx-text-muted;
+    -fx-dark-text-color: -fx-text-main;
+
+    /* Legacy aliases used across rules */
+    -fx-text: -fx-text-main;
+    -fx-surface: -fx-surface-1;
+    -fx-surface-subtle: -fx-surface-1;
+    -fx-surface-soft: -fx-surface-2;
+    -fx-border: -fx-border-subtle;
+    -fx-border-strong: #525C6E;
+    -fx-danger: #f87171;
+    -fx-success: #4ade80;
+}
+
+/* Global flat control reset */
+.button {
+    -fx-background-color: -fx-accent;
+    -fx-text-fill: -fx-text-main;
     -fx-background-radius: 6px;
-    -fx-border-radius: 6px;
-    -fx-border-color: rgba(255, 255, 255, 0.1);
-    -fx-border-width: 1;
-    -fx-padding: 6px 12px;
-    -fx-font-size: 12px;
-    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.5), 10, 0, 0, 2);
-}
-
-.tooltip .text {
-    -fx-fill: #f8fafc;
-}
-
-/* ── Login scene ─────────────────────────────────────────────── */
-.login-root {
-    -fx-background-color: #0f172a;
-    -fx-alignment: center;
-}
-
-.card {
-    -fx-background-color: #1e293b;
-    -fx-background-radius: 12;
-    -fx-padding: 40;
-    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.45), 24, 0.15, 0, 8);
-}
-
-.text-input-modern {
-    -fx-background-color: #0f172a;
-    -fx-text-fill: #ffffff;
-    -fx-prompt-text-fill: #64748b;
-    -fx-border-color: #334155;
-    -fx-border-width: 1;
-    -fx-border-radius: 6;
-    -fx-background-radius: 6;
-    -fx-padding: 10 15 10 15;
-}
-
-.primary-button-large {
-    -fx-background-color: #3b82f6;
-    -fx-text-fill: #ffffff;
-    -fx-font-weight: bold;
-    -fx-background-radius: 6;
-    -fx-padding: 12 20 12 20;
+    -fx-padding: 8px 16px;
     -fx-cursor: hand;
-    -fx-max-width: infinity;
-}
-
-.primary-button-large:hover {
-    -fx-background-color: #2563eb;
-}
-
-/* ── Sidebar container — fixed width so slide distance stays stable ─ */
-.sidebar {
-    -fx-background-color: #0f172a;
-    -fx-padding: 16;
-    -fx-pref-width: 200;
-    -fx-min-width: 200;
-    -fx-max-width: 200;
-    -fx-effect: dropshadow(three-pass-box, rgba(0, 0, 0, 0.5), 15, 0, 0, 0);
-}
-
-/* Tab attached to the right edge of the sidebar */
-.sidebar-toggle-btn {
-    -fx-background-color: #1e293b;
-    -fx-text-fill: #ffffff;
-    -fx-padding: 8 12 8 12;
-    -fx-background-radius: 0 6 6 0;
+    -fx-border-color: transparent;
     -fx-border-width: 0;
-    -fx-font-size: 14px;
-    -fx-font-weight: bold;
-    -fx-cursor: hand;
-    -fx-min-width: 40;
-    -fx-alignment: center;
+    -fx-border-insets: 0;
+    -fx-background-insets: 0;
+    -fx-effect: null;
+}
+.button:hover {
+    -fx-background-color: derive(-fx-accent, 12%);
 }
 
-.sidebar-toggle-btn:hover {
-    -fx-background-color: #334155;
-}
-
-.sidebar-toggle-btn:armed {
-    -fx-background-color: #475569;
-}
-
-.sidebar-toggle-btn:selected {
-    -fx-background-color: #1e293b;
-    -fx-text-fill: #ffffff;
-}
-
-/* Scrollable tool area — keeps bottom actions on-screen */
-.sidebar-scroll {
-    -fx-background-color: transparent;
-    -fx-background: transparent;
-    -fx-padding: 0;
-    -fx-min-height: 0;
-    -fx-min-width: 0;
-}
-
-.sidebar-scroll > .viewport {
-    -fx-background-color: #0f172a;
-}
-
-.sidebar-scroll > .scroll-bar:vertical {
-    -fx-background-color: transparent;
-    -fx-pref-width: 10;
-}
-
-.sidebar-scroll > .scroll-bar:vertical .thumb {
-    -fx-background-color: rgba(148, 163, 184, 0.45);
-    -fx-background-radius: 5;
-}
-
-.sidebar-scroll > .scroll-bar:vertical .thumb:hover {
-    -fx-background-color: rgba(148, 163, 184, 0.65);
-}
-
-/* ── Section header labels ──────────────────────────────────── */
-.section-header {
-    -fx-text-fill: #94a3b8;
-    -fx-font-size: 11px;
-    -fx-font-weight: bold;
-    /* Simulate letter-spacing with wider character spacing via padding */
-    -fx-label-padding: 0 0 8 0;
-}
-
-/* ── Tool toggle buttons ────────────────────────────────────── */
-.tool-button {
-    -fx-background-color: #1e293b;
-    -fx-text-fill: #f8fafc;
-    -fx-background-radius: 8;
-    -fx-padding: 10 14 10 14;
-    -fx-min-height: 40;
-    -fx-cursor: hand;
-    -fx-alignment: CENTER_LEFT;
-    -fx-border-width: 0;
-    -fx-font-size: 13px;
-}
-
-.tool-button:hover {
-    -fx-background-color: #334155;
-}
-
-.tool-button:armed {
-    -fx-background-color: #475569;
-}
-
-.tool-button:selected {
-    -fx-background-color: #3b82f6;
-    -fx-text-fill: #ffffff;
-    -fx-font-weight: bold;
-}
-
-.tool-button:selected:armed {
-    -fx-background-color: #2563eb;
-}
-
-/* ── Sidebar secondary action (e.g. Undo) — distinct from tools ─ */
-.sidebar-secondary-button {
-    -fx-background-color: transparent;
-    -fx-border-color: #475569;
-    -fx-border-width: 1;
-    -fx-border-radius: 8;
-    -fx-background-radius: 8;
-    -fx-text-fill: #e2e8f0;
-    -fx-padding: 10 14 10 14;
-    -fx-min-height: 40;
-    -fx-cursor: hand;
-    -fx-font-size: 13px;
-}
-
-.sidebar-secondary-button:hover {
-    -fx-background-color: rgba(51, 65, 85, 0.55);
-    -fx-border-color: #64748b;
-}
-
-.sidebar-secondary-button:armed {
-    -fx-background-color: #334155;
-}
-
-/* ── Danger (destructive action) button ─────────────────────── */
-.danger-button {
-    -fx-background-color: #e11d48;
-    -fx-text-fill: #ffffff;
-    -fx-background-radius: 8;
-    -fx-padding: 10 14 10 14;
-    -fx-min-height: 40;
-    -fx-cursor: hand;
-    -fx-font-size: 13px;
-    -fx-font-weight: bold;
-    -fx-border-width: 0;
-}
-
-.danger-button:hover {
-    -fx-background-color: #be123c;
-}
-
-.danger-button:armed {
-    -fx-background-color: #9f1239;
-}
-
-/* ── Ghost danger (outline leave / secondary destructive) ───── */
-.ghost-danger-button {
-    -fx-background-color: transparent;
-    -fx-border-color: #e11d48;
-    -fx-border-width: 1;
-    -fx-border-radius: 8;
-    -fx-background-radius: 8;
-    -fx-text-fill: #e11d48;
-    -fx-padding: 10 14 10 14;
-    -fx-min-height: 40;
-    -fx-cursor: hand;
-    -fx-font-size: 13px;
-    -fx-font-weight: bold;
-}
-
-.ghost-danger-button:hover {
-    -fx-background-color: rgba(225, 29, 72, 0.12);
-}
-
-.ghost-danger-button:armed {
-    -fx-background-color: #fecdd3;
-    -fx-border-color: #be123c;
-}
-
-/* Lobby room row — faint destructive default, solid red on hover */
-.danger-btn {
-    -fx-background-color: rgba(239, 68, 68, 0.1);
-    -fx-text-fill: #ef4444;
-    -fx-border-color: rgba(239, 68, 68, 0.3);
+.text-field {
+    -fx-background-color: -fx-surface-2;
+    -fx-control-inner-background: -fx-surface-2;
+    -fx-text-fill: -fx-text-main;
+    -fx-prompt-text-fill: -fx-text-muted;
+    -fx-border-color: -fx-border-subtle;
     -fx-border-width: 1px;
-    -fx-border-radius: 8px;
+    -fx-border-radius: 6px;
+    -fx-background-radius: 6px;
+    -fx-padding: 8px 12px;
+    -fx-effect: null;
+}
+.text-field:focused {
+    -fx-border-color: -fx-accent;
+    -fx-background-color: -fx-surface-2;
+    -fx-effect: null;
+}
+
+.tooltip {
+    -fx-background-color: -fx-surface-1;
+    -fx-text-fill: -fx-text-main;
     -fx-background-radius: 8px;
-    -fx-padding: 8 14 8 14;
-    -fx-cursor: hand;
-    -fx-font-size: 13px;
-}
-
-.danger-btn:hover {
-    -fx-background-color: #ef4444;
-    -fx-text-fill: #ffffff;
-    -fx-border-color: #ef4444;
-}
-
-.danger-btn:armed {
-    -fx-background-color: #dc2626;
-    -fx-text-fill: #ffffff;
-    -fx-border-color: #dc2626;
-}
-
-/* ── Connection status indicator ────────────────────────────── */
-.status-text {
-    -fx-text-fill: #10b981;
+    -fx-border-radius: 8px;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-width: 1px;
+    -fx-padding: 6 10 6 10;
     -fx-font-size: 12px;
+    -fx-effect: null;
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   Lobby scene (room discovery)
-   ═══════════════════════════════════════════════════════════════ */
-
-.lobby-root {
-    -fx-background-color: #0f172a;
+.toast-notification {
+    -fx-background-color: -fx-surface-1;
+    -fx-background-radius: 20px;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-width: 1px;
+    -fx-padding: 8px 16px;
+    -fx-effect: null;
 }
-
-.lobby-container {
-    -fx-max-width: 600;
-    -fx-spacing: 20;
-    -fx-alignment: top_center;
-    -fx-padding: 40;
-}
-
-.lobby-container > .lobby-header {
-    -fx-text-alignment: center;
-}
-
-.empty-state-text {
-    -fx-text-fill: #64748b;
-    -fx-font-size: 14px;
-    -fx-font-style: italic;
-}
-
-.room-card {
-    -fx-background-color: #1e293b;
-    -fx-padding: 15;
-    -fx-background-radius: 8;
-}
-
-.lobby-header {
-    -fx-text-fill: #f8fafc;
-    -fx-font-size: 26px;
-    -fx-font-weight: bold;
-}
-
-.lobby-subtitle {
-    -fx-text-fill: #94a3b8;
-    -fx-font-size: 14px;
-}
-
-.lobby-scroll {
-    -fx-background-color: transparent;
-    -fx-background: #0f172a;
-}
-
-.lobby-scroll > .viewport {
-    -fx-background-color: #0f172a;
-}
-
-.lobby-room-title {
-    -fx-text-fill: #f8fafc;
-    -fx-font-size: 16px;
-    -fx-font-weight: bold;
-}
-
-.lobby-meta {
-    -fx-text-fill: #94a3b8;
-    -fx-font-size: 12px;
-}
-
-.lobby-textfield {
-    -fx-background-color: #1e293b;
-    -fx-text-fill: #f8fafc;
-    -fx-prompt-text-fill: #64748b;
-    -fx-background-radius: 8;
-    -fx-padding: 10 14 10 14;
-}
-
-.lobby-status-muted {
-    -fx-text-fill: #94a3b8;
+.toast-notification .label {
+    -fx-text-fill: -fx-text-main;
     -fx-font-size: 13px;
+    -fx-wrap-text: true;
+}
+.toast-notification .label.lobby-status-connected {
+    -fx-text-fill: -fx-success;
+}
+.toast-notification .label.lobby-status-disconnected {
+    -fx-text-fill: -fx-danger;
+}
+.toast-notification .label.lobby-status-muted {
+    -fx-text-fill: -fx-text-muted;
 }
 
-.lobby-status-connected {
-    -fx-text-fill: #34d399;
-    -fx-font-size: 13px;
+.login-root {
+    -fx-background-color: -fx-bg-canvas;
 }
 
-.lobby-status-disconnected {
-    -fx-text-fill: #f87171;
-    -fx-font-size: 13px;
+.modal-card {
+    -fx-background-color: -fx-surface-1;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-width: 1px;
+    -fx-max-width: 600px;
+    -fx-padding: 40px;
+    -fx-background-radius: 12px;
+    -fx-border-radius: 12px;
+    -fx-effect: null;
 }
 
-/* Manual lobby refresh — blue outline, solid fill on hover */
-.refresh-btn {
-    -fx-background-color: rgba(59, 130, 246, 0.1);
-    -fx-text-fill: #3b82f6;
-    -fx-border-color: rgba(59, 130, 246, 0.3);
-    -fx-border-width: 1;
-    -fx-background-radius: 6;
-    -fx-border-radius: 6;
-    -fx-padding: 8 14 8 14;
-    -fx-cursor: hand;
+/* Main workspace StackPane — full-bleed canvas */
+.canvas-root {
+    -fx-background-color: -fx-bg-canvas;
 }
 
-.refresh-btn:hover {
-    -fx-background-color: #3b82f6;
-    -fx-text-fill: #ffffff;
+.floating-panel {
+    -fx-background-color: -fx-surface-1;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-width: 1px;
+    -fx-background-radius: 8px;
+    -fx-border-radius: 8px;
+    -fx-effect: dropshadow(two-pass-box, rgba(0, 0, 0, 0.4), 10, 0, 0, 4);
+    -fx-text-fill: -fx-text-main;
+    -fx-font-weight: 500;
 }
 
-.refresh-btn:disabled {
-    -fx-opacity: 0.5;
-    -fx-cursor: default;
+.floating-panel .label,
+.floating-panel .toggle-button,
+.floating-panel .button,
+.floating-panel .color-picker {
+    -fx-text-fill: -fx-text-main;
+    -fx-font-weight: 500;
 }
 
-/* Live telemetry strip — bottom-right canvas HUD */
-.telemetry-hud {
-    -fx-background-color: transparent;
-    -fx-text-fill: #94a3b8;
-    -fx-font-family: monospace;
-    -fx-font-size: 11px;
+.floating-panel.telemetry-hud .telemetry-hud-line,
+.floating-panel.telemetry-hud .telemetry-hud-sep {
+    -fx-text-fill: -fx-text-muted;
+    -fx-font-weight: 500;
+}
+
+/* Voice roster — top-right participant HUD */
+.participant-list-view {
+    -fx-spacing: 6;
+    -fx-padding: 8 10 8 10;
     -fx-alignment: center-right;
 }
 
-.telemetry-pill {
-    -fx-background-color: rgba(15, 23, 42, 0.6);
-    -fx-background-radius: 12px;
-    -fx-padding: 4px 12px;
+.participant-row {
+    -fx-spacing: 8;
+    -fx-alignment: center-left;
 }
 
-.telemetry-hud-line {
-    -fx-text-fill: #94a3b8;
+.participant-avatar {
+    -fx-min-width: 36;
+    -fx-min-height: 36;
+    -fx-max-width: 36;
+    -fx-max-height: 36;
+    -fx-pref-width: 36;
+    -fx-pref-height: 36;
+    -fx-background-color: -fx-surface-2;
+    -fx-background-radius: 18;
+    -fx-border-radius: 18;
+    -fx-border-width: 0;
+    -fx-border-color: transparent;
+    -fx-alignment: center;
 }
 
-.telemetry-hud-sep {
-    -fx-text-fill: #94a3b8;
-    -fx-opacity: 0.85;
+.participant-avatar.speaking-ring {
+    -fx-border-color: #10B981;
+    -fx-border-width: 2px;
+    -fx-effect: dropshadow(two-pass-box, rgba(16, 185, 129, 0.4), 10, 0, 0, 0);
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   Canvas workspace — floating island HUD (Figma-style)
-   ═══════════════════════════════════════════════════════════════ */
+.participant-avatar-initials {
+    -fx-text-fill: -fx-text-main;
+    -fx-font-size: 12px;
+    -fx-font-weight: bold;
+}
 
-.hud-panel {
-    -fx-background-color: rgba(15, 23, 42, 0.85);
-    -fx-background-radius: 16px;
-    -fx-border-radius: 16px;
-    -fx-border-color: rgba(255, 255, 255, 0.1);
+.participant-name {
+    -fx-text-fill: -fx-text-main;
+    -fx-font-size: 13px;
+}
+
+.participant-mute-icon {
+    -fx-alignment: center;
+}
+
+/* Panels pinned to the workspace margin: drop border so layout aligns to StackPane inset (no inner inset). */
+.hud-panel.workspace-perimeter-node,
+.floating-panel.workspace-perimeter-node {
+    -fx-border-width: 0;
+    -fx-border-color: transparent;
+}
+
+.canvas-control-layer {
+    -fx-background-color: transparent;
+}
+
+.card {
+    -fx-background-color: -fx-surface;
+    -fx-background-radius: 14px;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-radius: 14px;
+    -fx-padding: 40px;
+    -fx-effect: null;
+}
+
+.text-input-modern,
+.lobby-textfield {
+    -fx-background-color: -fx-surface-2;
+    -fx-control-inner-background: -fx-surface-2;
+    -fx-text-fill: -fx-text-main;
+    -fx-prompt-text-fill: -fx-text-muted;
+    -fx-border-color: -fx-border-subtle;
     -fx-border-width: 1px;
-    -fx-padding: 12px;
-    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.3), 15, 0, 0, 4);
+    -fx-border-radius: 6px;
+    -fx-background-radius: 6px;
+}
+.text-input-modern:focused,
+.lobby-textfield:focused {
+    -fx-border-color: -fx-accent;
+}
+
+.ghost-danger-button,
+.danger-btn {
+    -fx-background-color: derive(-fx-danger, -85%);
+    -fx-border-color: derive(-fx-danger, -55%);
+    -fx-border-width: 1px;
+    -fx-border-radius: 10px;
+    -fx-background-radius: 10px;
+    -fx-text-fill: -fx-danger;
+    -fx-padding: 8 12 8 12;
+    -fx-cursor: hand;
+}
+
+.ghost-danger-button:hover,
+.danger-btn:hover {
+    -fx-background-color: derive(-fx-danger, -75%);
+    -fx-border-color: derive(-fx-danger, -35%);
+}
+
+.status-text {
+    -fx-font-size: 12px;
+    -fx-font-weight: 600;
+    -fx-text-fill: -fx-text-muted;
+}
+
+.lobby-root {
+    -fx-background-color: -fx-bg-canvas;
+}
+
+.lobby-floating-card.floating-panel {
+    -fx-max-width: 600px;
+    -fx-padding: 32px;
+}
+
+.lobby-container {
+    -fx-spacing: 16;
+    -fx-alignment: top_center;
+    -fx-padding: 0;
+}
+
+.lobby-header {
+    -fx-text-fill: -fx-text-main;
+    -fx-font-size: 30px;
+    -fx-font-weight: 800;
+}
+
+.lobby-subtitle,
+.lobby-meta,
+.empty-state-text {
+    -fx-text-fill: -fx-text-muted;
+}
+
+.lobby-room-title {
+    -fx-text-fill: -fx-text-main;
+    -fx-font-size: 16px;
+    -fx-font-weight: 700;
+}
+
+.room-card {
+    -fx-background-color: -fx-surface-2;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-width: 1px;
+    -fx-background-radius: 12px;
+    -fx-border-radius: 12px;
+    -fx-padding: 14px;
+    -fx-effect: null;
+}
+
+.lobby-status-muted { -fx-text-fill: -fx-text-muted; -fx-font-size: 13px; }
+.lobby-status-connected { -fx-text-fill: -fx-success; -fx-font-size: 13px; }
+.lobby-status-disconnected { -fx-text-fill: -fx-danger; -fx-font-size: 13px; }
+
+.lobby-scroll {
+    -fx-background-color: transparent;
+    -fx-background-insets: 0;
+    -fx-padding: 0;
+    -fx-control-inner-background: transparent;
+}
+.lobby-scroll > .viewport {
+    -fx-background-color: transparent;
+    -fx-control-inner-background: transparent;
+}
+.lobby-scroll > .corner {
+    -fx-background-color: transparent;
+}
+.lobby-scroll .scroll-bar:vertical,
+.lobby-scroll .scroll-bar:horizontal {
+    -fx-background-color: transparent;
+    -fx-padding: 0;
+    -fx-opacity: 0;
+    -fx-pref-width: 0;
+    -fx-pref-height: 0;
+}
+.lobby-scroll .scroll-bar .increment-arrow,
+.lobby-scroll .scroll-bar .decrement-arrow,
+.lobby-scroll .scroll-bar .increment-button,
+.lobby-scroll .scroll-bar .decrement-button,
+.lobby-scroll .scroll-bar .track,
+.lobby-scroll .scroll-bar .thumb {
+    -fx-background-color: transparent;
+    -fx-padding: 0;
+}
+
+/* Top boards strip + top-right HUD — surfaced; mic shell stays clear */
+.hud-panel {
+    -fx-background-color: -fx-surface-1;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-width: 1px;
+    -fx-background-radius: 14px;
+    -fx-border-radius: 14px;
+    -fx-effect: null;
+}
+
+/* Ghost icon toggles — transparent until hover / selected (voice panel, etc.). */
+.ghost-button {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+    -fx-border-width: 0;
+    -fx-background-radius: 6px;
+    -fx-border-radius: 6px;
+    -fx-padding: 0;
+    -fx-cursor: hand;
+    -fx-effect: null;
+}
+
+.ghost-button:hover:not(:selected) {
+    -fx-background-color: -fx-surface-2;
+}
+
+.tool-dock {
+    -fx-padding: 4px;
+    -fx-spacing: 6px;
+    -fx-background-radius: 0 8px 8px 0;
+    -fx-border-radius: 0 8px 8px 0;
+}
+
+.tool-dock-toggle {
+    -fx-background-color: -fx-surface-1;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-width: 1px 0 1px 1px;
+    -fx-background-radius: 8px 0 0 8px;
+    -fx-border-radius: 8px 0 0 8px;
+    -fx-text-fill: -fx-text-main;
+    -fx-min-width: 28px;
+    -fx-pref-width: 28px;
+    -fx-max-width: 28px;
+    -fx-padding: 0;
+    -fx-cursor: hand;
+    -fx-font-weight: 700;
+    -fx-effect: null;
 }
 
 .tool-btn {
     -fx-background-color: transparent;
-    -fx-text-fill: #cbd5e1;
-    -fx-padding: 10;
-    -fx-min-width: 44px;
-    -fx-pref-width: 44px;
-    -fx-max-width: 44px;
+    -fx-text-fill: -fx-text-main;
     -fx-background-radius: 10px;
     -fx-border-width: 0;
     -fx-cursor: hand;
-    -fx-font-size: 16px;
+    -fx-padding: 8 10 8 10;
 }
-
 .tool-btn:hover {
-    -fx-background-color: rgba(255, 255, 255, 0.1);
-    -fx-background-radius: 10px;
+    -fx-background-color: -fx-surface-2;
+    -fx-text-fill: -fx-text-main;
+}
+
+/* Left dock: 40×40 toggles, 20×20 icon region, pill hover / selected (6px). */
+.tool-dock .tool-btn {
+    -fx-min-width: 40px;
+    -fx-pref-width: 40px;
+    -fx-max-width: 40px;
+    -fx-min-height: 40px;
+    -fx-pref-height: 40px;
+    -fx-max-height: 40px;
+    -fx-alignment: CENTER;
+    -fx-padding: 0;
+}
+
+.tool-dock.floating-panel .toggle-button.tool-btn {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+    -fx-border-width: 0;
+    -fx-background-radius: 0;
+    -fx-border-radius: 0;
+    -fx-background-insets: 0;
+    -fx-border-insets: 0;
     -fx-cursor: hand;
 }
 
-.tool-btn.tool-btn-active {
-    -fx-text-fill: #ffffff;
-    -fx-background-color: rgba(59, 130, 246, 0.4);
-    -fx-font-weight: bold;
-    -fx-min-width: 44px;
-    -fx-pref-width: 44px;
-    -fx-max-width: 44px;
-    -fx-background-radius: 10px;
+.tool-dock.floating-panel .toggle-button.tool-btn:hover:not(:selected) {
+    -fx-background-color: -fx-surface-2;
+    -fx-background-radius: 6px;
+    -fx-border-radius: 6px;
+}
+
+.root .tool-dock.floating-panel .toggle-button.tool-btn:selected,
+.root .tool-dock.floating-panel .toggle-button.tool-btn.tool-btn-active {
+    -fx-background-color: -fx-surface-2;
+    -fx-background-radius: 6px;
+    -fx-border-radius: 6px;
+    -fx-border-color: transparent;
+    -fx-font-weight: 700;
+}
+
+.tool-dock.floating-panel .toggle-button.tool-btn .tool-dock-icon-wrap {
+    -fx-min-width: 20px;
+    -fx-pref-width: 20px;
+    -fx-max-width: 20px;
+    -fx-min-height: 20px;
+    -fx-pref-height: 20px;
+    -fx-max-height: 20px;
+}
+
+.tool-dock.floating-panel .toggle-button.tool-btn .tool-btn-icon {
+    -fx-text-fill: -fx-text-muted;
+    -fx-font-weight: 600;
+}
+
+.tool-dock.floating-panel .toggle-button.tool-btn .tool-dock-icon-wrap SVGPath {
+    -fx-fill: -fx-text-muted;
+    -fx-stroke: -fx-text-muted;
+}
+
+.tool-dock.floating-panel .toggle-button.tool-btn:selected .tool-btn-icon,
+.tool-dock.floating-panel .toggle-button.tool-btn.tool-btn-active .tool-btn-icon {
+    -fx-text-fill: -fx-accent;
+}
+
+.tool-dock.floating-panel .toggle-button.tool-btn:selected .tool-dock-icon-wrap SVGPath,
+.tool-dock.floating-panel .toggle-button.tool-btn.tool-btn-active .tool-dock-icon-wrap SVGPath {
+    -fx-fill: -fx-accent;
+    -fx-stroke: -fx-accent;
+}
+
+.tool-dock.floating-panel .button.tool-btn {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+    -fx-border-width: 0;
+    -fx-background-radius: 0;
+    -fx-border-radius: 0;
+    -fx-text-fill: -fx-text-muted;
     -fx-cursor: hand;
 }
 
-.color-picker {
+.tool-dock.floating-panel .button.tool-btn:hover {
+    -fx-background-color: -fx-surface-2;
+    -fx-background-radius: 6px;
+    -fx-border-radius: 6px;
+    -fx-text-fill: -fx-text-muted;
+}
+
+.properties-bar {
+    -fx-padding: 8 12 8 12;
+    -fx-spacing: 10;
+}
+
+.properties-color-picker {
     -fx-background-color: transparent;
     -fx-color-label-visible: false;
-    -fx-padding: 0;
 }
 
-.color-picker > .color-picker-label > .text {
-    -fx-opacity: 0;
+.properties-eraser-type-bar {
+    -fx-spacing: 6;
 }
 
-.color-picker > .arrow-button {
-    -fx-opacity: 0;
-    -fx-padding: 0;
-}
-
-/* Boards trigger inside a .hud-panel — no second chrome */
-.hud-inline-action {
-    -fx-background-color: transparent;
-    -fx-border-width: 0;
-    -fx-text-fill: #e2e8f0;
-    -fx-font-size: 13px;
-    -fx-font-weight: bold;
-    -fx-padding: 2 10 2 10;
-    -fx-cursor: hand;
-}
-
-.hud-inline-action:hover {
-    -fx-text-fill: #f8fafc;
-}
-
-/* PTT row: .hud-panel is required for layout max-size; chip chrome stays on .ptt-indicator */
-.hud-panel.ptt-hud-shell {
-    -fx-background-color: transparent;
-    -fx-border-color: transparent;
-    -fx-border-width: 0;
-    -fx-padding: 0;
-    -fx-effect: null;
-}
-
-/* Tools island — dot-style ColorPicker (width capped in code) */
-.hud-panel.tools-island {
-    -fx-padding: 8px;
-}
-
-.hud-panel.tools-island .tools-island-color-picker {
-    -fx-max-width: 30;
-}
-
-/* Drawer handle: physically merged with the tools panel */
-.drawer-handle {
-    -fx-background-color: rgba(15, 23, 42, 0.85);
-    -fx-border-color: rgba(255, 255, 255, 0.1);
-    -fx-border-width: 1px 1px 1px 0px;
-    -fx-background-radius: 0 8px 8px 0;
-    -fx-border-radius: 0 8px 8px 0;
-    -fx-text-fill: #cbd5e1;
-    -fx-font-size: 10px;
-    -fx-padding: 20px 8px;
-    -fx-cursor: hand;
-}
-
-.drawer-handle:hover {
-    -fx-background-color: rgba(15, 23, 42, 0.95);
-    -fx-text-fill: #f1f5f9;
-}
-
-/* ═══════════════════════════════════════════════════════════════
-   Canvas workspace — Figma-style tab bar (not TabPane)
-   ═══════════════════════════════════════════════════════════════ */
-
-.workspace-header {
-    -fx-background-color: #0f172a;
-    -fx-padding: 0 10 0 10;
-    -fx-border-color: #1e293b;
-    -fx-border-width: 0 0 1 0;
-}
-
-.workspace-tab {
-    -fx-background-color: transparent;
-    -fx-background-insets: 0;
-    -fx-text-fill: #94a3b8;
-    -fx-padding: 10 20 10 20;
-    -fx-cursor: hand;
-    -fx-border-width: 0 0 2 0;
-    -fx-border-color: transparent;
-    -fx-background-radius: 0;
-    -fx-focus-color: transparent;
-    -fx-faint-focus-color: transparent;
-}
-
-.workspace-tab:hover {
-    -fx-text-fill: #f8fafc;
-    -fx-background-color: #1e293b;
-}
-
-.workspace-tab.workspace-tab-active {
-    -fx-background-color: #1e293b;
-    -fx-text-fill: #3b82f6;
-    -fx-border-width: 0 0 2 0;
-    -fx-border-color: #3b82f6;
-    -fx-font-weight: bold;
-}
-
-.workspace-tab.workspace-tab-active:hover {
-    -fx-text-fill: #3b82f6;
-    -fx-background-color: #1e293b;
-}
-
-/* Floating Task View–style board switcher trigger (replaces tab bar) */
-.boards-switcher-trigger {
-    -fx-text-fill: #e2e8f0;
-    -fx-font-size: 13px;
-    -fx-font-weight: bold;
-    -fx-padding: 8 18 8 18;
-    -fx-background-color: rgba(30, 41, 59, 0.92);
-    -fx-background-radius: 20;
-    -fx-border-color: rgba(148, 163, 184, 0.35);
-    -fx-border-radius: 20;
-    -fx-border-width: 1;
-    -fx-cursor: hand;
-    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.45), 12, 0.2, 0, 2);
-}
-.boards-switcher-trigger:hover {
-    -fx-background-color: rgba(51, 65, 85, 0.95);
-    -fx-border-color: rgba(148, 163, 184, 0.55);
-}
-.boards-switcher-trigger:pressed {
-    -fx-background-color: rgba(15, 23, 42, 0.98);
-}
-
-.new-board-btn {
-    -fx-text-fill: #64748b;
-    -fx-background-color: transparent;
-    -fx-background-insets: 0;
-    -fx-font-size: 16px;
-    -fx-padding: 10 15 10 15;
-    -fx-cursor: hand;
-    -fx-border-width: 0;
-    -fx-background-radius: 0;
-    -fx-focus-color: transparent;
-    -fx-faint-focus-color: transparent;
-}
-
-.new-board-btn:hover {
-    -fx-text-fill: #10b981;
-}
-
-/* ── Workspace “new board” dialog (TextInputDialog) ───────────── */
-.workspace-input-dialog {
-    -fx-background-color: #0f172a;
-}
-
-.workspace-input-dialog .header-panel {
-    -fx-background-color: #0f172a;
-}
-
-.workspace-input-dialog .content.label {
-    -fx-text-fill: #e2e8f0;
-    -fx-font-size: 13px;
-}
-
-.workspace-input-dialog .text-field {
-    -fx-background-color: #1e293b;
-    -fx-text-fill: #f8fafc;
-    -fx-prompt-text-fill: #64748b;
-    -fx-border-color: #334155;
-    -fx-border-width: 1;
-    -fx-border-radius: 6;
-    -fx-background-radius: 6;
-    -fx-padding: 8 12 8 12;
-}
-
-.workspace-input-dialog .button {
-    -fx-cursor: hand;
-    -fx-background-radius: 6;
-    -fx-padding: 8 16 8 16;
-}
-
-.workspace-input-dialog .button:default {
-    -fx-background-color: #3b82f6;
-    -fx-text-fill: #ffffff;
-    -fx-font-weight: bold;
-}
-
-.workspace-input-dialog .button:default:hover {
-    -fx-background-color: #2563eb;
-}
-
-.workspace-input-dialog .button:not(:default) {
-    -fx-background-color: transparent;
-    -fx-text-fill: #94a3b8;
-    -fx-border-color: #475569;
-    -fx-border-width: 1;
-}
-
-.workspace-input-dialog .button:not(:default):hover {
-    -fx-background-color: #1e293b;
-    -fx-text-fill: #f8fafc;
-}
-
-/* ═══════════════════════════════════════════════════════════════
-   Push-to-talk floating indicator (canvas scene)
-   ═══════════════════════════════════════════════════════════════ */
-
-.ptt-indicator {
-    -fx-background-color: rgba(30, 41, 59, 0.9);
-    -fx-text-fill: #94a3b8;
-    -fx-font-weight: bold;
-    -fx-padding: 12px 24px;
-    -fx-background-radius: 30px;
-    -fx-border-radius: 30px;
+.properties-eraser-type-btn {
     -fx-font-size: 14px;
 }
 
-.ptt-active-self {
-    -fx-background-color: #10b981;
-    -fx-text-fill: white;
-    -fx-effect: dropshadow(gaussian, rgba(16, 185, 129, 0.5), 20, 0, 0, 0);
+.properties-stroke-slider {
+    -fx-pref-width: 180;
 }
 
-.ptt-active-other {
-    -fx-background-color: #3b82f6;
-    -fx-text-fill: white;
-    -fx-effect: dropshadow(gaussian, rgba(59, 130, 246, 0.5), 20, 0, 0, 0);
+.hud-inline-action {
+    -fx-background-color: transparent;
+    -fx-border-width: 0;
+    -fx-text-fill: -fx-text-main;
+    -fx-font-weight: 700;
+    -fx-cursor: hand;
+}
+
+.telemetry-hud,
+.telemetry-hud-line,
+.telemetry-hud-sep {
+    -fx-font-family: "Consolas", "Courier New", monospace;
+    -fx-font-size: 11px;
+}
+
+.floating-panel.telemetry-hud {
+    -fx-cursor: hand;
+}
+
+/* Discord-style mic toggle — bottom-left floating control (semantic state classes) */
+.mic-toggle-btn {
+    -fx-pref-width: 48px;
+    -fx-pref-height: 48px;
+    -fx-min-width: 48px;
+    -fx-min-height: 48px;
+    -fx-max-width: 48px;
+    -fx-max-height: 48px;
+    -fx-padding: 0;
+    -fx-background-insets: 0;
+    -fx-background-radius: 24px;
+    -fx-border-width: 0;
+    -fx-border-color: transparent;
+    -fx-font-size: 20px;
+    -fx-cursor: hand;
+    -fx-focus-color: transparent;
+    -fx-faint-focus-color: transparent;
+    -fx-effect: null;
+
+    /* Unmuted (idle) — subtle slate disc, light icon */
+    -fx-background-color: #2C313C;
+    -fx-text-fill: -fx-text-main;
+}
+
+.mic-toggle-btn:hover {
+    -fx-background-color: #353B48;
+}
+
+/* Muted (default) — dark disc, Red 500 icon */
+.mic-toggle-btn.muted {
+    -fx-background-color: #22262F;
+    -fx-text-fill: #EF4444;
+    -fx-effect: null;
+}
+
+.mic-toggle-btn.muted:hover {
+    -fx-background-color: #2A2F3A;
+}
+
+/* Live / speaking — emerald wash, icon, outer glow (no border) */
+.mic-toggle-btn.speaking {
+    -fx-background-color: rgba(16, 185, 129, 0.2);
+    -fx-text-fill: #10B981;
+    -fx-effect: dropshadow(two-pass-box, rgba(16, 185, 129, 0.4), 15, 0, 0, 0);
+}
+
+.mic-toggle-btn.speaking:hover {
+    -fx-background-color: rgba(16, 185, 129, 0.28);
+}
+
+.root .hud-panel > .button.leave-room-button {
+    -fx-background-color: transparent;
+    -fx-text-fill: -fx-text-muted;
+    -fx-border-color: transparent;
+    -fx-border-width: 0;
+    -fx-background-insets: 0;
+    -fx-border-insets: 0;
+    -fx-font-weight: 600;
+    -fx-padding: 8 12 8 12;
+    -fx-cursor: hand;
+    -fx-effect: null;
+}
+.root .hud-panel > .button.leave-room-button:hover {
+    -fx-background-color: rgba(248, 113, 113, 0.1);
+    -fx-text-fill: -fx-danger;
+}
+.root .hud-panel > .button.leave-room-button:pressed {
+    -fx-background-color: rgba(248, 113, 113, 0.16);
+    -fx-text-fill: -fx-danger;
+}
+
+.boards-switcher-trigger {
+    -fx-background-color: -fx-surface-2;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-width: 1px;
+    -fx-background-radius: 20px;
+    -fx-border-radius: 20px;
+    -fx-text-fill: -fx-text-main;
+    -fx-font-weight: 700;
+    -fx-padding: 8 16 8 16;
+    -fx-cursor: hand;
+    -fx-effect: null;
+}
+
+.board-switcher-backdrop { -fx-background-color: rgba(0, 0, 0, 0.55); }
+.board-switcher-card {
+    -fx-background-color: -fx-surface-1;
+    -fx-background-radius: 12px;
+    -fx-border-color: transparent;
+    -fx-border-width: 2px;
+    -fx-border-radius: 12px;
+    -fx-cursor: hand;
+    -fx-effect: null;
+}
+.board-switcher-card-hover { -fx-border-color: -fx-accent; }
+.board-switcher-thumb { -fx-background-color: -fx-surface-2; -fx-background-radius: 8px; }
+.board-switcher-title { -fx-text-fill: -fx-text-main; -fx-font-size: 12px; -fx-font-weight: 700; }
+.board-switcher-plus { -fx-text-fill: -fx-text-muted; -fx-font-size: 42px; -fx-font-weight: 700; }
+.board-switcher-hint { -fx-text-fill: -fx-text-muted; -fx-font-size: 12px; }
+
+.workspace-input-dialog,
+.workspace-input-dialog .header-panel {
+    -fx-background-color: -fx-surface-1;
+}
+.workspace-input-dialog .content.label {
+    -fx-text-fill: -fx-text-main;
+    -fx-font-size: 13px;
+}
+.workspace-input-dialog .text-field {
+    -fx-background-color: -fx-surface-2;
+    -fx-control-inner-background: -fx-surface-2;
+    -fx-text-fill: -fx-text-main;
+    -fx-prompt-text-fill: -fx-text-muted;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-width: 1px;
+    -fx-border-radius: 8px;
+    -fx-background-radius: 8px;
+}
+.workspace-input-dialog .button {
+    -fx-background-radius: 8px;
+    -fx-padding: 8 14 8 14;
+    -fx-cursor: hand;
+}
+
+.ghost-author-tag {
+    -fx-text-fill: -fx-text-main;
+    -fx-font-size: 10px;
+    -fx-font-weight: 700;
+    -fx-padding: 1 5 1 4;
+    -fx-background-color: rgba(8, 8, 20, 0.82);
+    -fx-background-radius: 0 3 3 0;
+}
+.ghost-text-preview {
+    -fx-font-size: 14px;
+    -fx-padding: 2 6 2 4;
+    -fx-background-color: rgba(8, 8, 20, 0.60);
+    -fx-background-radius: 0 3 3 3;
+}
+.canvas-text-input {
+    -fx-background-radius: 0;
+    -fx-border-radius: 0;
 }

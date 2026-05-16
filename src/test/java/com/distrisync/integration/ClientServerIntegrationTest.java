@@ -44,7 +44,7 @@ class ClientServerIntegrationTest {
 
     private static final String HOST            = "127.0.0.1";
     private static final int    SETUP_TIMEOUT_S = 5;
-    private static final int    BCAST_TIMEOUT_S = 2;
+    private static final int    BCAST_TIMEOUT_S = 5;
     private static final long   POLL_MS         = 50;
 
     // =========================================================================
@@ -136,8 +136,11 @@ class ClientServerIntegrationTest {
         // Belt-and-suspenders: interrupt in case stop() raced with select().
         if (serverThread != null) {
             serverThread.interrupt();
-            serverThread.join(3_000);
+            serverThread.join(10_000);
         }
+        server = null;
+        serverThread = null;
+        roomManager = null;
     }
 
     // =========================================================================

@@ -1,24 +1,30 @@
 package com.distrisync.client;
 
+import com.distrisync.model.ArrowNode;
 import com.distrisync.model.Circle;
+import com.distrisync.model.EllipseNode;
 import com.distrisync.model.EraserPath;
 import com.distrisync.model.Line;
+import com.distrisync.model.RectangleNode;
 import com.distrisync.model.Shape;
 import com.distrisync.model.TextNode;
 import javafx.animation.Animation;
-import javafx.animation.AnimationTimer;
 import javafx.animation.FadeTransition;
 import javafx.animation.PauseTransition;
 import javafx.animation.ScaleTransition;
+import javafx.animation.SequentialTransition;
 import javafx.animation.TranslateTransition;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.beans.binding.Bindings;
+import javafx.beans.binding.BooleanBinding;
 import javafx.geometry.Insets;
 import javafx.geometry.Orientation;
 import javafx.geometry.Pos;
 import javafx.geometry.Rectangle2D;
 import javafx.scene.Cursor;
+import javafx.scene.ImageCursor;
+import javafx.scene.Node;
 import javafx.scene.Scene;
 import javafx.scene.canvas.Canvas;
 import javafx.scene.effect.GaussianBlur;
@@ -32,7 +38,7 @@ import javafx.scene.control.ColorPicker;
 import javafx.scene.control.DialogPane;
 import javafx.scene.control.Label;
 import javafx.scene.control.ScrollPane;
-import javafx.scene.control.Separator;
+import javafx.scene.control.ScrollPane.ScrollBarPolicy;
 import javafx.scene.control.Slider;
 import javafx.scene.control.TextField;
 import javafx.scene.control.TextInputDialog;
@@ -42,6 +48,8 @@ import javafx.scene.control.ToggleGroup;
 import javafx.scene.control.Tooltip;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
+import javafx.scene.input.MouseEvent;
+import javafx.scene.control.ContentDisplay;
 import javafx.scene.control.TextInputControl;
 import javafx.util.Duration;
 import javafx.scene.Parent;
@@ -52,7 +60,15 @@ import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
+import javafx.scene.layout.Background;
+import javafx.scene.layout.BackgroundFill;
+import javafx.scene.layout.Border;
+import javafx.scene.layout.BorderStroke;
+import javafx.scene.layout.BorderStrokeStyle;
+import javafx.scene.layout.BorderWidths;
+import javafx.scene.layout.CornerRadii;
 import javafx.scene.paint.Color;
+import javafx.scene.paint.Paint;
 import javafx.scene.shape.Rectangle;
 import javafx.scene.shape.StrokeLineCap;
 import javafx.scene.shape.StrokeLineJoin;
@@ -72,10 +88,12 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -85,9 +103,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <h2>Canvas architecture — three-layer StackPane</h2>
  * <ul>
- *   <li><b>Layer 1 — {@code baseCanvas}</b>: re-rendered every frame by an
- *       {@link AnimationTimer}; draws the white background and all committed
- *       shapes sorted by Lamport timestamp.</li>
+ *   <li><b>Layer 1 — {@code baseCanvas}</b>: redrawn on snapshot/mutation events and
+ *       viewport resize; draws the white background and all committed shapes sorted
+ *       by Lamport timestamp.</li>
  *   <li><b>Layer 2 — {@code transientCanvas}</b>: transparent by default;
  *       updated directly from mouse-drag events to show the rubber-band preview
  *       (Line / Circle) or the in-progress freehand / eraser stroke.  Cleared
@@ -129,9 +147,42 @@ public class WhiteboardApp extends Application {
     private static final double MIN_DRAG_DIST     = 2.0;
     private static final double MIN_FREEHAND_STEP = 4.0;
     private static final double ERASER_BASE_WIDTH = 14.0;
+    private static final double MIN_STAGE_WIDTH   = 800;
+    private static final double MIN_STAGE_HEIGHT  = 600;
+
+    /** {@link javafx.scene.Node#setId(String)} on the canvas clear control for layout / visibility tests. */
+    static final String TOOLBAR_CLEAR_BUTTON_ID = "whiteboard-toolbar-clear";
+    static final String WORKSPACE_ROOT_ID = "whiteboard-workspace-root";
+    static final String WORKSPACE_CANVAS_LAYER_ID = "whiteboard-workspace-canvas-layer";
+    static final String WORKSPACE_TOOLBAR_LAYER_ID = "whiteboard-workspace-toolbar-layer";
+    static final String WORKSPACE_DOCK_LAYER_ID = "whiteboard-workspace-dock-layer";
+    /** StackPane layer wrapping the color/stroke properties bar (margin / TestFX hooks). */
+    static final String WORKSPACE_PROPERTIES_LAYER_ID = "whiteboard-workspace-properties-layer";
+    static final String WORKSPACE_MIC_LAYER_ID = "whiteboard-workspace-mic-layer";
+    static final String WORKSPACE_PARTICIPANT_LAYER_ID = "whiteboard-workspace-participant-layer";
+    static final String MIC_TOGGLE_BUTTON_ID = "whiteboard-mic-toggle";
+    static final String WORKSPACE_PROPERTIES_BAR_ID = "whiteboard-workspace-properties-bar";
+    static final String WORKSPACE_ERASER_TYPE_BAR_ID = "whiteboard-workspace-eraser-type-bar";
+    static final String ERASER_TYPE_CIRCLE_BUTTON_ID = "whiteboard-eraser-type-circle";
+    static final String ERASER_TYPE_SQUARE_BUTTON_ID = "whiteboard-eraser-type-square";
+    static final String BOARDS_BUTTON_ID = "whiteboard-boards-button";
+    static final String TOOL_DOCK_SELECT_BUTTON_ID = "whiteboard-tool-select";
+    static final String TOOL_DOCK_PEN_BUTTON_ID = "whiteboard-tool-pen";
+    static final String TOOL_DOCK_ERASER_BUTTON_ID = "whiteboard-tool-eraser";
+    static final String TOOL_DOCK_RECTANGLE_BUTTON_ID = "whiteboard-tool-rectangle";
+    static final String TOOL_DOCK_ELLIPSE_BUTTON_ID = "whiteboard-tool-ellipse";
+    static final String TOOL_DOCK_ARROW_BUTTON_ID = "whiteboard-tool-arrow";
+    /** Leave Room control on the canvas HUD (contrast / TestFX hooks). */
+    static final String LEAVE_ROOM_BUTTON_ID = "whiteboard-leave-room-button";
+    /** Chevron control that collapses / expands the tool dock beside the boards strip. */
+    static final String TOOL_DOCK_TOGGLE_BUTTON_ID = "whiteboard-tool-dock-toggle";
+    /** Login card primary action (flat button reset / TestFX). */
+    static final String LOGIN_JOIN_NETWORK_BUTTON_ID = "login-join-network";
+    static final String LOBBY_MODAL_CARD_ID = "lobby-modal-card";
+    static final String LOGIN_MODAL_CARD_ID = "login-modal-card";
 
     // ── active drawing tool ───────────────────────────────────────────────────
-    private enum Tool { LINE, CIRCLE, FREEHAND, ERASER, TEXT }
+    private enum Tool { LINE, CIRCLE, RECTANGLE, ELLIPSE, ARROW, FREEHAND, ERASER, TEXT }
     private volatile Tool activeTool = Tool.LINE;
 
     // ── canvas layers ─────────────────────────────────────────────────────────
@@ -144,22 +195,41 @@ public class WhiteboardApp extends Application {
     private Pane            cursorPane;             // Layer 4: remote-cursor JavaFX nodes
     private Pane            controlPane;            // Layer 5: floating text-input controls
 
-    // ── Eraser cursor overlay — square that tracks the mouse when Eraser is active ─
-    private Rectangle       eraserCursor;
+    // ── global stroke / color (Figma-style shared context) ───────────────────
+    private final GlobalCanvasContext globalCanvasContext = new GlobalCanvasContext();
+    private final GlobalCanvasShapeFactory shapeFactory =
+            new GlobalCanvasShapeFactory(globalCanvasContext);
+    private EraserSpatialIntersection eraserIntersection;
+    /** Shape ids removed during the current eraser press/drag (FX thread only). */
+    private final Set<UUID> erasedInGesture = new HashSet<>();
 
     // ── toolbar controls ──────────────────────────────────────────────────────
     private ColorPicker colorPicker;
     private Slider      strokeSlider;
+    private HBox        eraserTypeBar;
+    private ToggleButton eraserTypeCircleBtn;
+    private ToggleButton eraserTypeSquareBtn;
     private Label       statusLabel;
     private final ToolsDrawerToggleModel toolsDrawerToggleModel = new ToolsDrawerToggleModel();
     private TranslateTransition toolsDrawerSlideTransition;
+    private Button    toolDockToggleButton;
+    /** Toggle + dock row; chevron stays outside the clipped slide so it always receives clicks. */
+    private HBox      toolsChromeRow;
+    private StackPane dockSlideClipStack;
+    private Rectangle dockClipRect;
+    private VBox      canvasToolDock;
     /** Tools-island toggle group and buttons (for shortcuts + programmatic selection). */
     private ToggleGroup canvasToolGroup;
     private ToggleButton canvasToolLine;
     private ToggleButton canvasToolCircle;
     private ToggleButton canvasToolPen;
     private ToggleButton canvasToolEraser;
+    private ToggleButton canvasToolRectangle;
+    private ToggleButton canvasToolEllipse;
+    private ToggleButton canvasToolArrow;
     private ToggleButton canvasToolText;
+    /** Tracks SHIFT for aspect-ratio locks during rubber-band drags. */
+    private volatile boolean shiftKeyHeld;
 
     // ── shape-ownership tooltip (shown on hover over committed shapes) ─────────
     private Tooltip ownerTooltip;
@@ -180,15 +250,17 @@ public class WhiteboardApp extends Application {
     private Label  telemetryPingLabel;
     private volatile boolean telemetryHudWired;
 
-    /** Bottom-center push-to-talk status chip on the canvas scene. */
-    private Label             pttIndicatorLabel;
-    /** Reverts {@link #pttIndicatorLabel} after remote audio gaps (no UDP packets). */
-    private PauseTransition   pttRemoteSilenceTimer;
-    /** PTT chip scale pulse; stopped before starting a new one to avoid stacking transforms. */
-    private ScaleTransition   pttScaleTransition;
+    /** Subtle hover scale on the telemetry HUD strip. */
+    private ScaleTransition   telemetryHoverScaleTransition;
 
-    private static final String PTT_DEFAULT_TEXT      = "[ MIC ] SPACE TO SPEAK";
-    private static final String PTT_TRANSMITTING_TEXT = "[ ON AIR ] TRANSMITTING...";
+    /** Bottom-left Discord-style mute / unmute control on the canvas scene. */
+    private Button micToggleBtn;
+    private ParticipantListView participantListView;
+    private Tooltip micToggleTooltip;
+    private boolean micToggleHudWired;
+
+    private static final String MIC_ON_GLYPH  = "\uD83C\uDFA4";
+    private static final String MIC_OFF_GLYPH = "\uD83D\uDD07";
 
     // ── user identity (name from dialog); room title updated after JOIN_ROOM ─
     private String authorName = "Anonymous";
@@ -208,16 +280,21 @@ public class WhiteboardApp extends Application {
     /** Thumbnails captured from {@link #baseCanvas} before leaving each board (FX thread only). */
     private final Map<String, Image> boardSnapshots = new HashMap<>();
     private final GaussianBlur boardSwitcherCanvasBlur = new GaussianBlur(14);
-    /** Canvas layer stack — target for snapshot fade transitions. */
-    private StackPane canvasStackPane;
+    /** Layered workspace: three {@link Canvas} layers plus cursor and control {@link Pane}s; sizes follow this stack. */
+    private StackPane canvasContainer;
+    private CanvasViewportResizeHandler canvasViewportResizeHandler;
     /** In-flight snapshot hydration fade; stopped when a newer SNAPSHOT arrives. */
     private Animation snapshotHydrationAnimation;
     /** Bumped on each SNAPSHOT so stale fade callbacks do not paint after a newer snapshot. */
     private long snapshotHydrationToken;
     private VBox    lobbyRoomList;
     private Label   lobbyEmptyStateLabel;
-    private Label   lobbyStatusLabel;
+    private Label     lobbyStatusLabel;
+    private StackPane lobbyToastShell;
+    private Animation lobbyToastSequence;
     private TextField newRoomField;
+
+    static final String LOBBY_TOAST_SHELL_ID = "lobby-toast-shell";
 
     /** Debounce duplicate lobby join/create clicks (same room, short window). */
     private long   lastLobbyJoinMillis;
@@ -261,23 +338,19 @@ public class WhiteboardApp extends Application {
     public void start(Stage stage) {
         primaryStage = stage;
         Rectangle2D visual = Screen.getPrimary().getVisualBounds();
-        // Keep mins usable on small displays; never larger than the usable screen.
-        double maxMinW = Math.max(360, visual.getWidth() - 32);
-        double maxMinH = Math.max(340, visual.getHeight() - 72);
-        stage.setMinWidth(Math.min(520, maxMinW));
-        stage.setMinHeight(Math.min(460, maxMinH));
+        enforceMinimumStageBounds(stage);
         stage.setTitle("DistriSync – Welcome");
 
         // ── Layer 1: base canvas ──────────────────────────────────────────────
-        baseCanvas = new Canvas();
+        baseCanvas = new Canvas(1, 1);
         baseGc     = baseCanvas.getGraphicsContext2D();
 
         // ── Layer 2: remote-transient canvas (peers' in-progress shapes) ──────
-        remoteTransientCanvas = new Canvas();
+        remoteTransientCanvas = new Canvas(1, 1);
         remoteTransientGc     = remoteTransientCanvas.getGraphicsContext2D();
 
         // ── Layer 3: local transient canvas (rubber-band / freehand preview) ──
-        transientCanvas = new Canvas();
+        transientCanvas = new Canvas(1, 1);
         transientGc     = transientCanvas.getGraphicsContext2D();
 
         // ── Layer 4: cursor pane (transparent, mouse-transparent) ─────────────
@@ -289,78 +362,107 @@ public class WhiteboardApp extends Application {
         // is actively placed on it, then returns to transparent on commit/cancel.
         controlPane = new Pane();
         controlPane.setMouseTransparent(true);
-        controlPane.setStyle("-fx-background-color: transparent;");
+        controlPane.getStyleClass().add("canvas-control-layer");
 
         // ── Stack all five layers ─────────────────────────────────────────────
-        canvasStackPane = new StackPane(
+        canvasContainer = new StackPane(
                 baseCanvas, remoteTransientCanvas, transientCanvas, cursorPane, controlPane);
 
-        // Bind canvas dimensions to the StackPane so they resize with the window
-        baseCanvas.widthProperty().bind(canvasStackPane.widthProperty());
-        baseCanvas.heightProperty().bind(canvasStackPane.heightProperty());
-        remoteTransientCanvas.widthProperty().bind(canvasStackPane.widthProperty());
-        remoteTransientCanvas.heightProperty().bind(canvasStackPane.heightProperty());
-        transientCanvas.widthProperty().bind(canvasStackPane.widthProperty());
-        transientCanvas.heightProperty().bind(canvasStackPane.heightProperty());
-        cursorPane.prefWidthProperty().bind(canvasStackPane.widthProperty());
-        cursorPane.prefHeightProperty().bind(canvasStackPane.heightProperty());
-        controlPane.prefWidthProperty().bind(canvasStackPane.widthProperty());
-        controlPane.prefHeightProperty().bind(canvasStackPane.heightProperty());
+        // Bind canvas dimensions; floor at 1px so Prism never allocates a 0×0 RTTexture (NGCanvas NPE).
+        javafx.beans.value.ObservableDoubleValue canvasWidth =
+                canvasDimensionBinding(canvasContainer.widthProperty());
+        javafx.beans.value.ObservableDoubleValue canvasHeight =
+                canvasDimensionBinding(canvasContainer.heightProperty());
+        baseCanvas.widthProperty().bind(canvasWidth);
+        baseCanvas.heightProperty().bind(canvasHeight);
+        remoteTransientCanvas.widthProperty().bind(canvasWidth);
+        remoteTransientCanvas.heightProperty().bind(canvasHeight);
+        transientCanvas.widthProperty().bind(canvasWidth);
+        transientCanvas.heightProperty().bind(canvasHeight);
+        cursorPane.prefWidthProperty().bind(canvasContainer.widthProperty());
+        cursorPane.prefHeightProperty().bind(canvasContainer.heightProperty());
+        controlPane.prefWidthProperty().bind(canvasContainer.widthProperty());
+        controlPane.prefHeightProperty().bind(canvasContainer.heightProperty());
+
+        canvasViewportResizeHandler = new CanvasViewportResizeHandler(this::redrawAllLayersAfterViewportChange);
+        canvasViewportResizeHandler.attachTo(canvasContainer);
 
         // ── Root layout — StackPane: full-bleed canvas layer + floating HUD islands ─
         canvasSceneRoot = new StackPane();
-        canvasSceneRoot.setStyle("-fx-background-color: " + BG_BASE + ";");
+        canvasSceneRoot.getStyleClass().add("canvas-root");
+        canvasSceneRoot.setPrefSize(Region.USE_COMPUTED_SIZE, Region.USE_COMPUTED_SIZE);
 
-        Pane canvasWrapper = new Pane(canvasStackPane);
-        canvasStackPane.prefWidthProperty().bind(canvasWrapper.widthProperty());
-        canvasStackPane.prefHeightProperty().bind(canvasWrapper.heightProperty());
-        canvasWrapper.prefWidthProperty().bind(canvasSceneRoot.widthProperty());
-        canvasWrapper.prefHeightProperty().bind(canvasSceneRoot.heightProperty());
-        canvasWrapper.maxWidthProperty().bind(canvasSceneRoot.widthProperty());
-        canvasWrapper.maxHeightProperty().bind(canvasSceneRoot.heightProperty());
+        canvasSceneRoot.setId(WORKSPACE_ROOT_ID);
+        canvasContainer.setId(WORKSPACE_CANVAS_LAYER_ID);
+        canvasContainer.prefWidthProperty().bind(canvasSceneRoot.widthProperty());
+        canvasContainer.prefHeightProperty().bind(canvasSceneRoot.heightProperty());
 
         buildBoardSwitcherOverlay();
 
         HBox boardsIsland = new HBox();
-        boardsIsland.getStyleClass().add("hud-panel");
+        boardsIsland.getStyleClass().addAll("hud-panel", "workspace-perimeter-node");
         boardsIsland.setAlignment(Pos.CENTER_LEFT);
         boardsIsland.setPickOnBounds(false);
         Button boardsTrigger = new Button("Boards ▾");
+        boardsTrigger.setId(BOARDS_BUTTON_ID);
         boardsTrigger.setFocusTraversable(false);
         boardsTrigger.setMnemonicParsing(false);
         boardsTrigger.getStyleClass().add("hud-inline-action");
         boardsTrigger.setOnAction(e -> toggleBoardSwitcher());
         boardsIsland.getChildren().add(boardsTrigger);
         boardsIsland.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
-        StackPane.setAlignment(boardsIsland, Pos.TOP_LEFT);
-        StackPane.setMargin(boardsIsland, new Insets(20));
 
-        HBox toolDrawer = buildToolDrawer();
-        StackPane.setAlignment(toolDrawer, Pos.CENTER_LEFT);
-        StackPane.setMargin(toolDrawer, new Insets(20, 20, 20, 0));
+        VBox toolDrawer = buildToolDrawer();
+        canvasToolDock = toolDrawer;
 
+        toolDockToggleButton = new Button(toolsDrawerToggleModel.restChevronText());
+        toolDockToggleButton.setId(TOOL_DOCK_TOGGLE_BUTTON_ID);
+        toolDockToggleButton.getStyleClass().add("tool-dock-toggle");
+        toolDockToggleButton.setFocusTraversable(false);
+        toolDockToggleButton.setMnemonicParsing(false);
+        Tooltip.install(toolDockToggleButton, createTooltip("Hide tools", ""));
+
+        dockClipRect = new Rectangle(0, 0, 88, 400);
+        dockClipRect.setArcWidth(8);
+        dockClipRect.setArcHeight(8);
+
+        dockSlideClipStack = new StackPane();
+        dockSlideClipStack.setPickOnBounds(false);
+        dockSlideClipStack.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        dockSlideClipStack.setClip(dockClipRect);
+        dockSlideClipStack.getChildren().add(toolDrawer);
+        StackPane.setAlignment(toolDrawer, Pos.TOP_LEFT);
+        toolDrawer.setTranslateX(0);
+
+        toolsChromeRow = new HBox(0, toolDockToggleButton, dockSlideClipStack);
+        toolsChromeRow.setAlignment(Pos.TOP_LEFT);
+        toolsChromeRow.setPickOnBounds(false);
+
+        toolDockToggleButton.setOnAction(e -> toggleToolsDrawerSlide());
+
+        toolDrawer.boundsInLocalProperty().addListener((o, a, b) -> updateToolsDrawerClipAndHostWidth());
+        toolDrawer.widthProperty().addListener((o, a, b) -> updateToolsDrawerClipAndHostWidth());
+        toolDrawer.heightProperty().addListener((o, a, b) -> updateToolsDrawerClipAndHostWidth());
+        toolDockToggleButton.widthProperty().addListener((o, a, b) -> updateToolsDrawerClipAndHostWidth());
+
+        /* Floating chrome: strict 16px workspace perimeter (margins on root StackPane children, not inner padding). */
+        StackPane boardsLayer = wrapFloatingNode(boardsIsland, Pos.TOP_LEFT, new Insets(16, 0, 0, 16),
+                WORKSPACE_TOOLBAR_LAYER_ID);
+        StackPane dockLayer = wrapFloatingNode(toolsChromeRow, Pos.TOP_LEFT, new Insets(64, 0, 0, 16),
+                WORKSPACE_DOCK_LAYER_ID);
+        HBox propertiesBar = buildPropertiesBar();
+        StackPane propertiesBarLayer = wrapFloatingNode(propertiesBar, Pos.TOP_CENTER, new Insets(16, 0, 0, 0),
+                WORKSPACE_PROPERTIES_LAYER_ID);
+
+        participantListView = new ParticipantListView();
         HBox topRightIsland = buildTopRightHud();
         topRightIsland.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
-        StackPane.setAlignment(topRightIsland, Pos.TOP_RIGHT);
-        StackPane.setMargin(topRightIsland, new Insets(20));
-
-        pttRemoteSilenceTimer = new PauseTransition(Duration.millis(500));
-        pttRemoteSilenceTimer.setOnFinished(ev -> revertPttIndicatorAfterRemoteGap());
-
-        pttIndicatorLabel = new Label(PTT_DEFAULT_TEXT);
-        pttIndicatorLabel.getStyleClass().add("ptt-indicator");
-        pttIndicatorLabel.setMouseTransparent(true);
-        pttIndicatorLabel.setScaleX(1.0);
-        pttIndicatorLabel.setScaleY(1.0);
-
-        HBox pttHud = new HBox(pttIndicatorLabel);
-        pttHud.getStyleClass().addAll("hud-panel", "ptt-hud-shell");
-        pttHud.setAlignment(Pos.CENTER);
-        pttHud.setPickOnBounds(false);
-        pttHud.setMouseTransparent(true);
-        pttHud.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
-        StackPane.setAlignment(pttHud, Pos.BOTTOM_CENTER);
-        StackPane.setMargin(pttHud, new Insets(0, 0, 30, 0));
+        VBox topRightColumn = new VBox(8, participantListView, topRightIsland);
+        topRightColumn.setAlignment(Pos.TOP_RIGHT);
+        topRightColumn.setFillWidth(false);
+        topRightColumn.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        StackPane topRightLayer = wrapFloatingNode(topRightColumn, Pos.TOP_RIGHT, new Insets(16, 16, 0, 0),
+                WORKSPACE_PARTICIPANT_LAYER_ID);
 
         telemetryTcpLabel = new Label("TCP: …");
         telemetryUdpLabel = new Label("UDP: …");
@@ -373,15 +475,36 @@ public class WhiteboardApp extends Application {
         telSep1.getStyleClass().add("telemetry-hud-sep");
         telSep2.getStyleClass().add("telemetry-hud-sep");
         telemetryHudRoot = new HBox(6, telemetryTcpLabel, telSep1, telemetryUdpLabel, telSep2, telemetryPingLabel);
-        telemetryHudRoot.getStyleClass().addAll("telemetry-hud", "telemetry-pill");
-        telemetryHudRoot.setPickOnBounds(false);
-        telemetryHudRoot.setMouseTransparent(true);
+        telemetryHudRoot.getStyleClass().addAll("telemetry-hud", "telemetry-pill", "floating-panel");
+        telemetryHudRoot.setPickOnBounds(true);
+        telemetryHudRoot.setMouseTransparent(false);
         telemetryHudRoot.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
-        StackPane.setAlignment(telemetryHudRoot, Pos.BOTTOM_RIGHT);
-        StackPane.setMargin(telemetryHudRoot, new Insets(15));
+        StackPane telemetryLayer = wrapFloatingNode(telemetryHudRoot, Pos.BOTTOM_RIGHT, new Insets(0, 16, 16, 0),
+                "whiteboard-workspace-telemetry-layer");
 
-        canvasSceneRoot.getChildren().addAll(canvasWrapper, boardsIsland, toolDrawer, topRightIsland, pttHud,
-                telemetryHudRoot);
+        wireTelemetryHoverScale();
+
+        micToggleBtn = new Button(MIC_OFF_GLYPH);
+        micToggleBtn.setId(MIC_TOGGLE_BUTTON_ID);
+        micToggleBtn.getStyleClass().add("mic-toggle-btn");
+        micToggleBtn.getStyleClass().add("muted");
+        micToggleBtn.setFocusTraversable(false);
+        micToggleTooltip = createTooltip("Unmute mic", "");
+        micToggleBtn.setTooltip(micToggleTooltip);
+        micToggleBtn.setOnAction(e -> {
+            if (networkClient == null) {
+                return;
+            }
+            networkClient.getAudioEngine().toggleMic();
+        });
+
+        StackPane micLayer = wrapFloatingNode(micToggleBtn, Pos.BOTTOM_LEFT, new Insets(0, 0, 16, 16),
+                WORKSPACE_MIC_LAYER_ID);
+
+        canvasSceneRoot.getChildren().addAll(canvasContainer, boardsLayer, dockLayer, propertiesBarLayer,
+                topRightLayer, micLayer, telemetryLayer);
+
+        Platform.runLater(this::updateToolsDrawerClipAndHostWidth);
 
         // ── Ownership tooltip — shown when hovering over a committed shape ────
         ownerTooltip = new Tooltip();
@@ -395,7 +518,7 @@ public class WhiteboardApp extends Application {
         canvasH = Math.min(canvasH, visual.getHeight() - 32);
         canvasScene = new Scene(canvasSceneRoot, canvasW, canvasH);
         canvasScene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
-        attachPttKeyEventFilters(canvasScene);
+        attachShiftKeyTracking(canvasScene);
 
         // ── Canvas scene shortcuts: tools, undo, board switcher, dismiss overlay ─
         canvasScene.setOnKeyPressed(e -> {
@@ -408,10 +531,6 @@ public class WhiteboardApp extends Application {
                 switch (e.getCode()) {
                     case L -> {
                         activateCanvasTool(Tool.LINE, canvasToolLine);
-                        e.consume();
-                    }
-                    case O -> {
-                        activateCanvasTool(Tool.CIRCLE, canvasToolCircle);
                         e.consume();
                     }
                     case P -> {
@@ -466,15 +585,23 @@ public class WhiteboardApp extends Application {
         nameField.setMaxWidth(Double.MAX_VALUE);
 
         Button joinNetworkBtn = new Button("Join Network");
+        joinNetworkBtn.setId(LOGIN_JOIN_NETWORK_BUTTON_ID);
         joinNetworkBtn.getStyleClass().add("primary-button-large");
         joinNetworkBtn.setMaxWidth(Double.MAX_VALUE);
 
-        VBox loginCard = new VBox(16, loginTitle, loginSubtitle, nameField, joinNetworkBtn);
-        loginCard.setAlignment(Pos.TOP_LEFT);
-        loginCard.getStyleClass().add("card");
-        loginCard.setMaxWidth(440);
+        VBox loginForm = new VBox(16, loginTitle, loginSubtitle, nameField, joinNetworkBtn);
+        loginForm.setAlignment(Pos.TOP_LEFT);
+        loginForm.setFillWidth(true);
+        loginForm.setMaxWidth(Double.MAX_VALUE);
 
-        loginRoot.getChildren().add(loginCard);
+        VBox loginModalCard = new VBox(loginForm);
+        loginModalCard.setId(LOGIN_MODAL_CARD_ID);
+        loginModalCard.getStyleClass().add("modal-card");
+        loginModalCard.setFillWidth(true);
+        loginModalCard.setMaxWidth(600);
+        StackPane.setAlignment(loginModalCard, Pos.CENTER);
+
+        loginRoot.getChildren().add(loginModalCard);
 
         loginScene = new Scene(loginRoot, shellW, shellH);
         loginScene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
@@ -499,13 +626,36 @@ public class WhiteboardApp extends Application {
         // controlPane must sit above cursorPane; toFront() reaffirms StackPane z-order.
         controlPane.toFront();
 
-        // Eraser cursor square — must be created after strokeSlider and cursorPane exist
-        setupEraserCursor();
+        eraserIntersection = new EraserSpatialIntersection(() -> shapes.values());
+        setupEraserTool();
 
         // Wire all mouse events to the StackPane (always hit-testable)
-        wireMouseEvents(canvasStackPane);
+        wireMouseEvents(canvasContainer);
+    }
 
-        startRenderLoop();
+    static void enforceMinimumStageBounds(Stage stage) {
+        stage.setMinWidth(MIN_STAGE_WIDTH);
+        stage.setMinHeight(MIN_STAGE_HEIGHT);
+        stage.widthProperty().addListener((obs, oldWidth, newWidth) -> {
+            if (newWidth != null && newWidth.doubleValue() < MIN_STAGE_WIDTH) {
+                stage.setWidth(MIN_STAGE_WIDTH);
+            }
+        });
+        stage.heightProperty().addListener((obs, oldHeight, newHeight) -> {
+            if (newHeight != null && newHeight.doubleValue() < MIN_STAGE_HEIGHT) {
+                stage.setHeight(MIN_STAGE_HEIGHT);
+            }
+        });
+    }
+
+    private static StackPane wrapFloatingNode(Node node, Pos alignment, Insets margin, String nodeId) {
+        StackPane layer = new StackPane(node);
+        layer.setId(nodeId);
+        layer.setPickOnBounds(false);
+        layer.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        StackPane.setAlignment(layer, alignment);
+        StackPane.setMargin(layer, margin);
+        return layer;
     }
 
     /**
@@ -533,7 +683,7 @@ public class WhiteboardApp extends Application {
     private void buildBoardSwitcherOverlay() {
         Region backdrop = new Region();
         backdrop.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
-        backdrop.setStyle("-fx-background-color: rgba(15, 23, 42, 0.8);");
+        backdrop.getStyleClass().add("board-switcher-backdrop");
         backdrop.setOnMouseClicked(e -> hideBoardSwitcher());
 
         switcherBoardGrid = new FlowPane();
@@ -582,8 +732,8 @@ public class WhiteboardApp extends Application {
         if (a != null) {
             a.stop();
         }
-        if (canvasStackPane != null) {
-            canvasStackPane.setEffect(boardSwitcherCanvasBlur);
+        if (canvasContainer != null) {
+            canvasContainer.setEffect(boardSwitcherCanvasBlur);
         }
         switcherOverlay.setOpacity(0);
         switcherOverlay.setVisible(true);
@@ -602,8 +752,8 @@ public class WhiteboardApp extends Application {
 
     private void hideBoardSwitcher() {
         if (!isBoardSwitcherShowing() || switcherOverlay == null) {
-            if (canvasStackPane != null) {
-                canvasStackPane.setEffect(null);
+            if (canvasContainer != null) {
+                canvasContainer.setEffect(null);
             }
             return;
         }
@@ -622,8 +772,8 @@ public class WhiteboardApp extends Application {
             if (switcherOverlay != null) {
                 switcherOverlay.setVisible(false);
             }
-            if (canvasStackPane != null) {
-                canvasStackPane.setEffect(null);
+            if (canvasContainer != null) {
+                canvasContainer.setEffect(null);
             }
             if (boardSwitcherVisibilityAnimation == fadeOut) {
                 boardSwitcherVisibilityAnimation = null;
@@ -651,18 +801,13 @@ public class WhiteboardApp extends Application {
         card.setMaxSize(240, 160);
         card.setPadding(new Insets(4, 10, 4, 10));
         card.setAlignment(Pos.TOP_CENTER);
-        String normalShadow = "-fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 10, 0.2, 0, 2);";
-        String hoverShadow = "-fx-effect: dropshadow(gaussian, rgba(148,163,184,0.45), 14, 0.25, 0, 2);";
-        String baseChrome =
-                "-fx-background-color: #1e293b; -fx-background-radius: 12; -fx-cursor: hand;"
-                        + "-fx-border-radius: 12; -fx-border-width: 2; ";
-        card.setStyle(baseChrome + "-fx-border-color: transparent; " + normalShadow);
+        card.getStyleClass().add("board-switcher-card");
 
         StackPane thumb = new StackPane();
         thumb.setPrefSize(220, 124);
         thumb.setMinSize(220, 124);
         thumb.setMaxSize(220, 124);
-        thumb.setStyle("-fx-background-color: #334155; -fx-background-radius: 8;");
+        thumb.getStyleClass().add("board-switcher-thumb");
 
         Image snap = boardSnapshots.get(boardId);
         if (snap != null) {
@@ -685,17 +830,17 @@ public class WhiteboardApp extends Application {
         Label name = new Label(boardId);
         name.setWrapText(true);
         name.setMaxWidth(220);
-        name.setStyle("-fx-text-fill: #e2e8f0; -fx-font-size: 12px; -fx-font-weight: bold;");
+        name.getStyleClass().add("board-switcher-title");
 
         card.getChildren().addAll(thumb, name);
 
         card.setOnMouseEntered(e -> {
             playBoardSwitcherCardScale(card, 1.05);
-            card.setStyle(baseChrome + "-fx-border-color: #3b82f6; " + hoverShadow);
+            card.getStyleClass().add("board-switcher-card-hover");
         });
         card.setOnMouseExited(e -> {
             playBoardSwitcherCardScale(card, 1.0);
-            card.setStyle(baseChrome + "-fx-border-color: transparent; " + normalShadow);
+            card.getStyleClass().remove("board-switcher-card-hover");
         });
         card.setOnMouseClicked(e -> {
             e.consume();
@@ -718,31 +863,26 @@ public class WhiteboardApp extends Application {
         card.setMaxSize(240, 160);
         card.setPadding(new Insets(4, 10, 4, 10));
         card.setAlignment(Pos.TOP_CENTER);
-        String normalShadow = "-fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 10, 0.2, 0, 2);";
-        String hoverShadow = "-fx-effect: dropshadow(gaussian, rgba(148,163,184,0.45), 14, 0.25, 0, 2);";
-        String baseChrome =
-                "-fx-background-color: #1e293b; -fx-background-radius: 12; -fx-cursor: hand;"
-                        + "-fx-border-radius: 12; -fx-border-width: 2; ";
-        card.setStyle(baseChrome + "-fx-border-color: transparent; " + normalShadow);
+        card.getStyleClass().add("board-switcher-card");
         StackPane thumb = new StackPane();
         thumb.setPrefSize(220, 124);
         thumb.setMinSize(220, 124);
         thumb.setMaxSize(220, 124);
-        thumb.setStyle("-fx-background-color: #334155; -fx-background-radius: 8;");
+        thumb.getStyleClass().add("board-switcher-thumb");
         Label plus = new Label("+");
-        plus.setStyle("-fx-text-fill: #94a3b8; -fx-font-size: 42px; -fx-font-weight: bold;");
+        plus.getStyleClass().add("board-switcher-plus");
         thumb.getChildren().add(plus);
         Label hint = new Label("New board");
         hint.setMaxWidth(220);
-        hint.setStyle("-fx-text-fill: #cbd5e1; -fx-font-size: 12px;");
+        hint.getStyleClass().add("board-switcher-hint");
         card.getChildren().addAll(thumb, hint);
         card.setOnMouseEntered(e -> {
             playBoardSwitcherCardScale(card, 1.05);
-            card.setStyle(baseChrome + "-fx-border-color: #3b82f6; " + hoverShadow);
+            card.getStyleClass().add("board-switcher-card-hover");
         });
         card.setOnMouseExited(e -> {
             playBoardSwitcherCardScale(card, 1.0);
-            card.setStyle(baseChrome + "-fx-border-color: transparent; " + normalShadow);
+            card.getStyleClass().remove("board-switcher-card-hover");
         });
         card.setOnMouseClicked(e -> {
             e.consume();
@@ -806,8 +946,8 @@ public class WhiteboardApp extends Application {
         if (a != null) {
             a.stop();
         }
-        if (canvasStackPane != null) {
-            canvasStackPane.setOpacity(1.0);
+        if (canvasContainer != null) {
+            canvasContainer.setOpacity(1.0);
         }
     }
 
@@ -844,125 +984,236 @@ public class WhiteboardApp extends Application {
     // Toolbar construction
     // =========================================================================
 
-    /**
-     * Left-center collapsible tool drawer: {@link HBox} shell + inner {@link VBox} panel (initialises
-     * {@link #colorPicker}, {@link #strokeSlider}). The whole {@link HBox} translates so StackPane alignment
-     * stays stable (translating only the inner {@link VBox} skewed bounds and left the chevron stranded).
-     */
-    private HBox buildToolDrawer() {
-        VBox toolsPanel = new VBox(8);
-        toolsPanel.getStyleClass().addAll("hud-panel", "tools-island");
-        toolsPanel.setAlignment(Pos.CENTER);
-        toolsPanel.setPickOnBounds(false);
-        toolsPanel.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+    private void toggleToolsDrawerSlide() {
+        if (toolDockToggleButton == null || canvasToolDock == null || dockSlideClipStack == null) {
+            return;
+        }
+        canvasToolDock.applyCss();
+        canvasToolDock.layout();
+        double panelW = Math.max(canvasToolDock.getBoundsInLocal().getWidth(), canvasToolDock.prefWidth(-1));
+        if (panelW <= 1) {
+            panelW = 56;
+        }
+        if (toolsDrawerSlideTransition != null) {
+            toolsDrawerSlideTransition.stop();
+        }
+        if (!toolsDrawerToggleModel.isToolsOpen()) {
+            double h = Math.max(dockSlideClipStack.snapSizeY(canvasToolDock.prefHeight(-1)), 160);
+            dockClipRect.setWidth(panelW);
+            dockClipRect.setHeight(h);
+            dockSlideClipStack.setMinWidth(panelW);
+            dockSlideClipStack.setPrefWidth(panelW);
+            dockSlideClipStack.setMaxWidth(panelW);
+            dockSlideClipStack.setMinHeight(h);
+            dockSlideClipStack.setPrefHeight(h);
+            dockSlideClipStack.setMaxHeight(h);
+        }
+        double fromX = canvasToolDock.getTranslateX();
+        double toX = toolsDrawerToggleModel.animationTargetTranslateX(panelW);
+        toolDockToggleButton.setText(toolsDrawerToggleModel.chevronAtAnimationStart());
+        toolsDrawerSlideTransition = new TranslateTransition(Duration.millis(250), canvasToolDock);
+        toolsDrawerSlideTransition.setFromX(fromX);
+        toolsDrawerSlideTransition.setToX(toX);
+        toolsDrawerSlideTransition.setOnFinished(ev -> {
+            toolsDrawerToggleModel.commitAfterToggleAnimation();
+            toolDockToggleButton.setText(toolsDrawerToggleModel.restChevronText());
+            String tip = toolsDrawerToggleModel.isToolsOpen() ? "Hide tools" : "Show tools";
+            Tooltip.install(toolDockToggleButton, createTooltip(tip, ""));
+            if (!toolsDrawerToggleModel.isToolsOpen()) {
+                dockSlideClipStack.setMinWidth(0);
+                dockSlideClipStack.setPrefWidth(0);
+                dockSlideClipStack.setMaxWidth(0);
+            }
+            updateToolsDrawerClipAndHostWidth();
+            toolsDrawerSlideTransition = null;
+        });
+        toolsDrawerSlideTransition.play();
+    }
+
+    private void updateToolsDrawerClipAndHostWidth() {
+        if (dockClipRect == null || dockSlideClipStack == null || canvasToolDock == null
+                || toolDockToggleButton == null || toolsChromeRow == null) {
+            return;
+        }
+        dockSlideClipStack.applyCss();
+        dockSlideClipStack.layout();
+        canvasToolDock.applyCss();
+        canvasToolDock.layout();
+        double dw = Math.max(
+                canvasToolDock.getBoundsInLocal().getWidth(),
+                dockSlideClipStack.snapSizeX(canvasToolDock.prefWidth(-1)));
+        if (dw <= 0) {
+            dw = 56;
+        }
+        double h = Math.max(dockSlideClipStack.snapSizeY(canvasToolDock.prefHeight(-1)), 160);
+        boolean animating = toolsDrawerSlideTransition != null
+                && toolsDrawerSlideTransition.getStatus() == Animation.Status.RUNNING;
+        if (!animating) {
+            canvasToolDock.setTranslateX(toolsDrawerToggleModel.restPanelTranslateX(dw));
+        }
+        if (toolsDrawerToggleModel.isToolsOpen()) {
+            dockClipRect.setWidth(dw);
+        } else {
+            dockClipRect.setWidth(0);
+        }
+        dockClipRect.setHeight(h);
+
+        double toggleH = Math.max(dockSlideClipStack.snapSizeY(toolDockToggleButton.prefHeight(-1)), h);
+        toolsChromeRow.setMinHeight(toggleH);
+        toolsChromeRow.setPrefHeight(toggleH);
+
+        if (toolsDrawerToggleModel.isToolsOpen()) {
+            dockSlideClipStack.setMinWidth(dw);
+            dockSlideClipStack.setPrefWidth(dw);
+            dockSlideClipStack.setMaxWidth(dw);
+        } else {
+            dockSlideClipStack.setMinWidth(0);
+            dockSlideClipStack.setPrefWidth(0);
+            dockSlideClipStack.setMaxWidth(0);
+        }
+        dockSlideClipStack.setMinHeight(h);
+        dockSlideClipStack.setPrefHeight(h);
+        dockSlideClipStack.setMaxHeight(h);
+    }
+
+    /** Vertical floating left dock for primary drawing tools. */
+    VBox buildToolDrawer() {
+        VBox toolDock = new VBox(6);
+        toolDock.getStyleClass().addAll("tool-dock", "floating-panel");
+        toolDock.setAlignment(Pos.TOP_CENTER);
+        toolDock.setPickOnBounds(false);
+        toolDock.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
 
         canvasToolGroup = new ToggleGroup();
-        canvasToolLine   = toolToggle("/", "Line", "L", canvasToolGroup, true);
-        canvasToolCircle = toolToggle("◯", "Circle", "O", canvasToolGroup, false);
-        canvasToolPen    = toolToggle("✎", "Pen", "P", canvasToolGroup, false);
-        canvasToolEraser = toolToggle("▧", "Eraser", "E", canvasToolGroup, false);
+        // Icon glyphs (tooltip carries full names); geometric / tool Unicode for compact 40×40 toggles.
+        canvasToolLine   = toolToggle("\u21F1", "Line", "L", canvasToolGroup, true);
+        canvasToolPen    = toolToggle("\u270E", "Pen", "P", canvasToolGroup, false);
+        canvasToolEraser = toolToggle("\u25A7", "Eraser", "E", canvasToolGroup, false);
+        canvasToolRectangle = toolToggle("\u25AD", "Rectangle", "R", canvasToolGroup, false);
+        canvasToolEllipse = toolToggle("\u2B2D", "Ellipse", "O", canvasToolGroup, false);
+        canvasToolArrow = toolToggle("\u2192", "Arrow", "A", canvasToolGroup, false);
         canvasToolText   = toolToggle("T", "Text", "T", canvasToolGroup, false);
+        canvasToolLine.setId(TOOL_DOCK_SELECT_BUTTON_ID);
+        canvasToolPen.setId(TOOL_DOCK_PEN_BUTTON_ID);
+        canvasToolEraser.setId(TOOL_DOCK_ERASER_BUTTON_ID);
+        canvasToolRectangle.setId(TOOL_DOCK_RECTANGLE_BUTTON_ID);
+        canvasToolEllipse.setId(TOOL_DOCK_ELLIPSE_BUTTON_ID);
+        canvasToolArrow.setId(TOOL_DOCK_ARROW_BUTTON_ID);
 
-        canvasToolLine.setOnAction(e   -> activateCanvasTool(Tool.LINE, canvasToolLine));
-        canvasToolCircle.setOnAction(e -> activateCanvasTool(Tool.CIRCLE, canvasToolCircle));
-        canvasToolPen.setOnAction(e    -> activateCanvasTool(Tool.FREEHAND, canvasToolPen));
-        canvasToolEraser.setOnAction(e -> activateCanvasTool(Tool.ERASER, canvasToolEraser));
-        canvasToolText.setOnAction(e   -> activateCanvasTool(Tool.TEXT, canvasToolText));
+        canvasToolLine.setOnAction(e       -> activateCanvasTool(Tool.LINE, canvasToolLine));
+        canvasToolPen.setOnAction(e        -> activateCanvasTool(Tool.FREEHAND, canvasToolPen));
+        canvasToolEraser.setOnAction(e     -> activateCanvasTool(Tool.ERASER, canvasToolEraser));
+        canvasToolRectangle.setOnAction(e  -> activateCanvasTool(Tool.RECTANGLE, canvasToolRectangle));
+        canvasToolEllipse.setOnAction(e    -> activateCanvasTool(Tool.ELLIPSE, canvasToolEllipse));
+        canvasToolArrow.setOnAction(e      -> activateCanvasTool(Tool.ARROW, canvasToolArrow));
+        canvasToolText.setOnAction(e       -> activateCanvasTool(Tool.TEXT, canvasToolText));
 
         canvasToolGroup.selectedToggleProperty().addListener((obs, oldToggle, newToggle) -> {
             applyToolToggleStyleClasses(canvasToolGroup);
             if (newToggle == null) return;
             if (newToggle == canvasToolEraser) {
-                if (cursorPane      != null) cursorPane.setCursor(Cursor.NONE);
-                if (transientCanvas != null) transientCanvas.setCursor(Cursor.NONE);
+                syncEraserTypeToggleButtons();
+                applyEraserCursorToCanvas();
             } else {
-                if (eraserCursor    != null) eraserCursor.setVisible(false);
                 Cursor cursor = (newToggle == canvasToolText) ? Cursor.TEXT : Cursor.CROSSHAIR;
-                if (cursorPane      != null) cursorPane.setCursor(cursor);
-                if (transientCanvas != null) transientCanvas.setCursor(cursor);
+                applyDrawingCursor(cursor);
             }
         });
         applyToolToggleStyleClasses(canvasToolGroup);
-        if (cursorPane      != null) cursorPane.setCursor(Cursor.CROSSHAIR);
-        if (transientCanvas != null) transientCanvas.setCursor(Cursor.CROSSHAIR);
-
-        VBox toolColumn = new VBox(8, canvasToolLine, canvasToolCircle, canvasToolPen, canvasToolEraser, canvasToolText);
-        toolColumn.setFillWidth(true);
+        applyDrawingCursor(Cursor.CROSSHAIR);
 
         Button undoBtn = new Button("⤺");
         undoBtn.getStyleClass().add("tool-btn");
+        undoBtn.setPrefSize(40, 40);
+        undoBtn.setMinSize(40, 40);
+        undoBtn.setMaxSize(40, 40);
+        undoBtn.setAlignment(Pos.CENTER);
+        undoBtn.setContentDisplay(ContentDisplay.CENTER);
+        undoBtn.setFont(Font.font(null, FontWeight.NORMAL, 16));
         undoBtn.setFocusTraversable(false);
         undoBtn.setMnemonicParsing(false);
         undoBtn.setOnAction(e -> undoLastShape());
         Tooltip.install(undoBtn, createTooltip("Undo", "Ctrl+Z"));
 
         Button clearBtn = new Button("⌧");
+        clearBtn.setId(TOOLBAR_CLEAR_BUTTON_ID);
         clearBtn.getStyleClass().add("tool-btn");
+        clearBtn.setPrefSize(40, 40);
+        clearBtn.setMinSize(40, 40);
+        clearBtn.setMaxSize(40, 40);
+        clearBtn.setAlignment(Pos.CENTER);
+        clearBtn.setContentDisplay(ContentDisplay.CENTER);
+        clearBtn.setFont(Font.font(null, FontWeight.NORMAL, 16));
         clearBtn.setFocusTraversable(false);
         clearBtn.setMnemonicParsing(false);
         clearBtn.setOnAction(e -> clearBoard());
         Tooltip.install(clearBtn, createTooltip("Clear board", ""));
 
-        HBox secondaryRow = new HBox(6, undoBtn, clearBtn);
-        secondaryRow.setAlignment(Pos.CENTER);
+        toolDock.getChildren().addAll(
+                canvasToolLine, canvasToolPen, canvasToolRectangle, canvasToolEllipse, canvasToolArrow,
+                canvasToolEraser, canvasToolText,
+                undoBtn, clearBtn);
+        return toolDock;
+    }
 
-        colorPicker = new ColorPicker(Color.web(ACCENT));
-        colorPicker.setMaxWidth(30);
-        colorPicker.getStyleClass().add("tools-island-color-picker");
-        colorPicker.setStyle("-fx-background-radius: 50%; -fx-cursor: hand;");
-
-        strokeSlider = new Slider(1, 20, 2);
+    private HBox buildPropertiesBar() {
+        colorPicker = new ColorPicker(globalCanvasContext.getActiveColor());
+        colorPicker.valueProperty().bindBidirectional(globalCanvasContext.activeColorProperty());
+        colorPicker.getStyleClass().add("properties-color-picker");
+        colorPicker.setFocusTraversable(false);
+        strokeSlider = new Slider(1, 20, globalCanvasContext.getActiveStrokeWidth());
+        strokeSlider.valueProperty().bindBidirectional(globalCanvasContext.activeStrokeWidthProperty());
         strokeSlider.setShowTickLabels(false);
-        strokeSlider.setMaxWidth(Double.MAX_VALUE);
+        strokeSlider.getStyleClass().add("properties-stroke-slider");
+        strokeSlider.setPrefWidth(180);
         Tooltip.install(colorPicker, createTooltip("Color", ""));
         Tooltip.install(strokeSlider, createTooltip("Stroke Width", ""));
 
-        Separator toolsColorSep = new Separator();
-        toolsColorSep.setMaxWidth(Double.MAX_VALUE);
+        ToggleGroup eraserTypeGroup = new ToggleGroup();
+        eraserTypeCircleBtn = new ToggleButton("○");
+        eraserTypeCircleBtn.setId(ERASER_TYPE_CIRCLE_BUTTON_ID);
+        eraserTypeCircleBtn.getStyleClass().addAll("tool-btn", "properties-eraser-type-btn");
+        eraserTypeCircleBtn.setToggleGroup(eraserTypeGroup);
+        eraserTypeCircleBtn.setFocusTraversable(false);
+        eraserTypeCircleBtn.setPrefSize(32, 32);
+        Tooltip.install(eraserTypeCircleBtn, createTooltip("Stroke eraser", ""));
 
-        toolsPanel.getChildren().addAll(toolColumn, secondaryRow, toolsColorSep, colorPicker, strokeSlider);
+        eraserTypeSquareBtn = new ToggleButton("□");
+        eraserTypeSquareBtn.setId(ERASER_TYPE_SQUARE_BUTTON_ID);
+        eraserTypeSquareBtn.getStyleClass().addAll("tool-btn", "properties-eraser-type-btn");
+        eraserTypeSquareBtn.setToggleGroup(eraserTypeGroup);
+        eraserTypeSquareBtn.setFocusTraversable(false);
+        eraserTypeSquareBtn.setPrefSize(32, 32);
+        Tooltip.install(eraserTypeSquareBtn, createTooltip("Block eraser", ""));
 
-        Button toolDrawerToggleBtn = new Button("<");
-        toolDrawerToggleBtn.getStyleClass().add("drawer-handle");
-        toolDrawerToggleBtn.setFocusTraversable(false);
-        toolDrawerToggleBtn.setMnemonicParsing(false);
-        Tooltip.install(toolDrawerToggleBtn, createTooltip("Hide tools", ""));
+        eraserTypeCircleBtn.setSelected(globalCanvasContext.getActiveEraserType() == EraserType.CIRCLE);
+        eraserTypeSquareBtn.setSelected(globalCanvasContext.getActiveEraserType() == EraserType.SQUARE);
+        eraserTypeCircleBtn.setOnAction(e -> globalCanvasContext.setActiveEraserType(EraserType.CIRCLE));
+        eraserTypeSquareBtn.setOnAction(e -> globalCanvasContext.setActiveEraserType(EraserType.SQUARE));
 
-        HBox toolDrawer = new HBox(0, toolsPanel, toolDrawerToggleBtn);
-        toolDrawer.setSpacing(0);
-        toolDrawer.setAlignment(Pos.CENTER_LEFT);
-        toolDrawer.setPickOnBounds(false);
-        toolDrawer.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        eraserTypeBar = new HBox(6, eraserTypeCircleBtn, eraserTypeSquareBtn);
+        eraserTypeBar.setId(WORKSPACE_ERASER_TYPE_BAR_ID);
+        eraserTypeBar.setAlignment(Pos.CENTER);
+        eraserTypeBar.getStyleClass().add("properties-eraser-type-bar");
 
-        // Slide the whole row: translating only the inner VBox skews HBox boundsInParent and
-        // StackPane CENTER_LEFT alignment leaves the chevron visually "behind" on the canvas.
-        toolDrawerToggleBtn.setOnAction(e -> {
-            if (toolsDrawerSlideTransition != null) {
-                toolsDrawerSlideTransition.stop();
-            }
-            toolsPanel.setTranslateX(0);
-            double w = toolsPanel.getLayoutBounds().getWidth();
-            if (w <= 1) {
-                w = toolsPanel.prefWidth(-1);
-            }
-            TranslateTransition tt = new TranslateTransition(Duration.millis(250), toolDrawer);
-            toolsDrawerSlideTransition = tt;
-            toolDrawerToggleBtn.setDisable(true);
-            toolDrawerToggleBtn.setText(toolsDrawerToggleModel.chevronAtAnimationStart());
-            tt.setToX(toolsDrawerToggleModel.animationTargetTranslateX(w));
-            tt.setOnFinished(ev -> {
-                toolDrawerToggleBtn.setDisable(false);
-                toolsDrawerToggleModel.commitAfterToggleAnimation();
-                if (toolsDrawerToggleModel.isToolsOpen()) {
-                    Tooltip.install(toolDrawerToggleBtn, createTooltip("Hide tools", ""));
-                } else {
-                    Tooltip.install(toolDrawerToggleBtn, createTooltip("Show tools", ""));
-                }
-            });
-            tt.play();
-        });
+        BooleanBinding eraserToolActive = Bindings.createBooleanBinding(
+                () -> canvasToolGroup != null && canvasToolGroup.getSelectedToggle() == canvasToolEraser,
+                canvasToolGroup != null ? canvasToolGroup.selectedToggleProperty() : null);
+        eraserTypeBar.visibleProperty().bind(eraserToolActive);
+        eraserTypeBar.managedProperty().bind(eraserToolActive);
 
-        return toolDrawer;
+        HBox propertiesBar = new HBox(12, colorPicker, strokeSlider, eraserTypeBar);
+        propertiesBar.setId(WORKSPACE_PROPERTIES_BAR_ID);
+        propertiesBar.getStyleClass().addAll("properties-bar", "floating-panel", "workspace-perimeter-node");
+        propertiesBar.setAlignment(Pos.CENTER);
+        propertiesBar.setPickOnBounds(false);
+        propertiesBar.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        return propertiesBar;
+    }
+
+    /** Package-visible for TestFX; not a static singleton. */
+    GlobalCanvasContext getGlobalCanvasContext() {
+        return globalCanvasContext;
     }
 
     /** HUD tool toggles: {@code tool-btn-active} on the selected tool, {@code tool-btn} on all. */
@@ -981,16 +1232,20 @@ public class WhiteboardApp extends Application {
     /** Top-right floating island: leave room + connection status (initialises {@link #statusLabel}). */
     private HBox buildTopRightHud() {
         Button leaveRoomBtn = new Button("Leave Room");
-        leaveRoomBtn.getStyleClass().add("ghost-danger-button");
+        leaveRoomBtn.setId(LEAVE_ROOM_BUTTON_ID);
+        leaveRoomBtn.getStyleClass().add("leave-room-button");
         leaveRoomBtn.setFocusTraversable(false);
         leaveRoomBtn.setMnemonicParsing(false);
         leaveRoomBtn.setOnAction(e -> leaveCanvasRoom(true));
         leaveRoomBtn.setTooltip(new Tooltip("Return to the lobby"));
 
         statusLabel = new Label("⬤ Offline");
-        statusLabel.setStyle("-fx-text-fill: " + RED + "; -fx-font-size: 12px;");
+        statusLabel.getStyleClass().add("status-text");
+        statusLabel.setTextFill(Color.web(RED));
+        statusLabel.setWrapText(true);
+        statusLabel.setMaxWidth(200);
 
-        HBox row = new HBox(12, leaveRoomBtn, statusLabel);
+        HBox row = new HBox(10, leaveRoomBtn, statusLabel);
         row.setAlignment(Pos.CENTER_LEFT);
         row.getStyleClass().add("hud-panel");
         row.setPickOnBounds(false);
@@ -998,11 +1253,31 @@ public class WhiteboardApp extends Application {
         return row;
     }
 
-    private ToggleButton toolToggle(String icon, String name, String shortcut, ToggleGroup group, boolean selected) {
-        ToggleButton btn = new ToggleButton(icon);
+    /**
+     * Compact square tool toggle: {@code glyph} is a single icon character; {@code name} / {@code shortcut}
+     * are shown only in the tooltip.
+     */
+    private ToggleButton toolToggle(String glyph, String name, String shortcut, ToggleGroup group, boolean selected) {
+        ToggleButton btn = new ToggleButton();
         btn.setToggleGroup(group);
         btn.setSelected(selected);
-        btn.setMaxWidth(Double.MAX_VALUE);
+        btn.setPrefSize(40, 40);
+        btn.setMinSize(40, 40);
+        btn.setMaxSize(40, 40);
+        btn.setAlignment(Pos.CENTER);
+        btn.setContentDisplay(ContentDisplay.GRAPHIC_ONLY);
+        btn.setGraphicTextGap(0);
+        btn.setText(null);
+        Label glyphLabel = new Label(glyph);
+        glyphLabel.getStyleClass().add("tool-btn-icon");
+        glyphLabel.setFont(Font.font(null, FontWeight.NORMAL, 18));
+        StackPane iconWrap = new StackPane(glyphLabel);
+        iconWrap.getStyleClass().add("tool-dock-icon-wrap");
+        StackPane.setAlignment(glyphLabel, Pos.CENTER);
+        iconWrap.setMinSize(20, 20);
+        iconWrap.setPrefSize(20, 20);
+        iconWrap.setMaxSize(20, 20);
+        btn.setGraphic(iconWrap);
         btn.getStyleClass().add("tool-btn");
         btn.setFocusTraversable(false);
         btn.setMnemonicParsing(false);
@@ -1072,13 +1347,14 @@ public class WhiteboardApp extends Application {
     private Parent buildLobbyRoot() {
         StackPane root = new StackPane();
         root.getStyleClass().add("lobby-root");
+        root.setPrefSize(Region.USE_COMPUTED_SIZE, Region.USE_COMPUTED_SIZE);
 
         VBox container = new VBox();
         container.setFillWidth(true);
-        container.setMaxWidth(600);
+        container.setPrefSize(Region.USE_COMPUTED_SIZE, Region.USE_COMPUTED_SIZE);
+        container.setMaxWidth(Double.MAX_VALUE);
         container.setMaxHeight(Double.MAX_VALUE);
         container.getStyleClass().add("lobby-container");
-        StackPane.setAlignment(container, Pos.TOP_CENTER);
 
         Label header = new Label("DistriSync Lobby");
         header.getStyleClass().add("lobby-header");
@@ -1087,18 +1363,24 @@ public class WhiteboardApp extends Application {
         newRoomField = new TextField();
         newRoomField.setPromptText("New room name…");
         newRoomField.getStyleClass().add("lobby-textfield");
+        newRoomField.setMinWidth(160);
+        newRoomField.setMaxWidth(Double.MAX_VALUE);
 
         Button createBtn = new Button("Create Room");
         createBtn.getStyleClass().add("tool-button");
         createBtn.setOnAction(e -> joinRoomFromLobby(newRoomField.getText()));
         newRoomField.setOnAction(e -> joinRoomFromLobby(newRoomField.getText()));
 
-        HBox createRow = new HBox(12, newRoomField, createBtn);
+        HBox createRow = new HBox(12);
         createRow.setAlignment(Pos.CENTER_LEFT);
+        createRow.setMaxWidth(Double.MAX_VALUE);
         HBox.setHgrow(newRoomField, Priority.ALWAYS);
+        createRow.getChildren().addAll(newRoomField, createBtn);
+        VBox.setMargin(createRow, new Insets(0, 0, 32, 0));
 
         Label availableRoomsLabel = new Label("Available Rooms");
         availableRoomsLabel.getStyleClass().add("lobby-room-title");
+        availableRoomsLabel.setWrapText(true);
         availableRoomsLabel.setMaxWidth(Double.MAX_VALUE);
 
         Button refreshBtn = new Button("Refresh ↻");
@@ -1108,9 +1390,12 @@ public class WhiteboardApp extends Application {
             }
         });
 
-        HBox lobbyRoomsHeaderRow = new HBox(12, availableRoomsLabel, refreshBtn);
+        FlowPane lobbyRoomsHeaderRow = new FlowPane(10, 10, availableRoomsLabel, refreshBtn);
+        lobbyRoomsHeaderRow.setOrientation(Orientation.HORIZONTAL);
         lobbyRoomsHeaderRow.setAlignment(Pos.CENTER_LEFT);
-        HBox.setHgrow(availableRoomsLabel, Priority.ALWAYS);
+        lobbyRoomsHeaderRow.prefWrapLengthProperty().bind(Bindings.createDoubleBinding(
+                () -> Math.max(200, container.getWidth() - 8),
+                container.widthProperty()));
 
         lobbyRoomList = new VBox(10);
         lobbyRoomList.setFillWidth(true);
@@ -1124,23 +1409,99 @@ public class WhiteboardApp extends Application {
 
         VBox roomsSection = new VBox(10);
         roomsSection.setFillWidth(true);
+        roomsSection.setPrefSize(Region.USE_COMPUTED_SIZE, Region.USE_COMPUTED_SIZE);
         roomsSection.getChildren().addAll(lobbyRoomsHeaderRow, lobbyEmptyStateLabel, lobbyRoomList);
         VBox.setVgrow(lobbyRoomList, Priority.ALWAYS);
 
         ScrollPane scroll = new ScrollPane(roomsSection);
         scroll.setFitToWidth(true);
+        scroll.setHbarPolicy(ScrollBarPolicy.NEVER);
         scroll.setMinHeight(220);
         scroll.getStyleClass().add("lobby-scroll");
         VBox.setVgrow(scroll, Priority.ALWAYS);
 
         lobbyStatusLabel = new Label("Connecting…");
         lobbyStatusLabel.setWrapText(true);
-        lobbyStatusLabel.setMaxWidth(Double.MAX_VALUE);
-        lobbyStatusLabel.getStyleClass().add("lobby-status-muted");
+        lobbyStatusLabel.setMaxWidth(560);
+        lobbyStatusLabel.setMouseTransparent(true);
 
-        container.getChildren().addAll(header, createRow, scroll, lobbyStatusLabel);
-        root.getChildren().add(container);
+        lobbyToastShell = new StackPane(lobbyStatusLabel);
+        lobbyToastShell.setId(LOBBY_TOAST_SHELL_ID);
+        lobbyToastShell.getStyleClass().add("toast-notification");
+        lobbyToastShell.setPickOnBounds(false);
+        lobbyToastShell.setMouseTransparent(true);
+        lobbyToastShell.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        StackPane.setAlignment(lobbyToastShell, Pos.BOTTOM_CENTER);
+        StackPane.setMargin(lobbyToastShell, new Insets(0, 0, 32, 0));
+
+        container.getChildren().addAll(header, createRow, scroll);
+
+        VBox lobbyModalCard = new VBox(container);
+        lobbyModalCard.setId(LOBBY_MODAL_CARD_ID);
+        lobbyModalCard.getStyleClass().addAll("lobby-floating-card", "floating-panel");
+        lobbyModalCard.setFillWidth(true);
+        lobbyModalCard.setMaxWidth(600);
+        StackPane.setAlignment(lobbyModalCard, Pos.CENTER);
+
+        root.getChildren().addAll(lobbyModalCard, lobbyToastShell);
+        setLobbyStickyStatus("Connecting…", "lobby-status-muted");
         return root;
+    }
+
+    private void cancelLobbyToastAnimation() {
+        if (lobbyToastSequence != null) {
+            lobbyToastSequence.stop();
+            lobbyToastSequence = null;
+        }
+    }
+
+    /**
+     * Lobby status that stays visible (connection line) until replaced.
+     */
+    private void setLobbyStickyStatus(String message, String styleClass) {
+        cancelLobbyToastAnimation();
+        if (lobbyStatusLabel == null || lobbyToastShell == null) {
+            return;
+        }
+        lobbyStatusLabel.setText(message);
+        lobbyStatusLabel.getStyleClass().clear();
+        lobbyStatusLabel.getStyleClass().add(styleClass);
+        lobbyToastShell.setVisible(true);
+        lobbyToastShell.setOpacity(1);
+    }
+
+    /**
+     * Short-lived toast: fade in 200 ms, hold 2 s, fade out 200 ms. Pass-through for mouse events.
+     */
+    void showToast(String message) {
+        showToast(message, "lobby-status-muted");
+    }
+
+    void showToast(String message, String labelStyleClass) {
+        if (lobbyStatusLabel == null || lobbyToastShell == null) {
+            return;
+        }
+        cancelLobbyToastAnimation();
+        lobbyStatusLabel.setText(message);
+        lobbyStatusLabel.getStyleClass().clear();
+        lobbyStatusLabel.getStyleClass().add(labelStyleClass);
+        lobbyToastShell.setVisible(true);
+        lobbyToastShell.setOpacity(0);
+
+        FadeTransition fadeIn = new FadeTransition(Duration.millis(200), lobbyToastShell);
+        fadeIn.setFromValue(0);
+        fadeIn.setToValue(1);
+        PauseTransition hold = new PauseTransition(Duration.seconds(2));
+        FadeTransition fadeOut = new FadeTransition(Duration.millis(200), lobbyToastShell);
+        fadeOut.setFromValue(1);
+        fadeOut.setToValue(0);
+        SequentialTransition seq = new SequentialTransition(fadeIn, hold, fadeOut);
+        seq.setOnFinished(e -> {
+            lobbyToastSequence = null;
+            lobbyToastShell.setVisible(false);
+        });
+        lobbyToastSequence = seq;
+        seq.play();
     }
 
     /**
@@ -1152,11 +1513,7 @@ public class WhiteboardApp extends Application {
             return;
         }
         if (networkClient == null || !networkClient.isRunning()) {
-            if (lobbyStatusLabel != null) {
-                lobbyStatusLabel.setText("Not connected — start the server or wait for connection.");
-                lobbyStatusLabel.getStyleClass().clear();
-                lobbyStatusLabel.getStyleClass().add("lobby-status-disconnected");
-            }
+            showToast("Not connected — start the server or wait for connection.", "lobby-status-disconnected");
             return;
         }
         long now = System.currentTimeMillis();
@@ -1165,11 +1522,7 @@ public class WhiteboardApp extends Application {
         }
         lastLobbyJoinMillis = now;
         lastLobbyJoinRoomId = name;
-        if (lobbyStatusLabel != null) {
-            lobbyStatusLabel.setText("Joining room \"" + name + "\"…");
-            lobbyStatusLabel.getStyleClass().clear();
-            lobbyStatusLabel.getStyleClass().add("lobby-status-muted");
-        }
+        showToast("Joining room \"" + name + "\"…");
         networkClient.sendJoinRoom(name);
         scheduleLobbyJoinWatchdog();
     }
@@ -1244,11 +1597,10 @@ public class WhiteboardApp extends Application {
             if (t == null || !t.startsWith("Joining room")) {
                 return;
             }
-            lobbyStatusLabel.setText(
+            showToast(
                     "Join timed out. Run WhiteboardServer on " + networkHost + ":" + networkPort
-                    + " (same project), then try Create Room again.");
-            lobbyStatusLabel.getStyleClass().clear();
-            lobbyStatusLabel.getStyleClass().add("lobby-status-disconnected");
+                            + " (same project), then try Create Room again.",
+                    "lobby-status-disconnected");
         });
         lobbyJoinWatchdog.play();
     }
@@ -1267,18 +1619,29 @@ public class WhiteboardApp extends Application {
             return;
         }
         for (RoomInfo info : rooms) {
-            HBox card = new HBox(16);
+            FlowPane card = new FlowPane(10, 10);
+            card.setOrientation(Orientation.HORIZONTAL);
             card.setAlignment(Pos.CENTER_LEFT);
             card.getStyleClass().add("room-card");
+            card.prefWrapLengthProperty().bind(Bindings.createDoubleBinding(
+                    () -> Math.max(180, lobbyRoomList.getWidth() - 16),
+                    lobbyRoomList.widthProperty()));
 
             VBox textCol = new VBox(4);
             Label idLab = new Label(info.roomId());
             idLab.getStyleClass().add("lobby-room-title");
+            idLab.setWrapText(true);
+            idLab.maxWidthProperty().bind(Bindings.createDoubleBinding(
+                    () -> Math.max(60, card.getWidth() - 8),
+                    card.widthProperty()));
             Label countLab = new Label(
                     info.userCount() + (info.userCount() == 1 ? " user connected" : " users connected"));
             countLab.getStyleClass().add("lobby-meta");
+            countLab.setWrapText(true);
+            countLab.maxWidthProperty().bind(Bindings.createDoubleBinding(
+                    () -> Math.max(60, card.getWidth() - 8),
+                    card.widthProperty()));
             textCol.getChildren().addAll(idLab, countLab);
-            HBox.setHgrow(textCol, Priority.ALWAYS);
 
             Button joinBtn = new Button("Join");
             joinBtn.getStyleClass().add("tool-button");
@@ -1290,9 +1653,9 @@ public class WhiteboardApp extends Application {
             deleteBtn.setDisable(networkClient == null || !networkClient.isRunning());
             deleteBtn.setOnAction(e -> confirmDeleteRoomFromLobby(rid, idLab, joinBtn, deleteBtn));
 
-            HBox actions = new HBox(8);
+            FlowPane actions = new FlowPane(10, 10, joinBtn, deleteBtn);
+            actions.setOrientation(Orientation.HORIZONTAL);
             actions.setAlignment(Pos.CENTER_RIGHT);
-            actions.getChildren().addAll(joinBtn, deleteBtn);
 
             card.getChildren().addAll(textCol, actions);
             lobbyRoomList.getChildren().add(card);
@@ -1357,148 +1720,171 @@ public class WhiteboardApp extends Application {
     }
 
     // =========================================================================
-    // Push-to-talk (canvas scene)
+    // Canvas scene input — shift constraints & mic toggle HUD
     // =========================================================================
 
     /**
-     * Space activates PTT except while typing in a {@link TextInputControl}, so
-     * whiteboard text fields keep normal space handling.
+     * Binds {@link #micToggleBtn} to {@link AudioEngine} mute/speaking properties (once per session).
      */
-    private void attachPttKeyEventFilters(Scene scene) {
-        scene.addEventFilter(KeyEvent.KEY_PRESSED, e -> {
-            if (e.getCode() != KeyCode.SPACE) {
-                return;
-            }
-            if (e.getTarget() instanceof TextInputControl) {
-                return;
-            }
-            if (networkClient == null) {
-                return;
-            }
-            AudioEngine audio = networkClient.getAudioEngine();
-            if (audio.isRecording()) {
-                return;
-            }
-            try {
-                audio.startRecording();
-            } catch (Exception ex) {
-                log.debug("PTT startRecording: {}", ex.getMessage());
-                return;
-            }
-            applyPttSelfTransmittingVisual();
-            playPttScalePulse(1.05);
-            if (pttRemoteSilenceTimer != null) {
-                pttRemoteSilenceTimer.stop();
-            }
-            e.consume();
-        });
-
-        scene.addEventFilter(KeyEvent.KEY_RELEASED, e -> {
-            if (e.getCode() != KeyCode.SPACE) {
-                return;
-            }
-            if (networkClient == null) {
-                return;
-            }
-            AudioEngine audio = networkClient.getAudioEngine();
-            boolean recording = audio.isRecording();
-            if (e.getTarget() instanceof TextInputControl && !recording) {
-                return;
-            }
-            audio.stopRecording();
-            applyPttDefaultVisual();
-            playPttScalePulse(1.0);
-            e.consume();
-        });
-    }
-
-    private void playPttScalePulse(double toScale) {
-        if (pttIndicatorLabel == null) {
+    private void wireParticipantHud(ParticipantManager manager) {
+        if (participantListView == null || manager == null || networkClient == null) {
             return;
         }
-        if (pttScaleTransition != null) {
-            pttScaleTransition.stop();
+        participantListView.bindTo(manager);
+        String displayName = networkClient.getAuthorName();
+        if (displayName == null || displayName.isBlank()) {
+            displayName = "You";
         }
-        double from = pttIndicatorLabel.getScaleX();
-        pttScaleTransition = new ScaleTransition(Duration.millis(100), pttIndicatorLabel);
-        pttScaleTransition.setFromX(from);
-        pttScaleTransition.setFromY(pttIndicatorLabel.getScaleY());
-        pttScaleTransition.setToX(toScale);
-        pttScaleTransition.setToY(toScale);
-        pttScaleTransition.play();
-    }
-
-    private void applyPttSelfTransmittingVisual() {
-        if (pttIndicatorLabel == null) {
-            return;
-        }
-        pttIndicatorLabel.setText(PTT_TRANSMITTING_TEXT);
-        pttIndicatorLabel.getStyleClass().remove("ptt-active-other");
-        if (!pttIndicatorLabel.getStyleClass().contains("ptt-active-self")) {
-            pttIndicatorLabel.getStyleClass().add("ptt-active-self");
-        }
-        if (!pttIndicatorLabel.getStyleClass().contains("ptt-indicator")) {
-            pttIndicatorLabel.getStyleClass().add(0, "ptt-indicator");
-        }
-    }
-
-    private void applyPttDefaultVisual() {
-        if (pttIndicatorLabel == null) {
-            return;
-        }
-        pttIndicatorLabel.setText(PTT_DEFAULT_TEXT);
-        pttIndicatorLabel.getStyleClass().removeAll("ptt-active-self", "ptt-active-other");
-        if (!pttIndicatorLabel.getStyleClass().contains("ptt-indicator")) {
-            pttIndicatorLabel.getStyleClass().add("ptt-indicator");
-        }
-    }
-
-    private void revertPttIndicatorAfterRemoteGap() {
-        if (pttIndicatorLabel == null || networkClient == null) {
-            return;
-        }
-        if (networkClient.getAudioEngine().isRecording()) {
-            return;
-        }
-        applyPttDefaultVisual();
-        playPttScalePulse(1.0);
-    }
-
-    private void onRemoteUserSpeaking(String speakerId) {
-        if (pttIndicatorLabel == null || networkClient == null) {
-            return;
-        }
+        manager.putParticipant(networkClient.getClientId(), displayName);
         AudioEngine audio = networkClient.getAudioEngine();
-        if (audio.isRecording()) {
-            return;
-        }
-        String token = networkClient.getUdpToken();
-        if (speakerId != null && token != null && !token.isEmpty() && speakerId.equals(token)) {
-            return;
-        }
-        String who = formatRemoteSpeakerLabel(speakerId);
-        String subject = who.equalsIgnoreCase("Someone") ? "USER" : who.toUpperCase();
-        pttIndicatorLabel.setText("[ 🔊 ] " + subject + " SPEAKING...");
-        pttIndicatorLabel.getStyleClass().remove("ptt-active-self");
-        if (!pttIndicatorLabel.getStyleClass().contains("ptt-active-other")) {
-            pttIndicatorLabel.getStyleClass().add("ptt-active-other");
-        }
-        if (!pttIndicatorLabel.getStyleClass().contains("ptt-indicator")) {
-            pttIndicatorLabel.getStyleClass().add(0, "ptt-indicator");
-        }
-        playPttScalePulse(1.05);
-        if (pttRemoteSilenceTimer != null) {
-            pttRemoteSilenceTimer.stop();
-            pttRemoteSilenceTimer.playFromStart();
+        Participant local = manager.get(networkClient.getClientId());
+        if (local != null && audio != null) {
+            local.setMuted(audio.isMicMuted());
+            audio.isMicMutedProperty().addListener((obs, was, muted) ->
+                    local.setMuted(Boolean.TRUE.equals(muted)));
         }
     }
 
-    private static String formatRemoteSpeakerLabel(String speakerId) {
-        if (speakerId == null || speakerId.isBlank()) {
-            return "Someone";
+    private void wireMicToggleHud(AudioEngine audio) {
+        if (micToggleBtn == null || audio == null || micToggleHudWired) {
+            return;
         }
-        String s = speakerId.strip();
-        return s.length() > 24 ? s.substring(0, 21) + "…" : s;
+        micToggleHudWired = true;
+
+        Runnable refresh = () -> {
+            boolean muted = audio.isMicMuted();
+            boolean speaking = audio.isSpeaking();
+            Runnable apply = () -> applyMicToggleVisual(muted, speaking);
+            if (Platform.isFxApplicationThread()) {
+                apply.run();
+            } else {
+                Platform.runLater(apply);
+            }
+        };
+
+        audio.isMicMutedProperty().addListener((obs, was, now) -> refresh.run());
+        audio.isSpeakingProperty().addListener((obs, was, now) -> refresh.run());
+        refresh.run();
+    }
+
+    private void applyMicToggleVisual(boolean muted, boolean speaking) {
+        if (micToggleBtn == null) {
+            return;
+        }
+        micToggleBtn.getStyleClass().removeAll("muted", "speaking");
+        if (muted) {
+            micToggleBtn.setText(MIC_OFF_GLYPH);
+            micToggleBtn.getStyleClass().add("muted");
+        } else {
+            micToggleBtn.setText(MIC_ON_GLYPH);
+            if (speaking) {
+                micToggleBtn.getStyleClass().add("speaking");
+            }
+        }
+        updateMicToggleTooltip(muted, speaking);
+    }
+
+    private void updateMicToggleTooltip(boolean muted, boolean speaking) {
+        if (micToggleTooltip == null) {
+            return;
+        }
+        if (muted) {
+            micToggleTooltip.setText("Unmute mic");
+        } else if (speaking) {
+            micToggleTooltip.setText("Mute mic (live)");
+        } else {
+            micToggleTooltip.setText("Mute mic");
+        }
+    }
+
+    private void attachShiftKeyTracking(Scene scene) {
+        scene.addEventFilter(KeyEvent.KEY_PRESSED, e -> {
+            if (e.getCode() == KeyCode.SHIFT) {
+                shiftKeyHeld = true;
+            }
+        });
+        scene.addEventFilter(KeyEvent.KEY_RELEASED, e -> {
+            if (e.getCode() != KeyCode.SHIFT) {
+                return;
+            }
+            shiftKeyHeld = false;
+            if (!isDragging || transientGc == null || transientCanvas == null || !isRubberBandDragTool()) {
+                return;
+            }
+            transientGc.clearRect(0, 0, transientCanvas.getWidth(), transientCanvas.getHeight());
+            drawRubberBandPreview(false);
+        });
+    }
+
+    private boolean isRubberBandDragTool() {
+        return switch (activeTool) {
+            case LINE, CIRCLE, RECTANGLE, ELLIPSE, ARROW -> true;
+            default -> false;
+        };
+    }
+
+    private boolean isShiftHeld(MouseEvent e) {
+        return shiftKeyHeld || e.isShiftDown();
+    }
+
+    private static double segmentLength(ShapeMathUtils.LineSegment seg) {
+        return Math.hypot(seg.x2() - seg.x1(), seg.y2() - seg.y1());
+    }
+
+    private void strokeArrow(
+            GraphicsContext gc, double x1, double y1, double x2, double y2, double strokeWidth, Color color) {
+        gc.setStroke(color);
+        gc.setLineWidth(strokeWidth);
+        gc.setLineDashes((double[]) null);
+        gc.setLineCap(StrokeLineCap.ROUND);
+        gc.setLineJoin(StrokeLineJoin.ROUND);
+        gc.strokeLine(x1, y1, x2, y2);
+        double angle = Math.atan2(y2 - y1, x2 - x1);
+        double headLen = 8.0 + strokeWidth * 1.5;
+        double wing = Math.PI / 6.0;
+        gc.strokeLine(x2, y2,
+                x2 - headLen * Math.cos(angle - wing), y2 - headLen * Math.sin(angle - wing));
+        gc.strokeLine(x2, y2,
+                x2 - headLen * Math.cos(angle + wing), y2 - headLen * Math.sin(angle + wing));
+    }
+
+    /** Subtle 1.02× scale on pointer enter (150 ms) for the telemetry HUD strip. */
+    private void wireTelemetryHoverScale() {
+        if (telemetryHudRoot != null) {
+            telemetryHudRoot.addEventHandler(MouseEvent.MOUSE_ENTERED, e -> {
+                if (telemetryHoverScaleTransition != null) {
+                    telemetryHoverScaleTransition.stop();
+                }
+                double sx = telemetryHudRoot.getScaleX();
+                double sy = telemetryHudRoot.getScaleY();
+                ScaleTransition up = new ScaleTransition(Duration.millis(150), telemetryHudRoot);
+                telemetryHoverScaleTransition = up;
+                up.setFromX(sx);
+                up.setFromY(sy);
+                up.setToX(1.02);
+                up.setToY(1.02);
+                up.play();
+            });
+            telemetryHudRoot.addEventHandler(MouseEvent.MOUSE_EXITED, e -> {
+                if (telemetryHoverScaleTransition != null) {
+                    telemetryHoverScaleTransition.stop();
+                }
+                double sx = telemetryHudRoot.getScaleX();
+                double sy = telemetryHudRoot.getScaleY();
+                ScaleTransition down = new ScaleTransition(Duration.millis(150), telemetryHudRoot);
+                telemetryHoverScaleTransition = down;
+                down.setFromX(sx);
+                down.setFromY(sy);
+                down.setToX(1.0);
+                down.setToY(1.0);
+                down.setOnFinished(ev2 -> {
+                    if (telemetryHoverScaleTransition == down) {
+                        telemetryHoverScaleTransition = null;
+                    }
+                });
+                down.play();
+            });
+        }
     }
 
     // =========================================================================
@@ -1521,15 +1907,15 @@ public class WhiteboardApp extends Application {
      * re-attached from {@link #onSnapshotReceived} when the user re-enters a room.
      */
     private void unwireCanvasMouseEvents() {
-        if (canvasStackPane == null) {
+        if (canvasContainer == null) {
             return;
         }
-        canvasStackPane.setOnMousePressed(null);
-        canvasStackPane.setOnMouseDragged(null);
-        canvasStackPane.setOnMouseReleased(null);
-        canvasStackPane.setOnMouseMoved(null);
-        canvasStackPane.setOnMouseEntered(null);
-        canvasStackPane.setOnMouseExited(null);
+        canvasContainer.setOnMousePressed(null);
+        canvasContainer.setOnMouseDragged(null);
+        canvasContainer.setOnMouseReleased(null);
+        canvasContainer.setOnMouseMoved(null);
+        canvasContainer.setOnMouseEntered(null);
+        canvasContainer.setOnMouseExited(null);
     }
 
     private void wireMouseEvents(StackPane target) {
@@ -1543,13 +1929,20 @@ public class WhiteboardApp extends Application {
                 return;
             }
 
+            if (activeTool == Tool.ERASER) {
+                erasedInGesture.clear();
+                isDragging = true;
+                performEraserAt(e.getX(), e.getY());
+                return;
+            }
+
             dragStartX   = e.getX();
             dragStartY   = e.getY();
             dragCurrentX = e.getX();
             dragCurrentY = e.getY();
             isDragging   = true;
 
-            if (activeTool == Tool.FREEHAND || activeTool == Tool.ERASER) {
+            if (activeTool == Tool.FREEHAND) {
                 freehandPoints.clear();
                 freehandPoints.add(new double[]{e.getX(), e.getY()});
                 lastFreehandX = e.getX();
@@ -1559,16 +1952,13 @@ public class WhiteboardApp extends Application {
             // Assign a fresh shape identity for this gesture and broadcast SHAPE_START.
             activeShapeId = UUID.randomUUID();
             if (networkClient != null) {
-                String toolName    = activeTool.name();
-                String color       = toHexString(colorPicker.getValue());
-                double strokeWidth = strokeSlider.getValue();
-                if (activeTool == Tool.ERASER) {
-                    color       = "#FFFFFF";
-                    strokeWidth = strokeSlider.getValue() * 3.0;
-                }
                 try {
-                    networkClient.sendShapeStart(activeShapeId, toolName, color, strokeWidth,
-                                                 e.getX(), e.getY());
+                    networkClient.sendShapeStart(
+                            activeShapeId,
+                            activeTool.name(),
+                            globalCanvasContext.activeColorHex(),
+                            globalCanvasContext.getActiveStrokeWidth(),
+                            e.getX(), e.getY());
                 } catch (Exception ex) {
                     log.warn("sendShapeStart failed: {}", ex.getMessage());
                 }
@@ -1580,13 +1970,12 @@ public class WhiteboardApp extends Application {
             dragCurrentY = e.getY();
 
             switch (activeTool) {
-                case LINE, CIRCLE -> {
-                    // Clear and redraw the rubber-band preview on every drag tick
+                case LINE, CIRCLE, RECTANGLE, ELLIPSE, ARROW -> {
                     transientGc.clearRect(0, 0,
                             transientCanvas.getWidth(), transientCanvas.getHeight());
-                    drawRubberBandPreview();
+                    drawRubberBandPreview(isShiftHeld(e));
                 }
-                case FREEHAND, ERASER -> {
+                case FREEHAND -> {
                     double dx = e.getX() - lastFreehandX;
                     double dy = e.getY() - lastFreehandY;
                     if (Math.sqrt(dx * dx + dy * dy) >= MIN_FREEHAND_STEP) {
@@ -1597,11 +1986,13 @@ public class WhiteboardApp extends Application {
                         lastFreehandY = e.getY();
                     }
                 }
+                case ERASER -> performEraserAt(e.getX(), e.getY());
             }
 
             // Throttled SHAPE_UPDATE: send at most once every 40 ms to keep bandwidth low.
             long now = System.currentTimeMillis();
-            if (networkClient != null && activeShapeId != null && now - lastSendTime > 40) {
+            if (activeTool != Tool.ERASER
+                    && networkClient != null && activeShapeId != null && now - lastSendTime > 40) {
                 lastSendTime = now;
                 try {
                     networkClient.sendShapeUpdate(activeShapeId, e.getX(), e.getY());
@@ -1611,12 +2002,16 @@ public class WhiteboardApp extends Application {
             }
 
             notifyUdpMove(e.getX(), e.getY());
-            updateEraserCursorPosition(e.getX(), e.getY());
         });
 
         target.setOnMouseReleased(e -> {
             if (!isDragging) return;
             isDragging = false;
+
+            if (activeTool == Tool.ERASER) {
+                erasedInGesture.clear();
+                return;
+            }
 
             // Always clear the local transient layer before committing.
             transientGc.clearRect(0, 0,
@@ -1631,12 +2026,11 @@ public class WhiteboardApp extends Application {
                 }
             }
 
-            commitShape(e.getX(), e.getY());
+            commitShape(e.getX(), e.getY(), isShiftHeld(e));
         });
 
         target.setOnMouseMoved(e -> {
             notifyUdpMove(e.getX(), e.getY());
-            updateEraserCursorPosition(e.getX(), e.getY());
             // Hover-ownership: find topmost shape under the cursor and show
             // a tooltip attributing it to its author.
             if (!isDragging) {
@@ -1650,43 +2044,52 @@ public class WhiteboardApp extends Application {
             }
         });
 
-        target.setOnMouseEntered(e -> {
-            if (activeTool == Tool.ERASER && eraserCursor != null) {
-                eraserCursor.setVisible(true);
-            }
-        });
-
-        target.setOnMouseExited(e -> {
-            ownerTooltip.hide();
-            if (eraserCursor != null) eraserCursor.setVisible(false);
-        });
+        target.setOnMouseExited(e -> ownerTooltip.hide());
     }
 
     // ── Transient-canvas drawing ──────────────────────────────────────────────
 
-    /** Draws a dashed rubber-band ghost of the current LINE or CIRCLE drag. */
-    private void drawRubberBandPreview() {
-        double dx    = dragCurrentX - dragStartX;
-        double dy    = dragCurrentY - dragStartY;
-        double width = strokeSlider.getValue();
-        Color  color = colorPicker.getValue();
+    /** Draws a dashed rubber-band ghost for vector drag tools. */
+    private void drawRubberBandPreview(boolean shiftHeld) {
+        double stroke = globalCanvasContext.getActiveStrokeWidth();
+        Color  color  = globalCanvasContext.getActiveColor();
 
         transientGc.save();
         transientGc.setGlobalAlpha(0.60);
         transientGc.setStroke(color);
-        transientGc.setLineWidth(width);
+        transientGc.setLineWidth(stroke);
         transientGc.setLineDashes(7, 5);
 
         switch (activeTool) {
             case LINE ->
                 transientGc.strokeLine(dragStartX, dragStartY, dragCurrentX, dragCurrentY);
             case CIRCLE -> {
-                double r  = Math.sqrt(dx * dx + dy * dy);
-                double ox = dragStartX - r;
-                double oy = dragStartY - r;
-                transientGc.strokeOval(ox, oy, r * 2, r * 2);
+                double dx = dragCurrentX - dragStartX;
+                double dy = dragCurrentY - dragStartY;
+                if (shiftHeld) {
+                    double[] d = ShapeMathUtils.constrainAxisDelta(dx, dy, true);
+                    dx = d[0];
+                    dy = d[1];
+                }
+                double r = Math.sqrt(dx * dx + dy * dy);
+                transientGc.strokeOval(dragStartX - r, dragStartY - r, r * 2, r * 2);
             }
-            default -> { /* not used for other tools */ }
+            case RECTANGLE -> {
+                ShapeMathUtils.NormalizedRect rect = ShapeMathUtils.rectangleFromDrag(
+                        dragStartX, dragStartY, dragCurrentX, dragCurrentY, shiftHeld);
+                transientGc.strokeRect(rect.x(), rect.y(), rect.width(), rect.height());
+            }
+            case ELLIPSE -> {
+                ShapeMathUtils.NormalizedRect bounds = ShapeMathUtils.ellipseFromDrag(
+                        dragStartX, dragStartY, dragCurrentX, dragCurrentY, shiftHeld);
+                transientGc.strokeOval(bounds.x(), bounds.y(), bounds.width(), bounds.height());
+            }
+            case ARROW -> {
+                ShapeMathUtils.LineSegment seg = ShapeMathUtils.arrowFromDrag(
+                        dragStartX, dragStartY, dragCurrentX, dragCurrentY, shiftHeld);
+                strokeArrow(transientGc, seg.x1(), seg.y1(), seg.x2(), seg.y2(), stroke, color);
+            }
+            default -> { /* not used */ }
         }
 
         transientGc.restore();
@@ -1696,15 +2099,9 @@ public class WhiteboardApp extends Application {
     private void drawFreehandSegment(double x1, double y1, double x2, double y2) {
         transientGc.save();
 
-        if (activeTool == Tool.ERASER) {
-            transientGc.setStroke(Color.WHITE);
-            transientGc.setLineWidth(strokeSlider.getValue() * 3.0);
-            transientGc.setLineCap(StrokeLineCap.SQUARE);
-        } else {
-            transientGc.setStroke(colorPicker.getValue());
-            transientGc.setLineWidth(strokeSlider.getValue());
-            transientGc.setLineCap(StrokeLineCap.ROUND);
-        }
+        transientGc.setStroke(globalCanvasContext.getActiveColor());
+        transientGc.setLineWidth(globalCanvasContext.getActiveStrokeWidth());
+        transientGc.setLineCap(StrokeLineCap.ROUND);
 
         transientGc.setLineDashes((double[]) null);
         transientGc.setLineJoin(StrokeLineJoin.ROUND);
@@ -1780,24 +2177,20 @@ public class WhiteboardApp extends Application {
         Region stripe = new Region();
         stripe.setPrefWidth(3);
         stripe.setPrefHeight(16);
-        stripe.setStyle("-fx-background-color: " + hex + "; -fx-background-radius: 2 0 0 2;");
+        stripe.getStyleClass().add("ghost-author-stripe");
+        stripe.setBackground(new Background(new BackgroundFill(accent, new CornerRadii(2, 0, 0, 2, false), Insets.EMPTY)));
 
         // Author name pill
         Label nameTag = new Label(authorName.isBlank() ? "typing…" : authorName);
-        nameTag.setStyle(
-            "-fx-text-fill: white; -fx-font-size: 10px; -fx-font-weight: bold;" +
-            "-fx-padding: 1 5 1 4; -fx-background-color: rgba(8,8,20,0.82);" +
-            "-fx-background-radius: 0 3 3 0;");
+        nameTag.getStyleClass().add("ghost-author-tag");
 
         HBox badge = new HBox(0, stripe, nameTag);
         badge.setAlignment(Pos.CENTER_LEFT);
 
         // Live-text preview: shows the in-progress content with a thin block cursor
         Label textPreview = new Label("\u258f");   // initial cursor glyph
-        textPreview.setStyle(
-            "-fx-text-fill: " + hex + "; -fx-font-size: 14px;" +
-            "-fx-padding: 2 6 2 4; -fx-background-color: rgba(8,8,20,0.60);" +
-            "-fx-background-radius: 0 3 3 3;");
+        textPreview.getStyleClass().add("ghost-text-preview");
+        textPreview.setTextFill(accent);
 
         VBox box = new VBox(0, badge, textPreview);
         box.setMouseTransparent(true);
@@ -1810,55 +2203,87 @@ public class WhiteboardApp extends Application {
      * Builds the final {@link Shape}(s) from the completed drag gesture,
      * stores them locally, and enqueues them for network broadcast.
      */
-    private void commitShape(double endX, double endY) {
-        String color       = toHexString(colorPicker.getValue());
-        double strokeWidth = strokeSlider.getValue();
-
+    private void commitShape(double endX, double endY, boolean shiftHeld) {
         switch (activeTool) {
             case LINE -> {
                 double dx = endX - dragStartX;
                 double dy = endY - dragStartY;
                 if (Math.sqrt(dx * dx + dy * dy) < MIN_DRAG_DIST) return;
-                addAndSend(Line.create(color, dragStartX, dragStartY, endX, endY, strokeWidth,
-                                       authorName, clientId));
+                addAndSend(shapeFactory.line(dragStartX, dragStartY, endX, endY, authorName, clientId));
             }
             case CIRCLE -> {
-                double dx = endX - dragStartX;
-                double dy = endY - dragStartY;
-                double r  = Math.sqrt(dx * dx + dy * dy);
+                double[] d = ShapeMathUtils.constrainAxisDelta(endX - dragStartX, endY - dragStartY, shiftHeld);
+                double r = Math.sqrt(d[0] * d[0] + d[1] * d[1]);
                 if (r < MIN_DRAG_DIST) return;
-                addAndSend(Circle.create(color, dragStartX, dragStartY, Math.max(1.0, r),
-                                         authorName, clientId));
+                addAndSend(shapeFactory.circle(dragStartX, dragStartY, Math.max(1.0, r),
+                        authorName, clientId));
+            }
+            case RECTANGLE -> {
+                ShapeMathUtils.NormalizedRect rect = ShapeMathUtils.rectangleFromDrag(
+                        dragStartX, dragStartY, endX, endY, shiftHeld);
+                if (rect.width() < MIN_DRAG_DIST || rect.height() < MIN_DRAG_DIST) return;
+                addAndSend(shapeFactory.rectangle(
+                        rect.x(), rect.y(), rect.width(), rect.height(), authorName, clientId));
+            }
+            case ELLIPSE -> {
+                ShapeMathUtils.NormalizedRect bounds = ShapeMathUtils.ellipseFromDrag(
+                        dragStartX, dragStartY, endX, endY, shiftHeld);
+                if (bounds.width() < MIN_DRAG_DIST || bounds.height() < MIN_DRAG_DIST) return;
+                addAndSend(shapeFactory.ellipse(
+                        bounds.x(), bounds.y(), bounds.width(), bounds.height(), authorName, clientId));
+            }
+            case ARROW -> {
+                ShapeMathUtils.LineSegment seg = ShapeMathUtils.arrowFromDrag(
+                        dragStartX, dragStartY, endX, endY, shiftHeld);
+                if (segmentLength(seg) < MIN_DRAG_DIST) return;
+                addAndSend(shapeFactory.arrow(seg.x1(), seg.y1(), seg.x2(), seg.y2(), authorName, clientId));
             }
             case FREEHAND -> {
                 if (freehandPoints.size() < 2) return;
                 for (int i = 1; i < freehandPoints.size(); i++) {
                     double[] p0 = freehandPoints.get(i - 1);
                     double[] p1 = freehandPoints.get(i);
-                    addAndSend(Line.create(color, p0[0], p0[1], p1[0], p1[1], strokeWidth,
-                                           authorName, clientId));
+                    addAndSend(shapeFactory.line(p0[0], p0[1], p1[0], p1[1], authorName, clientId));
                 }
                 freehandPoints.clear();
             }
-            case ERASER -> {
-                if (freehandPoints.size() < 2) return;
-                double eraserWidth = strokeSlider.getValue() * 3.0;
-                int n = freehandPoints.size();
-                double[] xs = new double[n];
-                double[] ys = new double[n];
-                for (int i = 0; i < n; i++) {
-                    xs[i] = freehandPoints.get(i)[0];
-                    ys[i] = freehandPoints.get(i)[1];
-                }
-                addAndSend(EraserPath.create(xs, ys, eraserWidth, authorName, clientId));
-                freehandPoints.clear();
-            }
+            case ERASER -> { /* object eraser — deletions handled in performEraserAt */ }
         }
+    }
+
+    /**
+     * Eraser pass: spatial hit-test against committed shapes; queue and apply
+     * {@code SHAPE_DELETE} (via {@link NetworkClient#sendUndoRequest(UUID)}).
+     */
+    private void performEraserAt(double x, double y) {
+        if (eraserIntersection == null) {
+            return;
+        }
+        double eraserSize = globalCanvasContext.getActiveStrokeWidth();
+        EraserType eraserType = globalCanvasContext.getActiveEraserType();
+        eraserIntersection.eraseAt(x, y, eraserSize, eraserType).ifPresent(shapeId -> {
+            if (!erasedInGesture.add(shapeId)) {
+                return;
+            }
+            shapes.remove(shapeId);
+            undoHistory.remove(shapeId);
+            if (networkClient != null) {
+                try {
+                    networkClient.sendUndoRequest(shapeId);
+                } catch (Exception ex) {
+                    log.warn("sendUndoRequest (eraser) failed: {}", ex.getMessage());
+                }
+            }
+            redrawBaseCanvas(shapes.values());
+        });
     }
 
     private void addAndSend(Shape shape) {
         shapes.put(shape.objectId(), shape);
         undoHistory.addLast(shape.objectId());
+        // Server excludes the sender from MUTATION broadcast; repaint locally immediately
+        // (replaces the removed AnimationTimer render loop).
+        redrawBaseCanvas(shapes.values());
         if (networkClient != null) {
             try {
                 networkClient.sendMutation(shape);
@@ -1942,7 +2367,7 @@ public class WhiteboardApp extends Application {
         activeTextId = UUID.randomUUID();
         final UUID textId = activeTextId;
 
-        String hexColor = toHexString(colorPicker.getValue());
+        String hexColor = globalCanvasContext.activeColorHex();
         int    fontSize = TextNode.create(hexColor, 0, 0, "x").fontSize(); // canonical size (14)
         // Canvas baseline: fillText() renders from the bottom of the glyph, so
         // we offset by fontSize to align the top of the text with the click point.
@@ -1952,16 +2377,13 @@ public class WhiteboardApp extends Application {
         textField.setLayoutX(x);
         textField.setLayoutY(y);
         textField.setPrefWidth(220);
-        textField.setStyle(
-            "-fx-background-color: rgba(30,30,46,0.55);" +
-            "-fx-text-fill: "      + hexColor + ";" +
-            "-fx-border-color: "   + hexColor + ";" +
-            "-fx-border-width: 0 0 2 0;" +
-            "-fx-border-radius: 0;" +
-            "-fx-background-radius: 0;" +
-            "-fx-font-size: "      + fontSize + "px;" +
-            "-fx-padding: 2 4 2 4;"
-        );
+        textField.getStyleClass().add("canvas-text-input");
+        textField.setBackground(new Background(
+                new BackgroundFill(Color.rgb(30, 30, 46, 0.55), CornerRadii.EMPTY, Insets.EMPTY)));
+        textField.setBorder(new Border(new BorderStroke(
+                Paint.valueOf(hexColor), BorderStrokeStyle.SOLID, CornerRadii.EMPTY, new BorderWidths(0, 0, 2, 0))));
+        textField.setFont(Font.font("System", fontSize));
+        textField.setPadding(new Insets(2, 4, 2, 4));
 
         controlPane.getChildren().add(textField);
         controlPane.setMouseTransparent(false);
@@ -1989,11 +2411,7 @@ public class WhiteboardApp extends Application {
                     if (!text.isEmpty()) {
                         // fillText() baseline is at y; offset by fontSize so the
                         // rendered text aligns with the top of the TextField.
-                        TextNode node = TextNode.create(
-                            toHexString(colorPicker.getValue()),
-                            x, textBase,
-                            text, authorName, clientId
-                        );
+                        TextNode node = shapeFactory.text(x, textBase, text, authorName, clientId);
                         addAndSend(node);
                     }
                     // Signal remote peers to dismiss the ghost overlay for this session.
@@ -2055,8 +2473,8 @@ public class WhiteboardApp extends Application {
 
         networkClient = new NetworkClient(host, port, authorName, clientId);
         wireTelemetryHud(networkClient);
-        networkClient.getAudioEngine().setUserSpeakingListener(speakerId ->
-                Platform.runLater(() -> onRemoteUserSpeaking(speakerId)));
+        wireMicToggleHud(networkClient.getAudioEngine());
+        wireParticipantHud(networkClient.getParticipantManager());
         networkClient.addLobbyListener(rooms ->
                 Platform.runLater(() -> refreshLobbyRooms(rooms)));
         networkClient.addRoomDeletedListener(() ->
@@ -2069,8 +2487,8 @@ public class WhiteboardApp extends Application {
             public void onSnapshotReceived(List<Shape> incoming) {
                 Platform.runLater(() -> {
                     cancelLobbyJoinWatchdog();
-                    if (canvasStackPane != null) {
-                        wireMouseEvents(canvasStackPane);
+                    if (canvasContainer != null) {
+                        wireMouseEvents(canvasContainer);
                     }
                     List<Shape> list = incoming != null ? incoming : List.of();
                     roomId = networkClient != null ? networkClient.getActiveRoomId() : "";
@@ -2083,9 +2501,10 @@ public class WhiteboardApp extends Application {
                         primaryStage.setTitle("DistriSync – " + authorName + "  [" + roomId + "]");
                         controlPane.toFront();
                         setStatus("⬤ Connected", GREEN);
+                        Platform.runLater(WhiteboardApp.this::updateToolsDrawerClipAndHostWidth);
                     }
 
-                    if (canvasStackPane == null) {
+                    if (canvasContainer == null) {
                         shapes.clear();
                         for (Shape s : list) {
                             if (s != null) {
@@ -2103,7 +2522,7 @@ public class WhiteboardApp extends Application {
 
                     stopSnapshotHydrationAndResetOpacity();
                     final long hydrationToken = ++snapshotHydrationToken;
-                    FadeTransition fadeOut = new FadeTransition(Duration.millis(150), canvasStackPane);
+                    FadeTransition fadeOut = new FadeTransition(Duration.millis(150), canvasContainer);
                     fadeOut.setFromValue(1.0);
                     fadeOut.setToValue(0.0);
                     fadeOut.setOnFinished(ev -> {
@@ -2122,7 +2541,7 @@ public class WhiteboardApp extends Application {
                             log.error("redrawBaseCanvas after SNAPSHOT failed", ex);
                         }
                         log.info("Snapshot applied — {} shape(s) on canvas", shapes.size());
-                        FadeTransition fadeIn = new FadeTransition(Duration.millis(150), canvasStackPane);
+                        FadeTransition fadeIn = new FadeTransition(Duration.millis(150), canvasContainer);
                         fadeIn.setFromValue(0.0);
                         fadeIn.setToValue(1.0);
                         fadeIn.setOnFinished(e2 -> {
@@ -2254,21 +2673,11 @@ public class WhiteboardApp extends Application {
         Thread connectThread = new Thread(() -> {
             try {
                 networkClient.connect();
-                Platform.runLater(() -> {
-                    if (lobbyStatusLabel != null) {
-                        lobbyStatusLabel.setText("Connected to " + host + ":" + port);
-                        lobbyStatusLabel.getStyleClass().clear();
-                        lobbyStatusLabel.getStyleClass().add("lobby-status-connected");
-                    }
-                });
+                Platform.runLater(() -> setLobbyStickyStatus("Connected to " + host + ":" + port, "lobby-status-connected"));
             } catch (IOException e) {
                 log.warn("Could not reach server at {}:{} — offline mode active", host, port);
                 Platform.runLater(() -> {
-                    if (lobbyStatusLabel != null) {
-                        lobbyStatusLabel.setText("Offline — start the server or check host/port");
-                        lobbyStatusLabel.getStyleClass().clear();
-                        lobbyStatusLabel.getStyleClass().add("lobby-status-disconnected");
-                    }
+                    setLobbyStickyStatus("Offline — start the server or check host/port", "lobby-status-disconnected");
                     setStatus("⬤ Offline", RED);
                 });
             }
@@ -2284,7 +2693,7 @@ public class WhiteboardApp extends Application {
 
     private void setStatus(String text, String colorHex) {
         statusLabel.setText(text);
-        statusLabel.setStyle("-fx-text-fill: " + colorHex + "; -fx-font-size: 12px;");
+        statusLabel.setTextFill(Color.web(colorHex));
     }
 
     private void wireTelemetryHud(NetworkClient client) {
@@ -2324,17 +2733,16 @@ public class WhiteboardApp extends Application {
                         client.pingProperty()));
     }
 
-    // =========================================================================
-    // Render loop  (baseCanvas only — transient and cursor layers are event-driven)
-    // =========================================================================
+    private boolean isViewportDrawable() {
+        return CanvasViewportResizeHandler.isViewportDrawable(canvasContainer);
+    }
 
-    private void startRenderLoop() {
-        new AnimationTimer() {
-            @Override
-            public void handle(long now) {
-                renderBase();
-            }
-        }.start();
+    /** At least 1px so {@link javafx.scene.canvas.Canvas} never enters Prism with a null RTTexture. */
+    private static javafx.beans.value.ObservableDoubleValue canvasDimensionBinding(
+            javafx.beans.value.ObservableNumberValue source) {
+        return Bindings.createDoubleBinding(
+                () -> Math.max(source.doubleValue(), 1.0),
+                source);
     }
 
     /**
@@ -2346,12 +2754,14 @@ public class WhiteboardApp extends Application {
      * {@link Platform#runLater} from any background callback — e.g. inside
      * {@code onSnapshotReceived}, {@code onMutationReceived},
      * {@code onShapeDeleted}, and {@code onUserShapesCleared} — to guarantee the
-     * canvas reflects the latest committed state immediately rather than
-     * waiting for the next {@link AnimationTimer} tick.
+     * canvas reflects the latest committed state immediately.
      *
      * @param shapesToDraw the committed shapes to render; must not be {@code null}
      */
     private void redrawBaseCanvas(Collection<Shape> shapesToDraw) {
+        if (canvasContainer == null || canvasContainer.getScene() == null || !isViewportDrawable()) {
+            return;
+        }
         double w = baseCanvas.getWidth();
         double h = baseCanvas.getHeight();
 
@@ -2364,14 +2774,6 @@ public class WhiteboardApp extends Application {
     }
 
     /**
-     * Animation-timer entry point — delegates to {@link #redrawBaseCanvas}
-     * so the canvas is refreshed every frame even when no network event fired.
-     */
-    private void renderBase() {
-        redrawBaseCanvas(shapes.values());
-    }
-
-    /**
      * Clears and redraws {@code remoteTransientCanvas} with all currently
      * tracked in-progress shapes from remote peers.  Must be called on the
      * FX Application Thread.
@@ -2380,6 +2782,9 @@ public class WhiteboardApp extends Application {
      * so clearing it never disturbs the local rubber-band / freehand preview.
      */
     private void renderTransient() {
+        if (canvasContainer == null || canvasContainer.getScene() == null || !isViewportDrawable()) {
+            return;
+        }
         double w = remoteTransientCanvas.getWidth();
         double h = remoteTransientCanvas.getHeight();
         remoteTransientGc.clearRect(0, 0, w, h);
@@ -2405,6 +2810,28 @@ public class WhiteboardApp extends Application {
                     remoteTransientGc.setStroke(parseColor(entry.color));
                     remoteTransientGc.setLineWidth(entry.strokeWidth);
                     remoteTransientGc.strokeOval(entry.startX - r, entry.startY - r, r * 2, r * 2);
+                }
+                case "RECTANGLE" -> {
+                    ShapeMathUtils.NormalizedRect rect = ShapeMathUtils.rectangleFromDrag(
+                            entry.startX, entry.startY, entry.lastX, entry.lastY, false);
+                    remoteTransientGc.setStroke(parseColor(entry.color));
+                    remoteTransientGc.setLineWidth(entry.strokeWidth);
+                    remoteTransientGc.strokeRect(rect.x(), rect.y(), rect.width(), rect.height());
+                }
+                case "ELLIPSE" -> {
+                    ShapeMathUtils.NormalizedRect bounds = ShapeMathUtils.ellipseFromDrag(
+                            entry.startX, entry.startY, entry.lastX, entry.lastY, false);
+                    remoteTransientGc.setStroke(parseColor(entry.color));
+                    remoteTransientGc.setLineWidth(entry.strokeWidth);
+                    remoteTransientGc.strokeOval(bounds.x(), bounds.y(), bounds.width(), bounds.height());
+                }
+                case "ARROW" -> {
+                    ShapeMathUtils.LineSegment seg = ShapeMathUtils.arrowFromDrag(
+                            entry.startX, entry.startY, entry.lastX, entry.lastY, false);
+                    remoteTransientGc.setStroke(parseColor(entry.color));
+                    remoteTransientGc.setLineWidth(entry.strokeWidth);
+                    strokeArrow(remoteTransientGc, seg.x1(), seg.y1(), seg.x2(), seg.y2(),
+                            entry.strokeWidth, parseColor(entry.color));
                 }
                 case "FREEHAND" -> {
                     remoteTransientGc.setStroke(parseColor(entry.color));
@@ -2458,6 +2885,40 @@ public class WhiteboardApp extends Application {
         }
     }
 
+    /**
+     * Full repaint after the layered workspace changes size (JavaFX clears bitmap canvases on resize).
+     * Replays committed shapes, remote transient previews, and any in-progress local gesture.
+     */
+    private void redrawAllLayersAfterViewportChange() {
+        if (baseCanvas == null || baseGc == null) {
+            return;
+        }
+        redrawBaseCanvas(shapes.values());
+        renderTransient();
+        redrawLocalTransientAfterViewportResize();
+    }
+
+    /** Rebuilds local rubber-band / freehand ink if a resize occurs mid-gesture. */
+    private void redrawLocalTransientAfterViewportResize() {
+        if (transientCanvas == null || transientGc == null || !isDragging || !isViewportDrawable()) {
+            return;
+        }
+        double w = transientCanvas.getWidth();
+        double h = transientCanvas.getHeight();
+        transientGc.clearRect(0, 0, w, h);
+        switch (activeTool) {
+            case LINE, CIRCLE, RECTANGLE, ELLIPSE, ARROW -> drawRubberBandPreview(shiftKeyHeld);
+            case FREEHAND -> {
+                for (int i = 1; i < freehandPoints.size(); i++) {
+                    double[] p0 = freehandPoints.get(i - 1);
+                    double[] p1 = freehandPoints.get(i);
+                    drawFreehandSegment(p0[0], p0[1], p1[0], p1[1]);
+                }
+            }
+            default -> { /* TEXT uses controlPane */ }
+        }
+    }
+
     // =========================================================================
     // Shape rendering
     // =========================================================================
@@ -2500,6 +2961,20 @@ public class WhiteboardApp extends Application {
                 gc.setFill(parseColor(t.color()));
                 gc.fillText(t.content(), t.x(), t.y());
             }
+            case RectangleNode r -> {
+                gc.setStroke(parseColor(r.color()));
+                gc.setLineWidth(r.strokeWidth());
+                gc.setLineDashes((double[]) null);
+                gc.strokeRect(r.x(), r.y(), r.width(), r.height());
+            }
+            case EllipseNode e -> {
+                gc.setStroke(parseColor(e.color()));
+                gc.setLineWidth(e.strokeWidth());
+                gc.setLineDashes((double[]) null);
+                gc.strokeOval(e.x(), e.y(), e.width(), e.height());
+            }
+            case ArrowNode a ->
+                strokeArrow(gc, a.x1(), a.y1(), a.x2(), a.y2(), a.strokeWidth(), parseColor(a.color()));
             case EraserPath ep -> {
                 // Render as a white stroke with a square brush.
                 // Because redrawBaseCanvas always fills white before painting shapes in
@@ -2536,95 +3011,80 @@ public class WhiteboardApp extends Application {
      * @param y canvas Y coordinate
      */
     private Shape findShapeAt(double x, double y) {
+        if (activeTool == Tool.ERASER) {
+            return shapes.values().stream()
+                    .filter(s -> ShapeSpatialQuery.intersectsEraser(
+                            x, y,
+                            globalCanvasContext.getActiveStrokeWidth(),
+                            globalCanvasContext.getActiveEraserType(),
+                            s))
+                    .max(Comparator.comparingLong(Shape::timestamp))
+                    .orElse(null);
+        }
         return shapes.values().stream()
-                     .filter(s -> hitsShape(x, y, s))
-                     .max(Comparator.comparingLong(Shape::timestamp))
-                     .orElse(null);
-    }
-
-    /**
-     * Returns {@code true} when the point {@code (x, y)} lies within the
-     * interactive hit area of {@code shape}.
-     *
-     * <ul>
-     *   <li><b>Line</b> — within half the stroke width plus a 5 px tolerance
-     *       of the closest point on the segment.</li>
-     *   <li><b>Circle</b> — inside the radius (filled) or within half the
-     *       stroke width of the circumference (hollow).</li>
-     *   <li><b>TextNode</b> — within an approximate bounding rectangle.</li>
-     * </ul>
-     */
-    private boolean hitsShape(double x, double y, Shape s) {
-        final double TOL = 5.0;
-        return switch (s) {
-            case Line l -> {
-                double dx    = l.x2() - l.x1();
-                double dy    = l.y2() - l.y1();
-                double lenSq = dx * dx + dy * dy;
-                if (lenSq == 0) {
-                    yield Math.hypot(x - l.x1(), y - l.y1()) <= l.strokeWidth() / 2 + TOL;
-                }
-                double t    = Math.max(0, Math.min(1,
-                              ((x - l.x1()) * dx + (y - l.y1()) * dy) / lenSq));
-                double projX = l.x1() + t * dx;
-                double projY = l.y1() + t * dy;
-                yield Math.hypot(x - projX, y - projY) <= l.strokeWidth() / 2 + TOL;
-            }
-            case Circle c -> {
-                double dist = Math.hypot(x - c.x(), y - c.y());
-                if (c.filled()) yield dist <= c.radius() + TOL;
-                yield Math.abs(dist - c.radius()) <= c.strokeWidth() / 2 + TOL;
-            }
-            case TextNode t -> {
-                double approxW = t.content().length() * t.fontSize() * 0.6;
-                yield x >= t.x() - TOL
-                   && x <= t.x() + approxW + TOL
-                   && y >= t.y() - t.fontSize() - TOL
-                   && y <= t.y() + TOL;
-            }
-            case EraserPath ep -> false;  // Eraser strokes have no interactive hit area
-        };
+                .filter(s -> ShapeSpatialQuery.intersectsEraser(x, y, 5.0, EraserType.CIRCLE, s))
+                .max(Comparator.comparingLong(Shape::timestamp))
+                .orElse(null);
     }
 
     // =========================================================================
-    // Eraser cursor
+    // Eraser tool cursor
     // =========================================================================
 
-    /**
-     * Creates the MS-Paint-style square eraser cursor node and adds it to
-     * {@code cursorPane}.  The node's size is bound to the stroke slider so it
-     * updates in real time as the user drags the slider.
-     *
-     * <p>Must be called after both {@code cursorPane} and {@code strokeSlider}
-     * are initialised (i.e. after {@link #buildToolDrawer()} and the canvas stack
-     * are set up in {@link #start}).
-     */
-    private void setupEraserCursor() {
-        eraserCursor = new Rectangle();
-        // Width and height track strokeSlider * 3.0, identical to the committed stroke size
-        eraserCursor.widthProperty().bind(strokeSlider.valueProperty().multiply(3.0));
-        eraserCursor.heightProperty().bind(strokeSlider.valueProperty().multiply(3.0));
-        eraserCursor.setFill(Color.TRANSPARENT);
-        eraserCursor.setStroke(Color.BLACK);
-        eraserCursor.setStrokeWidth(1.5);
-        eraserCursor.setMouseTransparent(true);
-        eraserCursor.setVisible(false);
-        cursorPane.getChildren().add(eraserCursor);
+    private void setupEraserTool() {
+        globalCanvasContext.activeStrokeWidthProperty().addListener((obs, oldW, newW) -> {
+            if (activeTool == Tool.ERASER) {
+                applyEraserCursorToCanvas();
+            }
+        });
+        globalCanvasContext.activeEraserTypeProperty().addListener((obs, oldT, newT) -> {
+            if (activeTool == Tool.ERASER) {
+                applyEraserCursorToCanvas();
+                syncEraserTypeToggleButtons();
+            }
+        });
     }
 
-    /**
-     * Moves the eraser cursor square so its centre aligns with the given canvas
-     * coordinates, and makes it visible when the Eraser tool is active.
-     *
-     * @param x canvas X coordinate of the current mouse position
-     * @param y canvas Y coordinate of the current mouse position
-     */
-    private void updateEraserCursorPosition(double x, double y) {
-        if (eraserCursor == null || activeTool != Tool.ERASER) return;
-        eraserCursor.setVisible(true);
-        double half = eraserCursor.getWidth() / 2.0;
-        eraserCursor.setLayoutX(x - half);
-        eraserCursor.setLayoutY(y - half);
+    private void syncEraserTypeToggleButtons() {
+        if (eraserTypeCircleBtn == null || eraserTypeSquareBtn == null) {
+            return;
+        }
+        EraserType type = globalCanvasContext.getActiveEraserType();
+        eraserTypeCircleBtn.setSelected(type == EraserType.CIRCLE);
+        eraserTypeSquareBtn.setSelected(type == EraserType.SQUARE);
+    }
+
+    private void applyEraserCursorToCanvas() {
+        ImageCursor cursor = EraserCursorFactory.createImageCursor(
+                globalCanvasContext.getActiveStrokeWidth(),
+                globalCanvasContext.getActiveEraserType());
+        if (canvasContainer != null) {
+            canvasContainer.setCursor(cursor);
+        }
+        if (baseCanvas != null) {
+            baseCanvas.setCursor(cursor);
+        }
+        if (transientCanvas != null) {
+            transientCanvas.setCursor(cursor);
+        }
+        if (cursorPane != null) {
+            cursorPane.setCursor(cursor);
+        }
+    }
+
+    private void applyDrawingCursor(Cursor cursor) {
+        if (canvasContainer != null) {
+            canvasContainer.setCursor(cursor);
+        }
+        if (baseCanvas != null) {
+            baseCanvas.setCursor(cursor);
+        }
+        if (transientCanvas != null) {
+            transientCanvas.setCursor(cursor);
+        }
+        if (cursorPane != null) {
+            cursorPane.setCursor(cursor);
+        }
     }
 
     // =========================================================================

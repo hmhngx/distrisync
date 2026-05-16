@@ -33,6 +33,7 @@ import java.util.Map;
  * 0x14        DELETE_ROOM       – client→server: JSON object { roomId } — request durable room removal
  * 0x15        ROOM_DELETED      – server→client: empty payload — room was destroyed; clients should return to lobby
  * 0x16        FETCH_LOBBY       – client→server: empty JSON object {} — pull current LOBBY_STATE for this connection only
+ * 0x17        VOICE_STATE       – client→server→peers: JSON object { clientId, isMuted } — hardware mute toggle (not speaking activity)
  * </pre>
  */
 public enum MessageType {
@@ -58,7 +59,8 @@ public enum MessageType {
     PONG             ((byte) 0x13),
     DELETE_ROOM      ((byte) 0x14),
     ROOM_DELETED     ((byte) 0x15),
-    FETCH_LOBBY      ((byte) 0x16);
+    FETCH_LOBBY      ((byte) 0x16),
+    VOICE_STATE      ((byte) 0x17);
 
     private final byte wireCode;
 

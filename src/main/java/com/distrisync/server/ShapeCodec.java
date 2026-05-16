@@ -1,8 +1,11 @@
 package com.distrisync.server;
 
+import com.distrisync.model.ArrowNode;
 import com.distrisync.model.Circle;
+import com.distrisync.model.EllipseNode;
 import com.distrisync.model.EraserPath;
 import com.distrisync.model.Line;
+import com.distrisync.model.RectangleNode;
 import com.distrisync.model.Shape;
 import com.distrisync.model.TextNode;
 import com.google.gson.*;
@@ -123,10 +126,13 @@ final class ShapeCodec {
             throw new IllegalArgumentException("Shape envelope missing '" + TYPE_FIELD + "' field");
         }
         return switch (typeEl.getAsString()) {
-            case "Line"        -> GSON.fromJson(envelope, Line.class);
-            case "Circle"      -> GSON.fromJson(envelope, Circle.class);
-            case "TextNode"    -> GSON.fromJson(envelope, TextNode.class);
-            case "EraserPath"  -> GSON.fromJson(envelope, EraserPath.class);
+            case "Line"          -> GSON.fromJson(envelope, Line.class);
+            case "Circle"        -> GSON.fromJson(envelope, Circle.class);
+            case "TextNode"      -> GSON.fromJson(envelope, TextNode.class);
+            case "EraserPath"    -> GSON.fromJson(envelope, EraserPath.class);
+            case "RectangleNode" -> GSON.fromJson(envelope, RectangleNode.class);
+            case "EllipseNode"   -> GSON.fromJson(envelope, EllipseNode.class);
+            case "ArrowNode"     -> GSON.fromJson(envelope, ArrowNode.class);
             default -> throw new IllegalArgumentException(
                     "Unknown shape type discriminator: " + typeEl.getAsString());
         };
