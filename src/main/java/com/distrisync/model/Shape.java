@@ -7,7 +7,8 @@ import java.util.UUID;
  * concrete variant — critical for pattern-matching switch expressions used by
  * the codec and rendering pipeline.
  */
-public sealed interface Shape permits Line, Circle, TextNode, EraserPath {
+public sealed interface Shape permits
+        Line, Circle, TextNode, EraserPath, RectangleNode, EllipseNode, ArrowNode {
 
     /** Globally-unique stable identity for CRDT merge / dedup. */
     UUID objectId();

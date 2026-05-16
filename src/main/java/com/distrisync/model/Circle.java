@@ -53,6 +53,13 @@ public record Circle(
                           x, y, radius, false, 1.0, authorName, clientId);
     }
 
+    /** Attributed hollow circle with an explicit outline width. */
+    public static Circle create(String color, double x, double y, double radius, double strokeWidth,
+                                String authorName, String clientId) {
+        return new Circle(UUID.randomUUID(), System.currentTimeMillis(), color,
+                          x, y, radius, false, strokeWidth, authorName, clientId);
+    }
+
     /**
      * Convenience factory for a filled circle.
      * Attribution defaults to empty strings (anonymous / legacy).
