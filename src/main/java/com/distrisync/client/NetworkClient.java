@@ -156,6 +156,14 @@ public final class NetworkClient implements AutoCloseable {
     private final CopyOnWriteArrayList<VoiceStateListener> voiceStateListeners =
             new CopyOnWriteArrayList<>();
 
+    private final CopyOnWriteArrayList<CursorSyncListener> cursorSyncListeners =
+            new CopyOnWriteArrayList<>();
+
+    /** Minimum interval between {@link #sendCursorSync} frames (~15 Hz). */
+    private static final long CURSOR_SYNC_MIN_INTERVAL_MS = 66;
+
+    private volatile long lastCursorSendMs;
+
     /** Opaque UDP relay token from the latest {@link MessageType#UDP_ADMISSION}; empty until admitted. */
     private volatile String udpToken = "";
 
@@ -566,6 +574,37 @@ public final class NetworkClient implements AutoCloseable {
         if (listener != null) {
             voiceStateListeners.remove(listener);
         }
+    }
+
+    public void addCursorSyncListener(CursorSyncListener listener) {
+        if (listener != null) {
+            cursorSyncListeners.addIfAbsent(listener);
+        }
+    }
+
+    public void removeCursorSyncListener(CursorSyncListener listener) {
+        if (listener != null) {
+            cursorSyncListeners.remove(listener);
+        }
+    }
+
+    /**
+     * Publishes this client's canvas cursor position to peers ({@link MessageType#CURSOR_SYNC}).
+     * Rate-limited to ~15 Hz. Silently no-ops when not connected.
+     *
+     * @param x canvas X coordinate
+     * @param y canvas Y coordinate
+     */
+    public void sendCursorSync(double x, double y) {
+        if (!running.get()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastCursorSendMs < CURSOR_SYNC_MIN_INTERVAL_MS) {
+            return;
+        }
+        lastCursorSendMs = now;
+        enqueueFrame(MessageCodec.encodeCursorSync(clientId, authorName, x, y));
     }
 
     /**
@@ -1224,6 +1263,16 @@ public final class NetworkClient implements AutoCloseable {
                     }
                 } catch (Exception e) {
                     log.debug("Malformed VOICE_STATE ignored: {}", e.getMessage());
+                }
+            }
+            case CURSOR_SYNC -> {
+                try {
+                    MessageCodec.CursorSyncPayload p = MessageCodec.decodeCursorSync(msg);
+                    for (CursorSyncListener listener : cursorSyncListeners) {
+                        listener.onCursorSync(p.clientId(), p.authorName(), p.x(), p.y());
+                    }
+                } catch (Exception e) {
+                    log.debug("Malformed CURSOR_SYNC ignored: {}", e.getMessage());
                 }
             }
             case FETCH_LOBBY ->

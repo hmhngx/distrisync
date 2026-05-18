@@ -3,9 +3,13 @@ package com.distrisync.server;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.distrisync.server.backplane.RedisBackplanePublisher;
+import com.distrisync.server.backplane.RedisBackplaneSubscriber;
+
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Optional;
 
 /**
  * Entry point for the DistriSync collaborative whiteboard server.
@@ -72,12 +76,34 @@ public final class WhiteboardServer {
 
         RoomManager            roomManager = new RoomManager(walManager);
         StorageLifecycleManager lifecycle  = new StorageLifecycleManager(roomManager, walManager);
-        NioServer               server     = new NioServer(port, roomManager, walManager);
+
+        String originNodeId = ServerEnvironment.resolveNodeId();
+        RedisBackplanePublisher backplanePublisher = null;
+        RedisBackplaneSubscriber backplaneSubscriber = null;
+        Optional<String> redisUri = ServerEnvironment.resolveRedisUri();
+        if (redisUri.isPresent()) {
+            backplanePublisher = RedisBackplanePublisher.connect(originNodeId, redisUri.get());
+            backplaneSubscriber = RedisBackplaneSubscriber.connect(redisUri.get());
+            log.info("Redis backplane enabled  nodeId={} uri='{}'", originNodeId, redisUri.get());
+        } else {
+            log.info("Redis backplane disabled (set REDIS_HOST or DISTRISYNC_REDIS_URI)  nodeId={}", originNodeId);
+        }
+
+        NioServer server = new NioServer(
+                port, roomManager, walManager, backplanePublisher, backplaneSubscriber, originNodeId);
+        RedisBackplanePublisher backplanePublisherRef = backplanePublisher;
+        RedisBackplaneSubscriber backplaneSubscriberRef = backplaneSubscriber;
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("Shutdown hook — stopping server and flushing WAL");
             server.stop();
             lifecycle.shutdown();
+            if (backplaneSubscriberRef != null) {
+                backplaneSubscriberRef.close();
+            }
+            if (backplanePublisherRef != null) {
+                backplanePublisherRef.close();
+            }
             walManager.close();
         }, "shutdown-hook"));
 

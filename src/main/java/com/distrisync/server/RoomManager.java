@@ -69,6 +69,12 @@ public final class RoomManager {
      */
     private volatile Consumer<ClientSession> sessionEvictionHook;
     private volatile BiConsumer<ClientSession, SelectionKey> flushAfterRoomDeletedHook;
+    private volatile OutboundFrameHook outboundFrameHook;
+
+    /**
+     * Invoked when a room is first created (e.g. to {@code SUBSCRIBE} a Redis backplane channel).
+     */
+    private volatile Consumer<String> roomCreatedHook;
 
     /** Creates a room manager with no WAL persistence (rooms are ephemeral). */
     public RoomManager() {
@@ -95,6 +101,13 @@ public final class RoomManager {
     }
 
     /**
+     * Installs a callback invoked once when a room is first created via {@link #getOrCreateRoom}.
+     */
+    public void setRoomCreatedHook(Consumer<String> hook) {
+        this.roomCreatedHook = hook;
+    }
+
+    /**
      * Installs optional per-session hooks used during {@link #deleteRoom(String, WalManager)}.
      * Either argument may be {@code null} (e.g. in unit tests that only assert queue contents).
      *
@@ -106,6 +119,14 @@ public final class RoomManager {
             BiConsumer<ClientSession, SelectionKey> flushAfterRoomDeletedHook) {
         this.sessionEvictionHook = sessionEvictionHook;
         this.flushAfterRoomDeletedHook = flushAfterRoomDeletedHook;
+    }
+
+    /**
+     * Installs bounded outbound enqueue used during {@link #deleteRoom(String, WalManager)}.
+     * Typically wired to {@link NioServer}'s {@code safeEnqueue} on the selector thread.
+     */
+    public void setOutboundFrameHook(OutboundFrameHook hook) {
+        this.outboundFrameHook = hook;
     }
 
     /**
@@ -131,7 +152,12 @@ public final class RoomManager {
                 }
                 Object att = key.attachment();
                 if (att instanceof ClientSession session) {
-                    session.enqueue(roomDeletedFrame);
+                    OutboundFrameHook outbound = outboundFrameHook;
+                    if (outbound != null) {
+                        outbound.accept(session, roomDeletedFrame, key);
+                    } else {
+                        session.enqueue(roomDeletedFrame, OutboundClass.CRITICAL);
+                    }
                     Consumer<ClientSession> evict = sessionEvictionHook;
                     if (evict != null) {
                         evict.accept(session);
@@ -244,7 +270,12 @@ public final class RoomManager {
         }
         return rooms.computeIfAbsent(roomId, id -> {
             log.debug("Creating room  roomId='{}'", id);
-            return new RoomContext(id, walManager);
+            RoomContext ctx = new RoomContext(id, walManager);
+            Consumer<String> hook = roomCreatedHook;
+            if (hook != null) {
+                hook.accept(id);
+            }
+            return ctx;
         });
     }
 

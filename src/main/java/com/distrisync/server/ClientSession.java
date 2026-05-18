@@ -1,5 +1,8 @@
 package com.distrisync.server;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
@@ -16,12 +19,18 @@ import java.util.UUID;
  * partial tail for the next read.
  *
  * <h2>Write queue</h2>
- * An {@link ArrayDeque} of outbound {@link ByteBuffer}s. Each enqueued buffer
- * is a self-contained copy with its own position so that partial writes are
- * correctly resumed on the next {@code OP_WRITE} wake-up. When the queue is
- * empty the corresponding {@code OP_WRITE} interest bit is cleared from the key.
+ * A bounded {@link ArrayDeque} of outbound {@link ByteBuffer}s (max
+ * {@link #WRITE_QUEUE_CAPACITY} frames). Each enqueued buffer is a self-contained
+ * copy with its own position so that partial writes are correctly resumed on the
+ * next {@code OP_WRITE} wake-up. When the queue is empty the corresponding
+ * {@code OP_WRITE} interest bit is cleared from the key.
  */
 final class ClientSession {
+
+    private static final Logger log = LoggerFactory.getLogger(ClientSession.class);
+
+    /** Maximum outbound frames queued per TCP session before load shedding. */
+    static final int WRITE_QUEUE_CAPACITY = 1024;
 
     /** Stable server-assigned identity used in logs. */
     final UUID sessionId = UUID.randomUUID();
@@ -80,7 +89,7 @@ final class ClientSession {
      * Buffers are stored in write-ready state (position = next byte to send,
      * limit = end of data).
      */
-    final Deque<ByteBuffer> writeQueue = new ArrayDeque<>();
+    final Deque<ByteBuffer> writeQueue = new ArrayDeque<>(WRITE_QUEUE_CAPACITY);
 
     /**
      * Enqueues a frame for delivery to this client.
@@ -89,16 +98,29 @@ final class ClientSession {
      * limit at end of data). A fresh copy is made so the caller's buffer is
      * not consumed and can safely be passed to multiple sessions.
      *
-     * @param data the frame to enqueue; its bytes are copied into a new buffer
+     * @param frame the frame to enqueue; its bytes are copied into a new buffer
+     * @param cls   shedding policy when the queue is at capacity
+     * @return {@link EnqueueResult#ENQUEUED}, {@link EnqueueResult#DROPPED}, or
+     *         {@link EnqueueResult#OVERFLOW_DISCONNECT}
      */
-    void enqueue(ByteBuffer data) {
+    EnqueueResult enqueue(ByteBuffer frame, OutboundClass cls) {
+        if (writeQueue.size() >= WRITE_QUEUE_CAPACITY) {
+            if (cls == OutboundClass.EPHEMERAL) {
+                ServerMetrics.FRAMES_DROPPED_TOTAL.incrementAndGet();
+                log.trace("Dropping ephemeral outbound frame session={} queueDepth={}",
+                        sessionId, writeQueue.size());
+                return EnqueueResult.DROPPED;
+            }
+            return EnqueueResult.OVERFLOW_DISCONNECT;
+        }
         // duplicate() creates an independent view with its own position/limit so
         // that advancing the copy's position does not consume the caller's buffer.
         // This lets broadcastExcept() safely pass the same frame to N sessions.
-        ByteBuffer copy = ByteBuffer.allocate(data.remaining());
-        copy.put(data.duplicate());
+        ByteBuffer copy = ByteBuffer.allocate(frame.remaining());
+        copy.put(frame.duplicate());
         copy.flip();
         writeQueue.addLast(copy);
+        return EnqueueResult.ENQUEUED;
     }
 
     @Override

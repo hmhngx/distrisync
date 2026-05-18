@@ -480,6 +480,19 @@ class MessageCodecTest {
     }
 
     @Test
+    void cursorSync_roundTrip() {
+        ByteBuffer frame = MessageCodec.encodeCursorSync("peer-1", "Alice", 12.5, 99.0);
+        Message decoded = MessageCodec.decode(frame);
+
+        assertThat(decoded.type()).isEqualTo(MessageType.CURSOR_SYNC);
+        MessageCodec.CursorSyncPayload p = MessageCodec.decodeCursorSync(decoded);
+        assertThat(p.clientId()).isEqualTo("peer-1");
+        assertThat(p.authorName()).isEqualTo("Alice");
+        assertThat(p.x()).isEqualTo(12.5);
+        assertThat(p.y()).isEqualTo(99.0);
+    }
+
+    @Test
     void testBufferUnderflow_IncompletePayload() {
         final int declaredPayloadLength = 100;
         final int availablePayloadBytes = 50;
