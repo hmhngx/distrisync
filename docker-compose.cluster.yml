@@ -1,0 +1,52 @@
+services:
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  node-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      NODE_ID: node-a
+    ports:
+      - "9090:9090/tcp"
+      - "9090:9090/udp"
+    volumes:
+      - distrisync-data-a:/app/distrisync-data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  node-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      NODE_ID: node-b
+    ports:
+      - "9091:9090/tcp"
+      - "9091:9090/udp"
+    volumes:
+      - distrisync-data-b:/app/distrisync-data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  distrisync-data-a:
+  distrisync-data-b:
