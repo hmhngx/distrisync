@@ -1,6 +1,10 @@
 package com.distrisync.server;
 
 import com.distrisync.model.Shape;
+import com.distrisync.server.backplane.BackplaneEnvelope;
+import com.distrisync.server.backplane.BackplaneEventDedup;
+import com.distrisync.server.backplane.RedisBackplanePublisher;
+import com.distrisync.server.backplane.RedisBackplaneSubscriber;
 import com.distrisync.protocol.Message;
 import com.distrisync.protocol.MessageCodec;
 import com.distrisync.protocol.MessageType;
@@ -10,7 +14,11 @@ import com.google.gson.JsonParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.StandardSocketOptions;
@@ -99,6 +107,31 @@ public final class NioServer implements Runnable {
     private final WalManager walManager;
 
     /**
+     * Optional Redis Pub/Sub backplane for cross-node mutation fanout; {@code null} when disabled.
+     * Cluster wiring is resolved at bootstrap via {@link ServerEnvironment} ({@code REDIS_HOST},
+     * {@code REDIS_PORT}, {@code DISTRISYNC_REDIS_URI}, {@code NODE_ID}) in {@link WhiteboardServer}.
+     */
+    private final RedisBackplanePublisher backplanePublisher;
+
+    /**
+     * Optional Redis Pub/Sub consumer; {@code null} when disabled. Enqueues into {@link #remoteMailbox}.
+     * See {@link #backplanePublisher} for environment configuration.
+     */
+    private final RedisBackplaneSubscriber backplaneSubscriber;
+
+    /** Server instance id for discarding self-originated backplane events (from {@code NODE_ID} or generated). */
+    private final String localNodeId;
+
+    /** Idempotency guard for backplane {@code eventId} values (publish + ingest). */
+    private final BackplaneEventDedup backplaneEventDedup = new BackplaneEventDedup();
+
+    /**
+     * Cross-thread remote mutation delivery: the Redis listener thread offers envelopes;
+     * {@link #processRemoteMailbox()} drains on the selector thread.
+     */
+    final ConcurrentLinkedQueue<BackplaneEnvelope> remoteMailbox = new ConcurrentLinkedQueue<>();
+
+    /**
      * Maps {@link ClientSession#udpToken} to the owning session for UDP registration and audio relay.
      * {@link ConcurrentHashMap} provides lock-free reads on the selector thread during UDP fan-out.
      */
@@ -146,6 +179,8 @@ public final class NioServer implements Runnable {
      */
     private volatile boolean stopped = false;
 
+    private HttpServer metricsServer;
+
     /**
      * The live {@link Selector}; stored so {@link #stop()} can call
      * {@link Selector#wakeup()} even while the event loop is blocked in
@@ -164,18 +199,58 @@ public final class NioServer implements Runnable {
      * @param roomManager the multi-tenant routing registry
      */
     public NioServer(int port, RoomManager roomManager) {
-        this(port, roomManager, null);
+        this(port, roomManager, null, null, null, null);
     }
 
     /**
      * @param walManager  WAL used when servicing {@link MessageType#DELETE_ROOM}; may be {@code null}
      */
     public NioServer(int port, RoomManager roomManager, WalManager walManager) {
+        this(port, roomManager, walManager, null, null, null);
+    }
+
+    /**
+     * @param backplanePublisher Redis mutation fanout; {@code null} disables backplane publish
+     */
+    public NioServer(
+            int port,
+            RoomManager roomManager,
+            WalManager walManager,
+            RedisBackplanePublisher backplanePublisher) {
+        this(port, roomManager, walManager, backplanePublisher, null, null);
+    }
+
+    /**
+     * @param backplaneSubscriber Redis mutation ingest; {@code null} disables backplane subscribe
+     * @param localNodeId         node identity for self-echo discard; generated when {@code null}
+     */
+    public NioServer(
+            int port,
+            RoomManager roomManager,
+            WalManager walManager,
+            RedisBackplanePublisher backplanePublisher,
+            RedisBackplaneSubscriber backplaneSubscriber,
+            String localNodeId) {
         if (port < 0 || port > 65535) throw new IllegalArgumentException("Invalid port: " + port);
         if (roomManager == null)       throw new IllegalArgumentException("roomManager must not be null");
-        this.port        = port;
-        this.roomManager = roomManager;
-        this.walManager  = walManager;
+        this.port                = port;
+        this.roomManager         = roomManager;
+        this.walManager          = walManager;
+        this.backplanePublisher  = backplanePublisher;
+        this.backplaneSubscriber = backplaneSubscriber;
+        this.localNodeId         = resolveLocalNodeId(backplanePublisher, localNodeId);
+    }
+
+    private static String resolveLocalNodeId(
+            RedisBackplanePublisher backplanePublisher,
+            String localNodeId) {
+        if (localNodeId != null && !localNodeId.isBlank()) {
+            return localNodeId;
+        }
+        if (backplanePublisher != null) {
+            return backplanePublisher.originNodeId();
+        }
+        return UUID.randomUUID().toString();
     }
 
     // =========================================================================
@@ -190,6 +265,8 @@ public final class NioServer implements Runnable {
     public void run() {
         log.info("NioServer starting on port {}", port);
 
+        startMetricsServer();
+
         try (ServerSocketChannel serverChannel = ServerSocketChannel.open();
              DatagramChannel datagramChannel = DatagramChannel.open();
              Selector selector = Selector.open()) {
@@ -202,6 +279,19 @@ public final class NioServer implements Runnable {
                 selectorRef.wakeup();
             });
             roomManager.setRoomDeletionClientHooks(this::revokeUdpAdmission, (s, k) -> flushWriteQueue(s, k));
+            roomManager.setOutboundFrameHook(
+                    (s, frame, k) -> safeEnqueue(s, k, frame, OutboundClass.CRITICAL));
+            if (backplaneSubscriber != null || backplanePublisher != null) {
+                if (backplaneSubscriber != null) {
+                    backplaneSubscriber.bind(remoteMailbox, selectorRef::wakeup);
+                }
+                roomManager.setRoomCreatedHook(roomId -> {
+                    if (backplaneSubscriber != null) {
+                        backplaneSubscriber.subscribeRoom(roomId);
+                    }
+                    publishStateRequest(roomId);
+                });
+            }
 
             serverChannel.configureBlocking(false);
             serverChannel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
@@ -230,6 +320,7 @@ public final class NioServer implements Runnable {
                 while (!stopped && !Thread.currentThread().isInterrupted()) {
                     selector.select();
                     drainPendingLobbyBroadcasts();
+                    processRemoteMailbox();
 
                     Set<SelectionKey> selected = selector.selectedKeys();
                     for (SelectionKey key : selected) {
@@ -249,9 +340,83 @@ public final class NioServer implements Runnable {
         } catch (IOException e) {
             log.error("NioServer fatal I/O error — shutting down", e);
             boundPortFuture.completeExceptionally(e);
+        } finally {
+            stopMetricsServer();
         }
 
         log.info("NioServer stopped");
+    }
+
+    private void startMetricsServer() {
+        int metricsPort = resolveMetricsPort();
+        try {
+            metricsServer = createAndStartMetricsServer(metricsPort);
+        } catch (IOException e) {
+            if (metricsPort != 0) {
+                log.warn("Metrics HTTP server failed on port {} ({}), retrying on ephemeral port",
+                        metricsPort, e.getMessage());
+                try {
+                    metricsServer = createAndStartMetricsServer(0);
+                } catch (IOException retry) {
+                    log.error("Failed to start metrics HTTP server: {}", retry.getMessage(), retry);
+                }
+            } else {
+                log.error("Failed to start metrics HTTP server: {}", e.getMessage(), e);
+            }
+        }
+    }
+
+    private HttpServer createAndStartMetricsServer(int metricsPort) throws IOException {
+        HttpServer server = HttpServer.create(new InetSocketAddress(metricsPort), 0);
+        server.createContext("/metrics", this::handleMetricsRequest);
+        server.setExecutor(Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "distrisync-metrics-http");
+            t.setDaemon(true);
+            return t;
+        }));
+        server.start();
+        int boundPort = server.getAddress().getPort();
+        log.info("Prometheus metrics listening on port {}", boundPort);
+        return server;
+    }
+
+    private void stopMetricsServer() {
+        HttpServer server = metricsServer;
+        if (server != null) {
+            server.stop(0);
+            metricsServer = null;
+        }
+    }
+
+    private static int resolveMetricsPort() {
+        String portEnv = System.getenv("METRICS_PORT");
+        if (portEnv == null || portEnv.isBlank()) {
+            return 8080;
+        }
+        try {
+            int port = Integer.parseInt(portEnv.trim());
+            if (port < 0 || port > 65535) {
+                throw new NumberFormatException("out of range");
+            }
+            return port;
+        } catch (NumberFormatException e) {
+            log.warn("Invalid METRICS_PORT '{}' — using default 8080", portEnv);
+            return 8080;
+        }
+    }
+
+    private void handleMetricsRequest(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            exchange.sendResponseHeaders(405, -1);
+            exchange.close();
+            return;
+        }
+        byte[] body = ServerMetrics.formatPrometheusText().getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", ServerMetrics.PROMETHEUS_CONTENT_TYPE);
+        exchange.sendResponseHeaders(200, body.length);
+        try (OutputStream out = exchange.getResponseBody()) {
+            out.write(body);
+        }
     }
 
     // =========================================================================
@@ -463,7 +628,10 @@ public final class NioServer implements Runnable {
                     break;
                 }
                 ByteBuffer lobbyFrame = MessageCodec.encodeLobbyState(roomManager.snapshotLobbyRoomEntries());
-                session.enqueue(lobbyFrame);
+                if (safeEnqueue(session, senderKey, lobbyFrame, OutboundClass.CRITICAL)
+                        == EnqueueResult.OVERFLOW_DISCONNECT) {
+                    break;
+                }
                 if (!flushWriteQueue(session, senderKey)) {
                     log.error("FETCH_LOBBY LOBBY_STATE flush failed for session={} — closing connection",
                             session.sessionId);
@@ -530,8 +698,19 @@ public final class NioServer implements Runnable {
                     // between the apply and the broadcast.
                     roomManager.appendToWal(session.roomId, session.currentBoardId, msg);
 
+                    if (backplanePublisher != null) {
+                        String eventId = UUID.randomUUID().toString();
+                        backplaneEventDedup.tryRecord(eventId);
+                        backplanePublisher.publish(new BackplaneEnvelope(
+                                eventId,
+                                backplanePublisher.originNodeId(),
+                                session.roomId,
+                                session.currentBoardId,
+                                MessageCodec.encode(msg)));
+                    }
+
                     ByteBuffer frame = MessageCodec.encode(msg);
-                    broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey);
+                    broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey, OutboundClass.CRITICAL);
                 } else {
                     log.debug("MUTATION rejected (stale)  id={} from={}", shape.objectId(), session.sessionId);
                 }
@@ -547,7 +726,9 @@ public final class NioServer implements Runnable {
                 log.debug("{} relayed  room='{}' board='{}' from session={}",
                         msg.type(), session.roomId, session.currentBoardId, session.sessionId);
                 ByteBuffer frame = MessageCodec.encode(msg);
-                broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey);
+                OutboundClass shapeCls = msg.type() == MessageType.SHAPE_UPDATE
+                        ? OutboundClass.EPHEMERAL : OutboundClass.CRITICAL;
+                broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey, shapeCls);
             }
 
             case TEXT_UPDATE -> {
@@ -560,7 +741,7 @@ public final class NioServer implements Runnable {
                 log.debug("TEXT_UPDATE relayed  room='{}' board='{}' from session={}",
                         session.roomId, session.currentBoardId, session.sessionId);
                 ByteBuffer frame = MessageCodec.encode(msg);
-                broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey);
+                broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey, OutboundClass.EPHEMERAL);
             }
 
             case CLEAR_USER_SHAPES -> {
@@ -587,7 +768,7 @@ public final class NioServer implements Runnable {
                 roomManager.appendToWal(session.roomId, session.currentBoardId, msg);
 
                 ByteBuffer frame = MessageCodec.encodeClearUserShapes(targetClientId);
-                broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey);
+                broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey, OutboundClass.CRITICAL);
             }
 
             case UNDO_REQUEST -> {
@@ -622,7 +803,7 @@ public final class NioServer implements Runnable {
                     roomManager.appendToWal(session.roomId, session.currentBoardId, deleteMsg);
 
                     ByteBuffer frame = MessageCodec.encode(deleteMsg);
-                    broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey);
+                    broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey, OutboundClass.CRITICAL);
                 } else {
                     log.debug("UNDO_REQUEST no-op (shape not found)  shapeId={} session={}",
                             shapeId, session.sessionId);
@@ -672,7 +853,10 @@ public final class NioServer implements Runnable {
                     log.warn("Malformed PING session={}: {}", session.sessionId, e.getMessage());
                     break;
                 }
-                session.enqueue(MessageCodec.encodePong(origin));
+                if (safeEnqueue(session, senderKey, MessageCodec.encodePong(origin), OutboundClass.EPHEMERAL)
+                        == EnqueueResult.OVERFLOW_DISCONNECT) {
+                    break;
+                }
                 if (!flushWriteQueue(session, senderKey)) {
                     log.error("PONG flush failed for session={} — closing connection", session.sessionId);
                     closeKey(senderKey);
@@ -704,6 +888,33 @@ public final class NioServer implements Runnable {
                         session.roomId, vs.clientId(), vs.isMuted());
                 ByteBuffer frame = MessageCodec.encodeVoiceState(vs.clientId(), vs.isMuted());
                 broadcastToRoom(session.roomId, frame, senderKey);
+            }
+
+            case CURSOR_SYNC -> {
+                if (!session.handshakeComplete) {
+                    log.warn("CURSOR_SYNC before HANDSHAKE session={}", session.sessionId);
+                    break;
+                }
+                RoomContext cursorRoom = resolveRoom(session, senderKey);
+                if (cursorRoom == null) {
+                    return;
+                }
+                MessageCodec.CursorSyncPayload cs;
+                try {
+                    cs = MessageCodec.decodeCursorSync(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed CURSOR_SYNC session={}: {}", session.sessionId, e.getMessage());
+                    break;
+                }
+                if (!session.clientId.equals(cs.clientId())) {
+                    log.warn("CURSOR_SYNC clientId mismatch session={} payload='{}' sessionClientId='{}'",
+                            session.sessionId, cs.clientId(), session.clientId);
+                    break;
+                }
+                ByteBuffer cursorFrame = MessageCodec.encodeCursorSync(
+                        cs.clientId(), cs.authorName(), cs.x(), cs.y());
+                broadcastToRoom(session.roomId, cursorFrame, senderKey);
+                publishPresenceEnvelope(session.roomId, msg);
             }
 
             default -> log.warn("Unexpected message type={} from session={} — ignoring",
@@ -749,7 +960,9 @@ public final class NioServer implements Runnable {
 
     private void sendUdpAdmission(ClientSession session, SelectionKey key, String udpToken) {
         ByteBuffer frame = MessageCodec.encodeUdpAdmission(udpToken);
-        session.enqueue(frame);
+        if (safeEnqueue(session, key, frame, OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
+            return;
+        }
         if (!flushWriteQueue(session, key)) {
             log.error("UDP_ADMISSION flush failed for session={} — closing connection", session.sessionId);
             closeKey(key);
@@ -883,11 +1096,23 @@ public final class NioServer implements Runnable {
         log.debug("Sending SNAPSHOT  room='{}' shapes={} bytes={} to={}",
                 room.roomId, shapes.size(), frame.remaining(), session.sessionId);
 
-        session.enqueue(frame);
+        if (safeEnqueue(session, key, frame, OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
+            return;
+        }
         if (!flushWriteQueue(session, key)) {
             log.error("SNAPSHOT flush failed for session={} — closing connection", session.sessionId);
             closeKey(key);
         }
+    }
+
+    /**
+     * Pushes a pre-encoded {@code SNAPSHOT} frame to every local client in {@code roomId}
+     * viewing {@code boardId}. Used after backplane hydration.
+     *
+     * @return number of recipients that accepted the frame
+     */
+    private int broadcastSnapshotToBoard(String roomId, String boardId, ByteBuffer frame) {
+        return fanoutFrameToBoard(roomId, boardId, frame);
     }
 
     // =========================================================================
@@ -899,6 +1124,340 @@ public final class NioServer implements Runnable {
         while ((frame = pendingLobbyFrames.poll()) != null) {
             deliverLobbyStateFrame(frame);
         }
+    }
+
+    /**
+     * Drains {@link #remoteMailbox} on the selector thread and fans out remote mutations
+     * to local TCP clients. Must not be called from the Redis listener thread.
+     */
+    void processRemoteMailbox() {
+        BackplaneEnvelope envelope;
+        while ((envelope = remoteMailbox.poll()) != null) {
+            if (envelope.originNodeId().equals(localNodeId)) {
+                continue;
+            }
+            ServerMetrics.REDIS_MESSAGES_RECEIVED.incrementAndGet();
+            Message peek;
+            try {
+                ByteBuffer decodeBuf = envelope.serializedPayload().duplicate();
+                peek = MessageCodec.decode(decodeBuf);
+            } catch (Exception e) {
+                log.warn("Remote backplane peek decode failed  room='{}' eventId='{}': {}",
+                        envelope.roomId(), envelope.eventId(), e.getMessage());
+                continue;
+            }
+            if (peek.type() == MessageType.CURSOR_SYNC) {
+                fanoutRemoteCursorSync(envelope);
+            } else {
+                fanoutRemoteEnvelope(envelope);
+            }
+        }
+    }
+
+    /**
+     * Publishes a room-level {@code STATE_REQUEST} when this node first materializes a room.
+     * Non-blocking; no-op when the backplane publisher is disabled.
+     */
+    void publishStateRequest(String roomId) {
+        if (backplanePublisher == null || roomId == null || roomId.isBlank()) {
+            return;
+        }
+        Message msg = new Message(MessageType.STATE_REQUEST, "{}");
+        publishBackplaneEnvelope(roomId, MessageCodec.DEFAULT_INITIAL_BOARD_ID, msg);
+        log.debug("Backplane STATE_REQUEST published  room='{}'", roomId);
+    }
+
+    private void publishBackplaneEnvelope(String roomId, String boardId, Message msg) {
+        if (backplanePublisher == null) {
+            return;
+        }
+        String eventId = UUID.randomUUID().toString();
+        backplaneEventDedup.tryRecord(eventId);
+        backplanePublisher.publish(new BackplaneEnvelope(
+                eventId,
+                backplanePublisher.originNodeId(),
+                roomId,
+                boardId,
+                MessageCodec.encode(msg)));
+    }
+
+    /**
+     * Publishes ephemeral cursor position to the presence channel without dedup or WAL.
+     */
+    private void publishPresenceEnvelope(String roomId, Message msg) {
+        if (backplanePublisher == null) {
+            return;
+        }
+        backplanePublisher.publishPresence(new BackplaneEnvelope(
+                UUID.randomUUID().toString(),
+                backplanePublisher.originNodeId(),
+                roomId,
+                MessageCodec.DEFAULT_INITIAL_BOARD_ID,
+                MessageCodec.encode(msg)));
+    }
+
+    /**
+     * Fans out a remote {@code CURSOR_SYNC} to all local room clients. Skips dedup and WAL.
+     */
+    private void fanoutRemoteCursorSync(BackplaneEnvelope envelope) {
+        String roomId = envelope.roomId();
+        ByteBuffer frame = envelope.serializedPayload().duplicate();
+        int recipients = fanoutFrameToRoom(roomId, frame);
+        log.trace("Remote CURSOR_SYNC fan-out  roomId='{}' recipients={}", roomId, recipients);
+    }
+
+    private void respondToStateRequest(RoomContext room, String roomId) {
+        if (backplanePublisher == null) {
+            return;
+        }
+        for (String activeBoardId : room.getActiveBoardIds()) {
+            List<Shape> shapes = room.getBoard(activeBoardId).snapshot();
+            if (shapes.isEmpty()) {
+                continue;
+            }
+            Message snapshotMsg = new Message(
+                    MessageType.STATE_SNAPSHOT,
+                    ShapeCodec.encodeSnapshot(shapes));
+            publishBackplaneEnvelope(roomId, activeBoardId, snapshotMsg);
+            log.debug("Backplane STATE_SNAPSHOT published  room='{}' board='{}' shapes={}",
+                    roomId, activeBoardId, shapes.size());
+        }
+    }
+
+    private void applyRemoteStateSnapshot(RoomContext room, String roomId, String boardId, Message msg) {
+        List<Shape> incoming;
+        try {
+            incoming = ShapeCodec.decodeSnapshot(msg.payload());
+        } catch (Exception e) {
+            log.warn("Remote STATE_SNAPSHOT malformed  room='{}' board='{}': {}",
+                    roomId, boardId, e.getMessage());
+            return;
+        }
+
+        CanvasStateManager board = room.getBoard(boardId);
+        for (Shape shape : incoming) {
+            board.applyMutation(shape);
+        }
+
+        if (walManager != null) {
+            try {
+                walManager.compactWal(roomId, boardId, board.snapshot());
+            } catch (IOException e) {
+                log.error("WAL compact after STATE_SNAPSHOT failed  room='{}' board='{}': {}",
+                        roomId, boardId, e.getMessage(), e);
+            }
+        }
+
+        Message clientSnapshot = new Message(
+                MessageType.SNAPSHOT,
+                ShapeCodec.encodeSnapshot(board.snapshot()));
+        ByteBuffer frame = MessageCodec.encode(clientSnapshot);
+        int recipients = broadcastSnapshotToBoard(roomId, boardId, frame);
+        log.debug("Remote STATE_SNAPSHOT hydrated  room='{}' board='{}' shapes={} recipients={}",
+                roomId, boardId, board.snapshot().size(), recipients);
+    }
+
+    /**
+     * Applies a remote backplane envelope to local authoritative state, persists to WAL when
+     * applicable, then fans out to local TCP clients. Mutation paths are receive-only;
+     * {@link MessageType#STATE_REQUEST} may trigger {@code STATE_SNAPSHOT} publishes from this node.
+     * Must run on the selector thread.
+     */
+    void fanoutRemoteEnvelope(BackplaneEnvelope envelope) {
+        if (!backplaneEventDedup.tryRecord(envelope.eventId())) {
+            log.trace("Remote backplane duplicate dropped  eventId='{}'", envelope.eventId());
+            return;
+        }
+
+        String roomId = envelope.roomId();
+        String boardId = envelope.boardId();
+        RoomContext room = roomManager.getOrCreateRoom(roomId);
+
+        Message msg;
+        try {
+            ByteBuffer decodeBuf = envelope.serializedPayload().duplicate();
+            msg = MessageCodec.decode(decodeBuf);
+        } catch (PartialMessageException e) {
+            log.warn("Remote backplane incomplete frame  room='{}' board='{}' eventId='{}': {}",
+                    roomId, boardId, envelope.eventId(), e.getMessage());
+            return;
+        } catch (Exception e) {
+            log.warn("Remote backplane decode failed  room='{}' board='{}' eventId='{}': {}",
+                    roomId, boardId, envelope.eventId(), e.getMessage());
+            return;
+        }
+
+        ByteBuffer fanoutFrame = envelope.serializedPayload().duplicate();
+        boolean fanout = switch (msg.type()) {
+            case MUTATION -> applyRemoteMutation(room, roomId, boardId, msg, fanoutFrame);
+            case SHAPE_DELETE -> applyRemoteShapeDelete(room, roomId, boardId, msg, fanoutFrame);
+            case CLEAR_USER_SHAPES -> applyRemoteClearUserShapes(room, roomId, boardId, msg, fanoutFrame);
+            case STATE_REQUEST -> {
+                respondToStateRequest(room, roomId);
+                yield false;
+            }
+            case STATE_SNAPSHOT -> {
+                applyRemoteStateSnapshot(room, roomId, boardId, msg);
+                yield false;
+            }
+            default -> {
+                log.debug("Remote backplane ignored non-durable type={}  room='{}' eventId='{}'",
+                        msg.type(), roomId, envelope.eventId());
+                yield false;
+            }
+        };
+
+        if (fanout) {
+            int recipients = fanoutFrameToBoard(roomId, boardId, fanoutFrame);
+            log.debug("Remote backplane applied  roomId='{}' boardId='{}' eventId='{}' type={} recipients={}",
+                    roomId, boardId, envelope.eventId(), msg.type(), recipients);
+        }
+    }
+
+    private boolean applyRemoteMutation(
+            RoomContext room, String roomId, String boardId, Message msg, ByteBuffer fanoutFrame) {
+        Shape shape;
+        try {
+            shape = ShapeCodec.decodeMutation(msg.payload());
+        } catch (Exception e) {
+            log.warn("Remote MUTATION malformed  room='{}' board='{}': {}", roomId, boardId, e.getMessage());
+            return false;
+        }
+
+        CanvasStateManager board = room.getBoard(boardId);
+        if (!board.applyMutation(shape)) {
+            log.debug("Remote MUTATION rejected (stale)  id={} room='{}' board='{}'",
+                    shape.objectId(), roomId, boardId);
+            return false;
+        }
+
+        roomManager.appendToWal(roomId, boardId, msg);
+        fanoutFrame.rewind();
+        return true;
+    }
+
+    private boolean applyRemoteShapeDelete(
+            RoomContext room, String roomId, String boardId, Message msg, ByteBuffer fanoutFrame) {
+        UUID shapeId;
+        try {
+            JsonObject p = JsonParser.parseString(msg.payload()).getAsJsonObject();
+            shapeId = UUID.fromString(p.get("shapeId").getAsString());
+        } catch (Exception e) {
+            log.warn("Remote SHAPE_DELETE malformed  room='{}' board='{}': {}", roomId, boardId, e.getMessage());
+            return false;
+        }
+
+        CanvasStateManager board = room.getBoard(boardId);
+        if (!board.deleteShape(shapeId)) {
+            log.debug("Remote SHAPE_DELETE no-op  id={} room='{}' board='{}'", shapeId, roomId, boardId);
+            return false;
+        }
+
+        roomManager.appendToWal(roomId, boardId, msg);
+        fanoutFrame.rewind();
+        return true;
+    }
+
+    private boolean applyRemoteClearUserShapes(
+            RoomContext room, String roomId, String boardId, Message msg, ByteBuffer fanoutFrame) {
+        String targetClientId;
+        try {
+            targetClientId = MessageCodec.decodeClearUserShapes(msg);
+        } catch (Exception e) {
+            log.warn("Remote CLEAR_USER_SHAPES malformed  room='{}' board='{}': {}", roomId, boardId, e.getMessage());
+            return false;
+        }
+
+        CanvasStateManager board = room.getBoard(boardId);
+        board.clearUserShapes(targetClientId);
+        roomManager.appendToWal(roomId, boardId, msg);
+        fanoutFrame.rewind();
+        return true;
+    }
+
+    /**
+     * Delivers {@code frame} to every active client in {@code roomId} on {@code boardId}.
+     *
+     * @return number of recipients that accepted the frame
+     */
+    private int fanoutFrameToBoard(String roomId, String boardId, ByteBuffer frame) {
+        var activeKeys = roomManager.getActiveClientKeys(roomId);
+        if (activeKeys.isEmpty()) {
+            return 0;
+        }
+
+        int frameBytes = frame.remaining();
+        List<SelectionKey> toClose = new ArrayList<>();
+        int recipientCount = 0;
+
+        for (SelectionKey key : activeKeys) {
+            if (!key.isValid()) {
+                continue;
+            }
+
+            ClientSession session = (ClientSession) key.attachment();
+            if (!boardId.equals(session.currentBoardId)) {
+                continue;
+            }
+
+            frame.rewind();
+            EnqueueResult result = safeEnqueue(session, key, frame, OutboundClass.CRITICAL);
+            if (result == EnqueueResult.OVERFLOW_DISCONNECT) {
+                continue;
+            }
+            if (!flushWriteQueue(session, key)) {
+                toClose.add(key);
+            } else {
+                bytesRouted.addAndGet(frameBytes);
+                recipientCount++;
+            }
+        }
+
+        toClose.forEach(this::closeKey);
+        return recipientCount;
+    }
+
+    /**
+     * Delivers {@code frame} to every active client in {@code roomId} (all boards).
+     *
+     * @return number of recipients that accepted the frame
+     */
+    private int fanoutFrameToRoom(String roomId, ByteBuffer frame) {
+        var activeKeys = roomManager.getActiveClientKeys(roomId);
+        if (activeKeys.isEmpty()) {
+            return 0;
+        }
+
+        int frameBytes = frame.remaining();
+        List<SelectionKey> toClose = new ArrayList<>();
+        int recipientCount = 0;
+
+        for (SelectionKey key : activeKeys) {
+            if (!key.isValid()) {
+                continue;
+            }
+
+            ClientSession session = (ClientSession) key.attachment();
+            frame.rewind();
+            EnqueueResult result = safeEnqueue(session, key, frame, OutboundClass.EPHEMERAL);
+            if (result == EnqueueResult.OVERFLOW_DISCONNECT) {
+                continue;
+            }
+            if (!flushWriteQueue(session, key)) {
+                toClose.add(key);
+            } else {
+                bytesRouted.addAndGet(frameBytes);
+                recipientCount++;
+            }
+        }
+
+        toClose.forEach(this::closeKey);
+        return recipientCount;
+    }
+
+    /** Package-private for tests — whether {@code eventId} is in the dedup cache. */
+    boolean isEventIdRecorded(String eventId) {
+        return backplaneEventDedup.contains(eventId);
     }
 
     /**
@@ -916,7 +1475,10 @@ public final class NioServer implements Runnable {
             if (!(key.attachment() instanceof ClientSession session)) {
                 continue;
             }
-            session.enqueue(frame);
+            EnqueueResult result = safeEnqueue(session, key, frame, OutboundClass.EPHEMERAL);
+            if (result == EnqueueResult.OVERFLOW_DISCONNECT) {
+                continue;
+            }
             if (!flushWriteQueue(session, key)) {
                 toClose.add(key);
             }
@@ -968,7 +1530,8 @@ public final class NioServer implements Runnable {
      * @param frame     the encoded binary frame to deliver (read-mode)
      * @param senderKey the originating client's key; excluded from delivery
      */
-    private void broadcastToBoard(String roomId, String boardId, ByteBuffer frame, SelectionKey senderKey) {
+    private void broadcastToBoard(String roomId, String boardId, ByteBuffer frame, SelectionKey senderKey,
+                                OutboundClass cls) {
         var activeKeys = roomManager.getActiveClientKeys(roomId);
         if (activeKeys.isEmpty()) {
             if (roomManager.getRoom(roomId) == null) {
@@ -991,8 +1554,10 @@ public final class NioServer implements Runnable {
                 continue;
             }
 
-            session.enqueue(frame);
-
+            EnqueueResult result = safeEnqueue(session, key, frame, cls);
+            if (result == EnqueueResult.OVERFLOW_DISCONNECT) {
+                continue;
+            }
             if (!flushWriteQueue(session, key)) {
                 toClose.add(key);
             } else {
@@ -1029,8 +1594,10 @@ public final class NioServer implements Runnable {
             }
 
             ClientSession peer = (ClientSession) key.attachment();
-            peer.enqueue(frame);
-
+            EnqueueResult result = safeEnqueue(peer, key, frame, OutboundClass.EPHEMERAL);
+            if (result == EnqueueResult.OVERFLOW_DISCONNECT) {
+                continue;
+            }
             if (!flushWriteQueue(peer, key)) {
                 toClose.add(key);
             } else {
@@ -1062,7 +1629,10 @@ public final class NioServer implements Runnable {
             if (!(key.attachment() instanceof ClientSession peer)) {
                 continue;
             }
-            peer.enqueue(frame);
+            EnqueueResult result = safeEnqueue(peer, key, frame, OutboundClass.CRITICAL);
+            if (result == EnqueueResult.OVERFLOW_DISCONNECT) {
+                continue;
+            }
             if (!flushWriteQueue(peer, key)) {
                 toClose.add(key);
             } else {
@@ -1078,6 +1648,20 @@ public final class NioServer implements Runnable {
     // =========================================================================
     // Write / drain
     // =========================================================================
+
+    private EnqueueResult safeEnqueue(ClientSession session, SelectionKey key,
+                                      Message msg, OutboundClass cls) {
+        return safeEnqueue(session, key, MessageCodec.encode(msg), cls);
+    }
+
+    private EnqueueResult safeEnqueue(ClientSession session, SelectionKey key,
+                                      ByteBuffer frame, OutboundClass cls) {
+        EnqueueResult result = session.enqueue(frame, cls);
+        if (result == EnqueueResult.OVERFLOW_DISCONNECT) {
+            closeKey(key);
+        }
+        return result;
+    }
 
     private void handleWrite(SelectionKey key) {
         ClientSession session = (ClientSession) key.attachment();
@@ -1107,6 +1691,7 @@ public final class NioServer implements Runnable {
                 }
 
                 session.writeQueue.poll();
+                ServerMetrics.FRAMES_SENT_TOTAL.incrementAndGet();
             }
 
             key.interestOpsAnd(~SelectionKey.OP_WRITE);
@@ -1188,6 +1773,7 @@ public final class NioServer implements Runnable {
      */
     public void stop() {
         stopped = true;
+        stopMetricsServer();
         Selector sel = this.selector;
         if (sel != null && sel.isOpen()) {
             sel.wakeup();
