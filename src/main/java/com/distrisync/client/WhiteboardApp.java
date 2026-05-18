@@ -236,7 +236,7 @@ public class WhiteboardApp extends Application {
 
     // ── network subsystems ────────────────────────────────────────────────────
     private NetworkClient     networkClient;
-    private UdpPointerTracker udpTracker;
+    private RemoteCursorManager remoteCursorManager;
     /** Endpoint last passed to {@link NetworkClient} (for lobby error text). */
     private String            networkHost = DEFAULT_HOST;
     private int               networkPort = DEFAULT_PORT;
@@ -1689,8 +1689,8 @@ public class WhiteboardApp extends Application {
         hideBoardSwitcher();
         boardSnapshots.clear();
         unwireCanvasMouseEvents();
-        if (udpTracker != null) {
-            udpTracker.clearPeerCursors();
+        if (remoteCursorManager != null) {
+            remoteCursorManager.clear();
         }
         if (networkClient != null && sendLeaveRoomToServer) {
             networkClient.sendLeaveRoom();
@@ -2339,7 +2339,9 @@ public class WhiteboardApp extends Application {
     }
 
     private void notifyUdpMove(double x, double y) {
-        if (udpTracker != null) udpTracker.onMouseMoved(x, y);
+        if (networkClient != null) {
+            networkClient.sendCursorSync(x, y);
+        }
     }
 
     // ── Text Tool ─────────────────────────────────────────────────────────────
@@ -2685,10 +2687,13 @@ public class WhiteboardApp extends Application {
         connectThread.setDaemon(true);
         connectThread.start();
 
-        // UDP pointer tracker — manages its own threads and the cursorPane nodes
-        udpTracker = new UdpPointerTracker(cursorPane);
-        udpTracker.setAuthorName(authorName);
-        udpTracker.start();
+        remoteCursorManager = new RemoteCursorManager(cursorPane, clientId);
+        networkClient.addCursorSyncListener((peerId, peerName, cx, cy) ->
+                Platform.runLater(() -> {
+                    if (remoteCursorManager != null) {
+                        remoteCursorManager.updateTarget(peerId, peerName, cx, cy);
+                    }
+                }));
     }
 
     private void setStatus(String text, String colorHex) {
@@ -3092,7 +3097,9 @@ public class WhiteboardApp extends Application {
     // =========================================================================
 
     private void shutdown() {
-        if (udpTracker    != null) udpTracker.stop();
+        if (remoteCursorManager != null) {
+            Platform.runLater(remoteCursorManager::stop);
+        }
         if (networkClient != null) networkClient.close();
     }
 
