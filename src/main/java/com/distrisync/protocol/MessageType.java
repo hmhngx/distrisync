@@ -34,6 +34,9 @@ import java.util.Map;
  * 0x15        ROOM_DELETED      – server→client: empty payload — room was destroyed; clients should return to lobby
  * 0x16        FETCH_LOBBY       – client→server: empty JSON object {} — pull current LOBBY_STATE for this connection only
  * 0x17        VOICE_STATE       – client→server→peers: JSON object { clientId, isMuted } — hardware mute toggle (not speaking activity)
+ * 0x18        STATE_REQUEST     – backplane only: cold node requests room state hydration (payload: {})
+ * 0x19        STATE_SNAPSHOT    – backplane only: hot node bulk board state (payload: same JSON array as SNAPSHOT)
+ * 0x1A        CURSOR_SYNC       – ephemeral multiplayer cursor position (payload: clientId, authorName, x, y)
  * </pre>
  */
 public enum MessageType {
@@ -60,7 +63,10 @@ public enum MessageType {
     DELETE_ROOM      ((byte) 0x14),
     ROOM_DELETED     ((byte) 0x15),
     FETCH_LOBBY      ((byte) 0x16),
-    VOICE_STATE      ((byte) 0x17);
+    VOICE_STATE      ((byte) 0x17),
+    STATE_REQUEST    ((byte) 0x18),
+    STATE_SNAPSHOT   ((byte) 0x19),
+    CURSOR_SYNC      ((byte) 0x1A);
 
     private final byte wireCode;
 

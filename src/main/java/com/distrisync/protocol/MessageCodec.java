@@ -723,6 +723,33 @@ public final class MessageCodec {
         return p;
     }
 
+    // -------------------------------------------------------------------------
+    // CURSOR_SYNC helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * JSON body for {@link MessageType#CURSOR_SYNC}: ephemeral multiplayer cursor position.
+     */
+    public record CursorSyncPayload(String clientId, String authorName, double x, double y) {}
+
+    public static ByteBuffer encodeCursorSync(String clientId, String authorName, double x, double y) {
+        if (clientId == null) throw new IllegalArgumentException("clientId must not be null");
+        return encodeObject(MessageType.CURSOR_SYNC,
+                new CursorSyncPayload(clientId, authorName != null ? authorName : "", x, y));
+    }
+
+    public static CursorSyncPayload decodeCursorSync(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.CURSOR_SYNC) {
+            throw new IllegalArgumentException("expected CURSOR_SYNC, got " + msg.type());
+        }
+        CursorSyncPayload p = GSON.fromJson(msg.payload(), CursorSyncPayload.class);
+        if (p == null || p.clientId() == null) {
+            throw new IllegalArgumentException("CURSOR_SYNC missing clientId");
+        }
+        return p;
+    }
+
     /**
      * Exposes the shared {@link Gson} instance for callers that need custom
      * serialization (e.g. registering type adapters for {@code UUID} or
