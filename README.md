@@ -17,6 +17,8 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 **Workspace Boards:** Rooms now support multiple isolated boards within a single shared space. Each board maintains its own independent `CanvasStateManager` and Write-Ahead Log (`{roomId}_{boardId}.wal`), enabling zero-overhead board creation and persistent recovery. Clients receive a `BOARD_LIST_UPDATE` on join and whenever a new board is created; the `SWITCH_BOARD` message allows in-room navigation between boards. Shape mutations are scoped to the active board and broadcast only to connected peers viewing the same board, preventing cross-board interference. A Figma-style Task View board switcher with live thumbnails facilitates rapid board discovery and navigation.
 
+**Horizontal scaling:** Multiple `NioServer` JVMs can share room state through an optional **Redis Pub/Sub backplane** (Lettuce). After a local WAL commit, mutations are published as `BackplaneEnvelope` records on `distrisync:room:{roomId}`; peer nodes apply them idempotently via `BackplaneEventDedup` and fan out to local TCP clients. Ephemeral cursor positions use `CURSOR_SYNC` on TCP and a dedicated Redis presence channel (`distrisync:room:{roomId}:presence`) for cross-node relay. Cold nodes request hydration with `STATE_REQUEST` / `STATE_SNAPSHOT` backplane events. Configure via `REDIS_HOST` + `REDIS_PORT` or `DISTRISYNC_REDIS_URI`, and `NODE_ID` / `DISTRISYNC_NODE_ID`.
+
 ---
 
 ## Core Features (Implemented)
@@ -73,6 +75,16 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Properties Bar & Floating Tool Chrome** — `styles.css` defines a Tailwind-inspired properties bar (colour picker, stroke slider, eraser-type toggles) and floating tool-dock layout. Extensive `WhiteboardApp*` TestFX/Mockito tests (`WhiteboardAppPropertiesBarTest`, `WhiteboardAppToolDockTest`, `WhiteboardAppFloatingLayoutTest`, etc.) lock layout IDs and interaction contracts without a manual QA pass.
 
+- **Redis Backplane (Multi-Node Fan-Out)** — when `ServerEnvironment.resolveRedisUri()` is set, `WhiteboardServer` starts `RedisBackplanePublisher` (async worker pool, never blocks the selector) and `RedisBackplaneSubscriber` (mailbox + `selector.wakeup()`). Each envelope carries `eventId`, `originNodeId`, `roomId`, `boardId`, and a full wire frame. `BackplaneEventDedup` (10-minute TTL, 50k cap) prevents double-apply on the originating node and on redelivery. `RoomManager` subscribes Redis channels when a room is first created locally.
+
+- **TCP Multiplayer Cursors (`CURSOR_SYNC` / `RemoteCursorManager`)** — clients publish cursor position over TCP at ~15 Hz (`CURSOR_SYNC_MIN_INTERVAL_MS = 66`). `RemoteCursorManager` renders peer cursors on the FX thread with LERP (`LERP_FACTOR = 0.3`), 2 s stale timeout, and 250 ms fade-out. `CursorSyncListener` bridges `NetworkClient` to the manager; cross-node peers receive the same frames via the Redis presence channel.
+
+- **Per-Session Write Backpressure** — `ClientSession.enqueue(frame, OutboundClass)` caps the outbound queue at **1024** frames. `OutboundClass.EPHEMERAL` frames (PONG, lobby fan-out, live stroke updates, `CURSOR_SYNC`) are **dropped** when full; `OutboundClass.CRITICAL` triggers `OVERFLOW_DISCONNECT` to protect server memory. Drops increment `ServerMetrics.FRAMES_DROPPED_TOTAL`.
+
+- **Prometheus Metrics Endpoint** — `NioServer` exposes `GET /metrics` on `METRICS_PORT` (default **8080**, bind retry on port conflict) returning `distrisync_frames_sent_total`, `distrisync_frames_dropped_total`, `distrisync_redis_messages_published`, and `distrisync_redis_messages_received`. Complements the existing 10 s `[METRICS]` Logback heartbeat.
+
+- **Load & Chaos Tooling (`com.distrisync.tools`)** — `BotSwarm` is a headless TCP load generator for horizontally scaled nodes (`serverIp port botCount roomId`). `SlowConsumerChaosTest` exercises slow-client backpressure behaviour against a live server.
+
 ---
 
 ## Project Structure
@@ -106,17 +118,33 @@ distrisync/
 │   │   │   │   ├── ShapeSpatialQuery.java
 │   │   │   │   ├── ShapeMathUtils.java
 │   │   │   │   ├── CanvasViewportResizeHandler.java
+│   │   │   │   ├── RemoteCursorManager.java
+│   │   │   │   ├── CursorSyncListener.java
 │   │   │   │   └── ToolsDrawerToggleModel.java
-│   │   │   ├── server/              # NIO server, room routing, WAL, canvas authority
+│   │   │   ├── server/              # NIO server, room routing, WAL, metrics, backplane
 │   │   │   │   ├── WhiteboardServer.java
 │   │   │   │   ├── NioServer.java
+│   │   │   │   ├── ServerEnvironment.java
+│   │   │   │   ├── ServerMetrics.java
+│   │   │   │   ├── ClientSession.java
+│   │   │   │   ├── EnqueueResult.java
+│   │   │   │   ├── OutboundClass.java
+│   │   │   │   ├── OutboundFrameHook.java
 │   │   │   │   ├── RoomManager.java
 │   │   │   │   ├── RoomContext.java
 │   │   │   │   ├── StorageLifecycleManager.java
 │   │   │   │   ├── WalManager.java
 │   │   │   │   ├── CanvasStateManager.java
-│   │   │   │   ├── ClientSession.java
-│   │   │   │   └── ShapeCodec.java
+│   │   │   │   ├── ShapeCodec.java
+│   │   │   │   └── backplane/
+│   │   │   │       ├── BackplaneEnvelope.java
+│   │   │   │       ├── BackplaneEnvelopeCodec.java
+│   │   │   │       ├── BackplaneEventDedup.java
+│   │   │   │       ├── RedisBackplanePublisher.java
+│   │   │   │       └── RedisBackplaneSubscriber.java
+│   │   │   ├── tools/               # Headless load / chaos utilities
+│   │   │   │   ├── BotSwarm.java
+│   │   │   │   └── SlowConsumerChaosTest.java
 │   │   │   ├── protocol/            # Binary framing and message type registry
 │   │   │   │   ├── MessageCodec.java
 │   │   │   │   ├── MessageType.java
@@ -143,6 +171,7 @@ distrisync/
 │           │   ├── NetworkClientTelemetryTest.java
 │           │   ├── ParticipantManagerTest.java
 │           │   ├── PointerStateTrackerTest.java
+│           │   ├── RemoteCursorManagerTest.java
 │           │   ├── ShapeMathUtilsTest.java
 │           │   ├── ToolsDrawerToggleModelTest.java
 │           │   ├── WhiteboardAppTestFxSupport.java
@@ -153,19 +182,28 @@ distrisync/
 │           ├── protocol/MessageCodecTest.java
 │           ├── resources/mockito-extensions/
 │           └── server/
+│               ├── backplane/          # Redis publisher/subscriber tests
 │               ├── CanvasStateManagerTest.java
+│               ├── ClientSessionBackpressureTest.java
+│               ├── MetricsHttpServerTest.java
+│               ├── NioServerDistributedHydrationTest.java
+│               ├── NioServerRemoteAuthorityTest.java
+│               ├── NioServerRemoteMailboxTest.java
 │               ├── NioServerTest.java
 │               ├── NioServerLifecycleTest.java
 │               ├── NioServerUdpRoutingBufferTest.java
 │               ├── RoomContextTest.java
 │               ├── RoomManagerTest.java
+│               ├── ServerEnvironmentTest.java
+│               ├── ServerMetricsFlushTest.java
 │               ├── ServerMetricsTest.java
 │               ├── ShapeCodecNewShapesTest.java
 │               └── WalManagerTest.java
 ├── docs/
 │   └── Architecture.md
-├── Dockerfile              # Multi-stage backend image (Maven → Temurin 21 JRE)
-├── docker-compose.yml      # distrisync-server: TCP+UDP 9090, WAL volume, restart policy
+├── Dockerfile                 # Multi-stage backend image (Maven → Temurin 21 JRE)
+├── docker-compose.yml         # Single-node: TCP+UDP 9090, WAL volume
+├── docker-compose.cluster.yml # Redis + node-a (9090) + node-b (9091)
 └── pom.xml
 ```
 
@@ -198,6 +236,9 @@ distrisync/
 | `ROOM_DELETED` | `0x15` | S → C | No | Empty payload notifying occupants that their room was deleted; clients clear room/board state and return to lobby |
 | `FETCH_LOBBY` | `0x16` | C → S | No | Empty JSON object `{}` requesting an immediate `LOBBY_STATE` response for this connection |
 | `VOICE_STATE` | `0x17` | C ↔ S | No | JSON object `{ clientId, isMuted }` — hardware microphone mute toggle; server validates `clientId` and relays to all room peers (not speaking activity) |
+| `STATE_REQUEST` | `0x18` | Backplane | No | Cold node requests room state hydration (`{}`); published on Redis room channel |
+| `STATE_SNAPSHOT` | `0x19` | Backplane | No | Hot node bulk board payload (same JSON array shape as `SNAPSHOT`); backplane hydration only |
+| `CURSOR_SYNC` | `0x1A` | C ↔ S | No | Ephemeral multiplayer cursor: `{ clientId, authorName, x, y }`; relayed in-room on TCP and via Redis `:presence` channel cross-node |
 
 ---
 
@@ -208,6 +249,7 @@ distrisync/
 | JDK | 21 (for local builds and the JavaFX client; not required on the host to *run* the server in Docker) |
 | Apache Maven | 3.8+ (or use the repository `mvnw` / `mvnw.cmd` wrapper) |
 | Docker Desktop (optional) | Recent **Docker Compose** v2 for containerised server |
+| Redis (optional) | **7+** when running multi-node cluster (`docker-compose.cluster.yml`) |
 | Network | Server and clients on the same subnet (UDP multicast for pointer presence) |
 
 > **Note:** For a local (non-Docker) server or client, ensure `JAVA_HOME` points to a JDK 21 installation. From the repository root, prefer the Maven wrapper: **`.\mvnw.cmd`** on Windows, **`./mvnw`** on macOS/Linux (instead of requiring a global `mvn` on `PATH`).
@@ -250,13 +292,37 @@ To build the image without starting a long-running container:
 docker compose build
 ```
 
+#### Option A2 — Docker Compose (two-node cluster + Redis)
+
+`docker-compose.cluster.yml` starts **Redis**, **node-a** (host `9090`), and **node-b** (host `9091`). Each node has its own WAL volume and `NODE_ID`; both point at the same `REDIS_HOST`.
+
+```powershell
+docker compose -f docker-compose.cluster.yml up --build
+```
+
+Connect clients to either `localhost:9090` or `localhost:9091` (same room id on both nodes once joined). Scrape Prometheus from each node at `http://localhost:8080/metrics` (inside the container; map `METRICS_PORT` in Compose if exposing to the host).
+
+| Service | Host ports | Environment |
+|---|---|---|
+| `redis` | `6379` | — |
+| `node-a` | `9090/tcp`, `9090/udp` | `NODE_ID=node-a`, `REDIS_HOST=redis` |
+| `node-b` | `9091/tcp`, `9091/udp` | `NODE_ID=node-b`, `REDIS_HOST=redis` |
+
 #### Option B — Maven or JAR on the host
 
 The server binds on TCP port **9090** by default. Optional positional arguments override **port** and **WAL directory** (see `WhiteboardServer` usage in source). For local runs, WAL files are typically under **`distrisync-data/`** in the working directory and are created on first use.
 
-**Default port (9090):**
+**Default port (9090), single-node (no Redis):**
 
 ```powershell
+.\mvnw.cmd exec:java "-Dexec.mainClass=com.distrisync.server.WhiteboardServer"
+```
+
+**With Redis backplane (local Redis on 6379):**
+
+```powershell
+$env:REDIS_HOST = "127.0.0.1"
+$env:NODE_ID = "local-dev"
 .\mvnw.cmd exec:java "-Dexec.mainClass=com.distrisync.server.WhiteboardServer"
 ```
 

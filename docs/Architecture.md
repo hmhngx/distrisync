@@ -22,7 +22,12 @@
 12. [Object Eraser & Spatial Hit-Testing](#12-object-eraser--spatial-hit-testing)
 13. [Participant Roster & Voice State](#13-participant-roster--voice-state)
 14. [Canvas Viewport & Global Drawing Context](#14-canvas-viewport--global-drawing-context)
-15. [Sequence Diagram — Two-Client Collaboration Flow](#15-sequence-diagram--two-client-collaboration-flow)
+15. [Redis Backplane — Horizontal Scaling](#15-redis-backplane--horizontal-scaling)
+16. [Remote Mailbox & Distributed Authority](#16-remote-mailbox--distributed-authority)
+17. [TCP Multiplayer Cursors (`CURSOR_SYNC`)](#17-tcp-multiplayer-cursors-cursor_sync)
+18. [Per-Session Write Backpressure](#18-per-session-write-backpressure)
+19. [Load & Chaos Tooling](#19-load--chaos-tooling)
+20. [Sequence Diagram — Two-Client Collaboration Flow](#20-sequence-diagram--two-client-collaboration-flow)
 
 ---
 
@@ -82,6 +87,9 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x15`    | `ROOM_DELETED`     | Server → Client      | No               | Forced room-eviction event. Empty payload; clients clear room/board state and return to lobby UI. |
 | `0x16`    | `FETCH_LOBBY`      | Client → Server      | No               | Pull-based lobby refresh request. Payload must be exactly `{}` (ignoring surrounding whitespace). |
 | `0x17`    | `VOICE_STATE`      | Client ↔ Server      | No               | Hardware mute toggle. Payload: `{ clientId, isMuted }`. Server validates `clientId` against session, then relays to all peers in the room via room-wide broadcast (not board-scoped). |
+| `0x18`    | `STATE_REQUEST`    | Backplane only       | No               | Cold node requests room hydration. Payload: `{}`. Published on `distrisync:room:{roomId}` when a room is first materialized locally. |
+| `0x19`    | `STATE_SNAPSHOT`   | Backplane only       | No               | Hot node bulk board payload (same JSON array shape as `SNAPSHOT`). Answers `STATE_REQUEST`; never accepted from TCP clients. |
+| `0x1A`    | `CURSOR_SYNC`      | Client ↔ Server      | No               | Ephemeral multiplayer cursor. Payload: `{ clientId, authorName, x, y }`. Relayed in-room on TCP; cross-node via Redis `:presence` channel (no WAL / dedup). |
 
 #### Shape Envelope Format (MUTATION / SNAPSHOT)
 
@@ -482,16 +490,20 @@ assert mgr.size() == 0;        // alice evicted
 
 This eliminates `Thread.sleep` in pointer eviction tests, making the entire test suite instant and deterministic.
 
-### 7.4 Current Runtime Cursor Path (`UdpPointerTracker`)
+### 7.4 Runtime Cursor Paths
 
-The active cursor implementation used by `WhiteboardApp` is `UdpPointerTracker`, which:
+DistriSync exposes **two** cursor presence mechanisms in parallel:
 
-1. Uses UDP multicast (`239.255.42.42:9292`) with datagrams like `UDP_POINTER|clientId|x|y|authorName`.
-2. Sends at 50 ms cadence (20 Hz) only when the mouse moved.
-3. Parses inbound packets on a dedicated receive thread and applies JavaFX node updates via `Platform.runLater`.
-4. Performs stale-cursor cleanup with fade-out animation on a scheduled cleanup loop.
+| Path | Transport | Rate | Client component |
+|---|---|---|---|
+| UDP multicast | `239.255.42.42:9292` | 20 Hz on move (50 ms cadence) | `UdpPointerTracker` — coloured dot + name badge |
+| TCP `CURSOR_SYNC` | Framed control channel | ~15 Hz (`CURSOR_SYNC_MIN_INTERVAL_MS = 66`) | `RemoteCursorManager` + `CursorSyncListener` |
 
-`PointerStateManager` is still valid and tested, but this code path currently manages pointer state directly in `UdpPointerTracker`.
+**UDP multicast** (`UdpPointerTracker`) sends datagrams like `UDP_POINTER|clientId|x|y|authorName` on a dedicated receive thread with `Platform.runLater` UI updates and fade-out stale cleanup. This path is independent of the TCP state machine; loss is acceptable.
+
+**TCP `CURSOR_SYNC`** (§17) is room-scoped, validated server-side (`clientId` must match session), and rendered with LERP smoothing (`LERP_FACTOR = 0.3`), a 2 s stale timeout, and 250 ms fade-out. In a multi-node deployment, the originating server also publishes cursor frames on the Redis **presence** channel so peers on other JVMs receive the same positions.
+
+`PointerStateManager` remains a unit-tested eviction utility (500 ms threshold); `UdpPointerTracker` manages multicast state directly rather than delegating to it.
 
 ---
 
@@ -636,7 +648,7 @@ log.info("[METRICS] Traffic routed: {} bytes | Active Rooms: {} | Active Sockets
         activeTcpSockets.get());
 ```
 
-`RoomManager.getActiveRoomCount()` returns `rooms.size()` — a thread-safe snapshot of the live room registry. No metrics framework (Micrometer, Dropwizard, Prometheus) is required; the structured `[METRICS]` prefix makes lines trivially parseable by log aggregators (Loki, Splunk, etc.) without any additional schema.
+`RoomManager.getActiveRoomCount()` returns `rooms.size()` — a thread-safe snapshot of the live room registry. The structured `[METRICS]` prefix makes lines trivially parseable by log aggregators (Loki, Splunk, etc.) without any additional schema. For scrape-based monitoring, see the Prometheus endpoint in §9.4.
 
 **Logback configuration:** `logback.xml` configures a CONSOLE appender with Jansi ANSI colour encoding and a rolling FILE appender (`logs/distrisync.log`, daily rollover, 7-day retention). The `com.distrisync` logger is set to `DEBUG`; all other loggers inherit the `INFO` root level.
 
@@ -664,6 +676,23 @@ All three segments are bound via JavaFX property expressions — no polling time
 | Ping | `client.pingProperty()` | `"Ping: —"` (while `< 0`) or `"Ping: Nms"` |
 
 The HUD is positioned using `AnchorPane` constraints and carries no mouse event handlers (`setMouseTransparent(true)`), ensuring it never interferes with canvas interaction. The `.telemetry-hud` CSS class sets a transparent background and 11 px monospace font; `.telemetry-pill` provides a subtle rounded-rectangle container with inner padding.
+
+---
+
+### 9.4 Prometheus Metrics Endpoint
+
+In addition to the Logback `[METRICS]` heartbeat (§9.2), `NioServer` starts a minimal embedded HTTP server on **`METRICS_PORT`** (environment variable, default **8080**). If the port is already bound, the server retries on successive ports up to a small cap.
+
+`GET /metrics` returns Prometheus text exposition (`ServerMetrics.PROMETHEUS_CONTENT_TYPE`) with four counters:
+
+| Counter | Incremented when |
+|---|---|
+| `distrisync_frames_sent_total` | A frame is successfully enqueued to a client write queue (per `OutboundFrameHook` callback) |
+| `distrisync_frames_dropped_total` | An `EPHEMERAL` frame is shed because the session queue is full |
+| `distrisync_redis_messages_published` | `RedisBackplanePublisher` completes a `PUBLISH` |
+| `distrisync_redis_messages_received` | `RedisBackplaneSubscriber` decodes an inbound envelope |
+
+`MetricsHttpServerTest` and `ServerMetricsFlushTest` lock the exposition format and counter wiring without a live Redis instance.
 
 ---
 
@@ -808,7 +837,154 @@ JavaFX clears `Canvas` pixel buffers when width or height change. `CanvasViewpor
 
 ---
 
-## 15. Sequence Diagram — Two-Client Collaboration Flow
+## 15. Redis Backplane — Horizontal Scaling
+
+When `ServerEnvironment.resolveRedisUri()` returns a value, `WhiteboardServer` constructs a stable **`NODE_ID`** (from `NODE_ID`, `DISTRISYNC_NODE_ID`, or a random UUID) and starts:
+
+| Component | Thread model | Responsibility |
+|---|---|---|
+| `RedisBackplanePublisher` | Fixed worker pool (4 threads) | Async `PUBLISH`; never blocks the selector |
+| `RedisBackplaneSubscriber` | Lettuce listener thread | Decodes envelopes → `remoteMailbox` + `selector.wakeup()` |
+| `BackplaneEventDedup` | Selector thread | Idempotent `eventId` guard (10 min TTL, 50k cap) |
+
+**Configuration precedence** (`ServerEnvironment`):
+
+1. `DISTRISYNC_REDIS_URI` — full URI, wins over host/port pair
+2. `redis://{REDIS_HOST}:{REDIS_PORT}` — port defaults to **6379**
+3. Absent Redis config → single-node mode (no backplane beans)
+
+**Channels** (`BackplaneEnvelopeCodec`):
+
+| Channel | Pattern | Payload |
+|---|---|---|
+| Room mutations | `distrisync:room:{roomId}` | `BackplaneEnvelope` JSON: `{ eventId, originNodeId, roomId, boardId, serializedPayload }` where `serializedPayload` is Base64 of a full wire frame |
+| Presence (cursors) | `distrisync:room:{roomId}:presence` | Same envelope shape; carries `CURSOR_SYNC` frames only |
+
+`RoomManager` calls `subscribeRoomChannels(roomId)` when a room is first created on a node so both channels are active before any cross-node traffic arrives.
+
+**Publish path (local mutation):**
+
+```
+Client ──TCP──► NioServer
+                  ├─► CanvasStateManager.applyMutation (LWW)
+                  ├─► WalManager.append (durable)
+                  ├─► broadcastToBoard (local TCP peers)
+                  └─► backplanePublisher.publish(BackplaneEnvelope)  [async worker]
+```
+
+The publisher pre-registers `eventId` in `BackplaneEventDedup` so when the envelope loops back through Redis the originating node skips re-application.
+
+**Dependency:** Lettuce **6.4.2.RELEASE** (see `pom.xml`).
+
+**Deployment:** `docker-compose.cluster.yml` runs `redis`, `node-a` (`9090`), and `node-b` (`9091` → container `9090`) with separate WAL volumes (`distrisync-data-a`, `distrisync-data-b`).
+
+---
+
+## 16. Remote Mailbox & Distributed Authority
+
+Cross-node frames are **never** applied on the Lettuce callback thread. `RedisBackplaneSubscriber` enqueues decoded `BackplaneEnvelope` records into `NioServer.remoteMailbox` (`ConcurrentLinkedQueue`) and calls `selector.wakeup()`.
+
+On each selector iteration, `drainRemoteMailbox()` polls until empty:
+
+```
+while (envelope = remoteMailbox.poll()) {
+    if (envelope.type == CURSOR_SYNC)
+        fanoutRemoteCursorSync(envelope);   // presence channel — no dedup, no WAL
+    else if (backplaneDedup.tryRecord(eventId))
+        fanoutRemoteEnvelope(envelope);     // apply authority + local TCP fan-out
+}
+```
+
+**`fanoutRemoteEnvelope`** re-enters the same code paths as a locally originated mutation:
+
+1. Decode the embedded wire frame from `serializedPayload`.
+2. For `MUTATION` / `SHAPE_DELETE` / `CLEAR_USER_SHAPES`: apply to `CanvasStateManager` (LWW), append to WAL, then `broadcastToBoard` to local sessions on the envelope's `boardId`.
+3. For `SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT` / `TEXT_UPDATE`: relay only (no WAL).
+4. Skip the originating TCP session when echoing.
+
+**Cold-node hydration (`STATE_REQUEST` / `STATE_SNAPSHOT`):**
+
+When a node first materialises a room locally, it publishes `STATE_REQUEST` (`0x18`, `{}`) on the room channel. A peer that already holds state responds with one `STATE_SNAPSHOT` (`0x19`) per active board — the payload is the same JSON array shape as a TCP `SNAPSHOT`. The requesting node applies each snapshot through `CanvasStateManager` without re-broadcasting to its own clients (they receive a normal TCP `SNAPSHOT` on `JOIN_ROOM`).
+
+`NioServerDistributedHydrationTest`, `NioServerRemoteAuthorityTest`, and `NioServerRemoteMailboxTest` cover hydration, LWW convergence across nodes, and mailbox ordering.
+
+---
+
+## 17. TCP Multiplayer Cursors (`CURSOR_SYNC`)
+
+**Wire format** (`MessageCodec`): `{ "clientId", "authorName", "x", "y" }` as JSON doubles for coordinates.
+
+**Client path:**
+
+```
+WhiteboardApp (mouse move)
+    └─► NetworkClient.maybeSendCursorSync(x, y)   // throttled ≥ 66 ms
+            └─► CURSOR_SYNC (0x1A) on TCP
+```
+
+**Server path (same node):**
+
+```
+CURSOR_SYNC received
+    ├─► validate handshake + clientId match
+    ├─► broadcastToRoom (EPHEMERAL) — local TCP peers
+    └─► publishPresenceEnvelope → Redis :presence channel
+```
+
+**Remote node:**
+
+```
+Redis :presence
+    └─► remoteMailbox
+            └─► fanoutRemoteCursorSync → EPHEMERAL broadcast (no dedup, no WAL)
+```
+
+**Rendering (`RemoteCursorManager`):**
+
+- Single `AnimationTimer` on the FX thread ticks LERP toward target `(x, y)` each frame.
+- Stale peers (> 2 s without update) trigger a 250 ms `FadeTransition` removal.
+- Local `clientId` is filtered so the user's own cursor is not duplicated.
+
+`CursorSyncListener` implements `CanvasUpdateListener` and forwards inbound `CURSOR_SYNC` messages from `NetworkClient` to the manager. `RemoteCursorManagerTest` validates LERP and stale eviction without JavaFX scene graph interaction where possible.
+
+---
+
+## 18. Per-Session Write Backpressure
+
+Each `ClientSession` maintains a bounded `ArrayDeque<ByteBuffer>` write queue capped at **`WRITE_QUEUE_CAPACITY = 1024`** frames. `enqueue(frame, OutboundClass)` returns an `EnqueueResult`:
+
+| Result | `EPHEMERAL` | `CRITICAL` |
+|---|---|---|
+| Queue has space | `ENQUEUED` | `ENQUEUED` |
+| Queue full | `DROPPED` (+ `FRAMES_DROPPED_TOTAL`) | `OVERFLOW_DISCONNECT` |
+
+**Classification** (representative; see `NioServer` call sites):
+
+| `OutboundClass` | Examples |
+|---|---|
+| `EPHEMERAL` | `PONG`, `SHAPE_UPDATE`, live stroke relays, `CURSOR_SYNC`, some lobby fan-out paths |
+| `CRITICAL` | `SNAPSHOT`, `MUTATION`, `SHAPE_DELETE`, `UDP_ADMISSION`, `ROOM_DELETED`, `HANDSHAKE` responses |
+
+`OVERFLOW_DISCONNECT` causes `NioServer` to close the `SelectionKey`, protecting heap from a slow consumer that cannot drain TCP writes. `ClientSessionBackpressureTest` asserts drop vs disconnect semantics; `SlowConsumerChaosTest` (§19) exercises this against a live server.
+
+`OutboundFrameHook` is injected into `NioServer` so tests can observe enqueue outcomes without a real socket.
+
+---
+
+## 19. Load & Chaos Tooling
+
+Package `com.distrisync.tools` provides headless utilities for cluster validation:
+
+| Class | Purpose |
+|---|---|
+| `BotSwarm` | Spawns N headless TCP clients that join a room and emit traffic (`main` args: `serverIp port botCount roomId`) |
+| `SlowConsumerChaosTest` | Connects a deliberately slow-reading client to trigger `EPHEMERAL` drops and `CRITICAL` disconnect paths |
+
+These tools complement the Surefire suite (`server/backplane/*`, `NioServerRemote*`, `ClientSessionBackpressureTest`) when validating horizontal scale on `docker-compose.cluster.yml`.
+
+---
+
+## 20. Sequence Diagram — Two-Client Collaboration Flow
 
 The diagram below shows the current lifecycle: handshake into lobby, explicit room join, board snapshot hydration (with lazy WAL replay on first board open), live draw relay, durable mutation, and distributed undo.
 
