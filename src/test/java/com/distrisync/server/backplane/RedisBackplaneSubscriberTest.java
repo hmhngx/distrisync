@@ -46,9 +46,11 @@ class RedisBackplaneSubscriberTest {
 
         byte[] roomChannel = BackplaneEnvelopeCodec.roomChannel("room-a").getBytes(StandardCharsets.UTF_8);
         byte[] presenceChannel = BackplaneEnvelopeCodec.presenceChannel("room-a").getBytes(StandardCharsets.UTF_8);
+        byte[] controlChannel = BackplaneEnvelopeCodec.controlChannel("room-a").getBytes(StandardCharsets.UTF_8);
         verify(redisClient).subscribe(eq(roomChannel));
         verify(redisClient).subscribe(eq(presenceChannel));
-        verify(redisClient, times(2)).subscribe(any());
+        verify(redisClient).subscribe(eq(controlChannel));
+        verify(redisClient, times(3)).subscribe(any());
     }
 
     @Test

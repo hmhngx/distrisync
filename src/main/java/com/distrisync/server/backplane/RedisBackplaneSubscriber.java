@@ -63,6 +63,7 @@ public final class RedisBackplaneSubscriber implements AutoCloseable {
         }
         subscribeChannel(BackplaneEnvelopeCodec.roomChannel(roomId));
         subscribeChannel(BackplaneEnvelopeCodec.presenceChannel(roomId));
+        subscribeChannel(BackplaneEnvelopeCodec.controlChannel(roomId));
     }
 
     private void subscribeChannel(String channel) {

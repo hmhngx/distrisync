@@ -32,6 +32,14 @@ public final class BackplaneEnvelopeCodec {
         return "distrisync:room:" + roomId + ":presence";
     }
 
+    /** Room control channel for cross-node moderation (no WAL). */
+    public static String controlChannel(String roomId) {
+        if (roomId == null || roomId.isBlank()) {
+            throw new IllegalArgumentException("roomId must not be blank");
+        }
+        return "distrisync:room:" + roomId + ":control";
+    }
+
     public static byte[] encode(BackplaneEnvelope envelope) {
         if (envelope == null) throw new IllegalArgumentException("envelope must not be null");
 
