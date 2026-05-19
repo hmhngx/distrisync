@@ -99,6 +99,23 @@
     -fx-text-fill: -fx-text-muted;
 }
 
+.session-revoked-overlay {
+    -fx-background-color: rgba(0, 0, 0, 0.85);
+}
+
+.session-revoked-message {
+    -fx-font-size: 18px;
+    -fx-font-weight: bold;
+    -fx-text-alignment: center;
+}
+
+.participant-revoke-speak-btn {
+    -fx-min-width: 28px;
+    -fx-min-height: 28px;
+    -fx-padding: 2 6 2 6;
+    -fx-font-size: 12px;
+}
+
 .login-root {
     -fx-background-color: -fx-bg-canvas;
 }
@@ -190,6 +207,159 @@
 
 .participant-mute-icon {
     -fx-alignment: center;
+}
+
+/* Collaboration roster — right slide-out sidebar */
+.collaboration-roster-chrome {
+    -fx-alignment: center-right;
+}
+
+.collaboration-roster {
+    -fx-background-color: -fx-surface-1;
+    -fx-background-radius: 10 0 0 10;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-width: 1 0 1 1;
+    -fx-border-radius: 10 0 0 10;
+    -fx-effect: dropshadow(two-pass-box, rgba(0, 0, 0, 0.28), 12, 0, -3, 0);
+}
+
+.roster-toggle-btn {
+    -fx-min-width: 26;
+    -fx-pref-width: 26;
+    -fx-max-width: 26;
+    -fx-min-height: 52;
+    -fx-pref-height: 52;
+    -fx-max-height: 52;
+    -fx-padding: 0;
+    -fx-font-size: 12px;
+    -fx-font-weight: bold;
+    -fx-text-fill: -fx-text-muted;
+    -fx-background-color: -fx-surface-1;
+    -fx-background-radius: 8 0 0 8;
+    -fx-border-color: -fx-border-subtle;
+    -fx-border-width: 1 0 1 1;
+    -fx-border-radius: 8 0 0 8;
+    -fx-cursor: hand;
+    -fx-effect: dropshadow(two-pass-box, rgba(0, 0, 0, 0.22), 8, 0, -2, 0);
+}
+
+.roster-toggle-btn:hover {
+    -fx-text-fill: -fx-text-main;
+    -fx-background-color: -fx-surface-2;
+}
+
+.roster-header {
+    -fx-padding: 0 0 8 0;
+}
+
+.roster-title {
+    -fx-text-fill: -fx-text-main;
+    -fx-font-size: 13px;
+    -fx-font-weight: bold;
+}
+
+.roster-board-lock-toggle {
+    -fx-text-fill: -fx-text-muted;
+    -fx-font-size: 14px;
+    -fx-background-color: transparent;
+    -fx-padding: 2 6 2 6;
+}
+
+.roster-board-lock-toggle:selected {
+    -fx-text-fill: -fx-text-main;
+}
+
+.roster-scroll {
+    -fx-background-color: transparent;
+    -fx-background: transparent;
+}
+
+.roster-scroll > .viewport {
+    -fx-background-color: transparent;
+}
+
+.roster-board-section {
+    -fx-spacing: 4;
+}
+
+.roster-board-header-row {
+    -fx-cursor: hand;
+    -fx-padding: 4 6 4 2;
+    -fx-background-radius: 6;
+    -fx-alignment: center-left;
+}
+
+.roster-board-header-row:hover {
+    -fx-background-color: -fx-surface-2;
+}
+
+.roster-board-section-collapsed .roster-board-header-row {
+    -fx-padding: 4 6 4 2;
+}
+
+.roster-board-chevron {
+    -fx-min-width: 20;
+    -fx-pref-width: 20;
+    -fx-max-width: 20;
+    -fx-padding: 0 2 0 0;
+    -fx-font-size: 11px;
+    -fx-text-fill: -fx-text-muted;
+    -fx-background-color: transparent;
+}
+
+.roster-board-header {
+    -fx-text-fill: -fx-text-muted;
+    -fx-font-size: 11px;
+    -fx-font-weight: 600;
+    -fx-padding: 0;
+}
+
+.roster-board-count {
+    -fx-text-fill: -fx-text-muted;
+    -fx-font-size: 10px;
+    -fx-opacity: 0.85;
+}
+
+.roster-board-members {
+    -fx-spacing: 0;
+}
+
+.roster-user-row {
+    -fx-padding: 2 0;
+    -fx-spacing: 6;
+}
+
+.roster-moderation-btn {
+    -fx-min-width: 22;
+    -fx-pref-width: 22;
+    -fx-max-width: 22;
+    -fx-padding: 0 2 0 2;
+    -fx-font-size: 14px;
+    -fx-text-fill: -fx-text-muted;
+    -fx-background-color: transparent;
+    -fx-cursor: hand;
+}
+
+.roster-moderation-btn:hover {
+    -fx-text-fill: -fx-text-main;
+    -fx-background-color: -fx-surface-2;
+    -fx-background-radius: 4;
+}
+
+.roster-user-name {
+    -fx-text-fill: -fx-text-main;
+    -fx-font-size: 12px;
+}
+
+.roster-crown-icon {
+    -fx-text-fill: #F59E0B;
+    -fx-font-size: 14px;
+}
+
+.roster-no-speak-icon,
+.roster-hw-mute-icon {
+    -fx-alignment: center;
+    -fx-opacity: 0.85;
 }
 
 /* Panels pinned to the workspace margin: drop border so layout aligns to StackPane inset (no inner inset). */

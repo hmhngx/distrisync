@@ -73,6 +73,23 @@ public final class RemoteCursorManager {
         }
     }
 
+    /**
+     * Immediately removes one remote peer's cursor. Must run on the FX Application Thread.
+     */
+    public void removePeer(String clientId) {
+        if (clientId == null || clientId.isBlank() || clientId.equals(localClientId)) {
+            return;
+        }
+        CursorTarget target = targets.remove(clientId);
+        Group node = nodes.remove(clientId);
+        if (target != null && target.activeFade != null) {
+            target.activeFade.stop();
+        }
+        if (node != null && node.getParent() != null) {
+            cursorPane.getChildren().remove(node);
+        }
+    }
+
     /** Removes all remote cursor nodes. Must run on the FX Application Thread. */
     public void clear() {
         for (Group node : nodes.values()) {
