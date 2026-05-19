@@ -27,7 +27,11 @@
 17. [TCP Multiplayer Cursors (`CURSOR_SYNC`)](#17-tcp-multiplayer-cursors-cursor_sync)
 18. [Per-Session Write Backpressure](#18-per-session-write-backpressure)
 19. [Load & Chaos Tooling](#19-load--chaos-tooling)
-20. [Sequence Diagram — Two-Client Collaboration Flow](#20-sequence-diagram--two-client-collaboration-flow)
+20. [Room RBAC — RoomPermissions](#20-room-rbac--roompermissions)
+21. [Host Election & ROLE_UPDATE](#21-host-election--role_update)
+22. [Moderation & SESSION_REVOKED](#22-moderation--session_revoked)
+23. [Collaboration Roster & Board Presence](#23-collaboration-roster--board-presence)
+24. [Sequence Diagram — Two-Client Collaboration Flow](#24-sequence-diagram--two-client-collaboration-flow)
 
 ---
 
@@ -76,8 +80,8 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x0A`    | `SHAPE_DELETE`     | Server → All peers   | **Yes**          | Server confirms deletion. Payload: `{ "shapeId": "<uuid>" }`. Broadcast to all peers except originator. |
 | `0x0B`    | `TEXT_UPDATE`      | Client → All peers   | No               | Ephemeral live-typing event. Payload: `{ objectId, clientId, authorName, x, y, currentText }`. Never written to `shapeMap`; final committed `TextNode` arrives as a `MUTATION`. |
 | `0x0C`    | `LOBBY_STATE`      | Server → Client      | No               | Room discovery snapshot. Payload: JSON array of `{ roomId, userCount }`, merged from active rooms plus persisted WAL stems. |
-| `0x0D`    | `JOIN_ROOM`        | Client → Server      | No               | Enter a room workspace. Payload: `{ roomId, initialBoardId? }` (legacy JSON string roomId accepted). |
-| `0x0E`    | `LEAVE_ROOM`       | Client → Server      | No               | Leave the active room and return to lobby. Empty payload. |
+| `0x0D`    | `JOIN_ROOM`        | Client ↔ Server      | No               | **Client→server:** `{ roomId, initialBoardId? }`. **Server→peers:** `{ clientId, authorName }` when a member joins. |
+| `0x0E`    | `LEAVE_ROOM`       | Client ↔ Server      | No               | **Client→server:** empty (return to lobby). **Server→peers:** JSON string `clientId` on depart / kick / disconnect. |
 | `0x0F`    | `SWITCH_BOARD`     | Client → Server      | No               | Switches the active board within the current room workspace. Payload: JSON string board id (e.g. `"Board-1"`). |
 | `0x10`    | `BOARD_LIST_UPDATE`| Server → Client      | No               | Announces room board-index changes for multi-board workspaces. Payload is a JSON array of board id strings. |
 | `0x11`    | `UDP_ADMISSION`    | Server → Client      | No               | Grants access to the UDP audio data plane; payload contains `{ udpToken }`. |
@@ -90,6 +94,11 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x18`    | `STATE_REQUEST`    | Backplane only       | No               | Cold node requests room hydration. Payload: `{}`. Published on `distrisync:room:{roomId}` when a room is first materialized locally. |
 | `0x19`    | `STATE_SNAPSHOT`   | Backplane only       | No               | Hot node bulk board payload (same JSON array shape as `SNAPSHOT`). Answers `STATE_REQUEST`; never accepted from TCP clients. |
 | `0x1A`    | `CURSOR_SYNC`      | Client ↔ Server      | No               | Ephemeral multiplayer cursor. Payload: `{ clientId, authorName, x, y }`. Relayed in-room on TCP; cross-node via Redis `:presence` channel (no WAL / dedup). |
+| `0x1B`    | `MODERATION_ACTION`| Client → Server / Backplane | No | `{ actionType, targetClientId, reason }`. Supported `actionType`: `KICK`, `REVOKE_SPEAK`, `GRANT_SPEAK`. Requires `PERM_MANAGE_USERS`. |
+| `0x1C`    | `SESSION_REVOKED`  | Server → Client      | No               | `{ reason }`. Sent to a kicked client; triggers lobby return and UI toast. |
+| `0x1D`    | `ROLE_UPDATE`      | Server → Client      | No               | `{ newHostClientId, newPermissions, roomHostClientId? }`. Syncs affected client permissions and room host id. |
+| `0x1E`    | `BOARD_SWITCH`     | Server → Room        | No               | `{ clientId, newBoardId }`. Room-wide active-board presence for roster grouping. |
+| `0x1F`    | `TOGGLE_BOARD_LOCK`| Client ↔ Server      | No               | `{ locked }`. Host sets `RoomContext.boardCreationLocked`; server broadcasts state to all room members. |
 
 #### Shape Envelope Format (MUTATION / SNAPSHOT)
 
@@ -780,25 +789,29 @@ performEraserAt(x, y)
 
 ---
 
-## 13. Participant Roster & Voice State
+## 13. Participant Roster, Voice State & Permissions
 
-DistriSync separates **hardware mute state** (TCP, reliable) from **speaking activity** (UDP audio, ephemeral).
+DistriSync separates **hardware mute state** (TCP, reliable) from **speaking activity** (UDP audio, ephemeral). **Room capabilities** are a third axis: an `int` permission bitmask on each `Participant` and `ClientSession`, enforced server-side and mirrored in the UI.
 
 ### 13.1 Data Model
 
 ```
 NetworkClient
-    └── ParticipantManager  (implements VoiceStateListener)
+    ├── RoomState                    ← boardCreationLocked (TOGGLE_BOARD_LOCK)
+    └── ParticipantManager           (implements VoiceStateListener)
+            ├── hostClientId         ← ROLE_UPDATE / join sync
             ├── ConcurrentHashMap<String, Participant> byClientId
             └── ObservableList<Participant> participants  ← FX binding surface
 
 Participant
     ├── StringProperty name
-    ├── BooleanProperty muted      ← VOICE_STATE
-    └── BooleanProperty speaking   ← UserSpeakingListener / setSpeaking
+    ├── BooleanProperty muted        ← VOICE_STATE
+    ├── BooleanProperty speaking     ← UserSpeakingListener / setSpeaking
+    ├── StringProperty currentBoardId← BOARD_SWITCH
+    └── IntegerProperty permissions  ← ROLE_UPDATE (RoomPermissions bitmask)
 ```
 
-`ParticipantListView` listens to `ObservableList` changes and maintains a `Map<String, ParticipantRow>` for incremental UI updates (add/remove without rebuilding the entire list).
+`ParticipantListView` provides compact HUD rows. `CollaborationRoster` is the primary slide-out presence UI: participants grouped by `currentBoardId`, host crown, moderation context menu, and board-lock toggle for hosts.
 
 ### 13.2 VOICE_STATE Wire Flow
 
@@ -816,6 +829,10 @@ Client A (mic muted)                NioServer                         Client B
 `MessageCodec.encodeVoiceState` / `decodeVoiceState` wrap `{ clientId, isMuted }`. The server rejects frames received before `HANDSHAKE` completion or with a `clientId` mismatch.
 
 `VoiceStateBroadcastTest` (integration) asserts relay semantics across two connected clients.
+
+### 13.3 Server-Side Speak Gate
+
+`NioServer.handleUdpRead` drops audio relay when `!RoomPermissions.canSpeak(speaker.permissions)`, independent of hardware mute (`VOICE_STATE`). `REVOKE_SPEAK` clears `PERM_SPEAK` and pushes `ROLE_UPDATE`; the client `AudioEngine` stops capture and disables the mic toggle.
 
 ---
 
@@ -859,8 +876,9 @@ When `ServerEnvironment.resolveRedisUri()` returns a value, `WhiteboardServer` c
 |---|---|---|
 | Room mutations | `distrisync:room:{roomId}` | `BackplaneEnvelope` JSON: `{ eventId, originNodeId, roomId, boardId, serializedPayload }` where `serializedPayload` is Base64 of a full wire frame |
 | Presence (cursors) | `distrisync:room:{roomId}:presence` | Same envelope shape; carries `CURSOR_SYNC` frames only |
+| Control (moderation / presence metadata) | `distrisync:room:{roomId}:control` | `MODERATION_ACTION`, `BOARD_SWITCH`, `TOGGLE_BOARD_LOCK` — no WAL |
 
-`RoomManager` calls `subscribeRoomChannels(roomId)` when a room is first created on a node so both channels are active before any cross-node traffic arrives.
+`RoomManager` calls `subscribeRoomChannels(roomId)` when a room is first created on a node so all three channels are active before any cross-node traffic arrives.
 
 **Publish path (local mutation):**
 
@@ -890,8 +908,12 @@ On each selector iteration, `drainRemoteMailbox()` polls until empty:
 while (envelope = remoteMailbox.poll()) {
     if (envelope.type == CURSOR_SYNC)
         fanoutRemoteCursorSync(envelope);   // presence channel — no dedup, no WAL
+    else if (envelope.type == MODERATION_ACTION)
+        applyRemoteModeration(envelope);    // control channel — KICK / speak toggles
+    else if (envelope.type == BOARD_SWITCH || envelope.type == TOGGLE_BOARD_LOCK)
+        applyRemoteRoomControl(envelope);   // control channel — roster / lock sync
     else if (backplaneDedup.tryRecord(eventId))
-        fanoutRemoteEnvelope(envelope);     // apply authority + local TCP fan-out
+        fanoutRemoteEnvelope(envelope);     // mutation channel — WAL + board fan-out
 }
 ```
 
@@ -984,7 +1006,130 @@ These tools complement the Surefire suite (`server/backplane/*`, `NioServerRemot
 
 ---
 
-## 20. Sequence Diagram — Two-Client Collaboration Flow
+## 20. Room RBAC — RoomPermissions
+
+`RoomPermissions` is a stateless bitmask utility — permission checks are a single `int` AND on the NIO hot path with no allocation.
+
+| Bit | Constant | Capability |
+|-----|----------|------------|
+| `1 << 0` | `PERM_DRAW` | `MUTATION`, live strokes, eraser undo |
+| `1 << 1` | `PERM_SPEAK` | UDP audio relay |
+| `1 << 2` | `PERM_MANAGE_USERS` | `MODERATION_ACTION` |
+| `1 << 3` | `PERM_DELETE_ROOM` | `DELETE_ROOM` |
+| `1 << 4` | `PERM_MANAGE_ROOM` | `TOGGLE_BOARD_LOCK`, override board lock on join |
+
+| Preset | Value | Typical holder |
+|--------|-------|----------------|
+| `OWNER` | all bits | Room host |
+| `MEMBER` | draw + speak | Default joiner |
+| `SPECTATOR` | `0` | Lobby |
+
+`ClientSession.permissions` resets to `SPECTATOR` on `HANDSHAKE` and `LEAVE_ROOM`. Join assigns `MEMBER` unless the client is the room creator (first joiner → `OWNER` + `hostClientId`).
+
+`NioServerRbacTest` and `RoomPermissionsTest` lock deny paths for draw, speak, moderation, and board-lock commands.
+
+---
+
+## 21. Host Election & ROLE_UPDATE
+
+Each `RoomContext` stores `hostClientId`. When the host's TCP session closes, `migrateHostIfNeeded` runs on the selector thread:
+
+```
+newHost = selectHostCandidate(room)
+    // minimum connectedAtMillis; tie-break lexicographic clientId
+
+newHost.permissions = OWNER
+room.hostClientId = newHost.clientId
+broadcast ROLE_UPDATE to every local room session
+```
+
+`RoleUpdatePayload` fields:
+
+| Field | Meaning |
+|-------|---------|
+| `newHostClientId` | Affected client's id (also used as permission target in moderation flows) |
+| `newPermissions` | Updated bitmask for that client |
+| `roomHostClientId` | Optional; set on join sync so clients learn the current host |
+
+`HostElectionTest` and `NioServerHostMigrationTest` cover tie-breaking and promotion after host disconnect.
+
+---
+
+## 22. Moderation & SESSION_REVOKED
+
+### 22.1 MODERATION_ACTION Flow
+
+```
+Moderator (PERM_MANAGE_USERS)
+    └─► MODERATION_ACTION { actionType, targetClientId, reason }
+            ├─► NioServer (local authority)
+            │       ├─ KICK → disconnect target, SESSION_REVOKED to victim,
+            │       │         LEAVE_ROOM broadcast to room
+            │       ├─ REVOKE_SPEAK → clear PERM_SPEAK, ROLE_UPDATE to target
+            │       └─ GRANT_SPEAK  → set PERM_SPEAK, ROLE_UPDATE to target
+            └─► backplanePublisher.publishControl (cluster)
+                    └─► peer nodes: applyRemoteModeration on selector thread
+```
+
+### 22.2 Action Semantics
+
+| `actionType` | Server effect | Target client |
+|--------------|---------------|---------------|
+| `KICK` | Force disconnect; fan-out peer `LEAVE_ROOM` | `SESSION_REVOKED` + lobby UI |
+| `REVOKE_SPEAK` | `permissions &= ~PERM_SPEAK` | `ROLE_UPDATE`; mic hardware stopped |
+| `GRANT_SPEAK` | `permissions \|= PERM_SPEAK` | `ROLE_UPDATE`; mic re-enabled |
+
+Owners (`canDeleteRoom`) cannot be kicked or have speak revoked. Unsupported `actionType` values are logged and ignored.
+
+`NioServerModerationKickTest`, `NioServerModerationRevokeSpeakTest`, and `NioServerModerationGrantSpeakTest` assert local and backplane paths. `MessageCodecModerationTest` locks JSON contracts.
+
+---
+
+## 23. Collaboration Roster & Board Presence
+
+### 23.1 BOARD_SWITCH (room-wide board presence)
+
+When a client completes `SWITCH_BOARD`, `NioServer` updates `ClientSession.currentBoardId` and broadcasts:
+
+```
+BOARD_SWITCH { clientId, newBoardId }  →  all room TCP sessions
+```
+
+`ParticipantManager` updates `Participant.currentBoardId`; `CollaborationRoster.rebuildSections()` regroups avatars under board headers without a full reconnect. Cross-node: published on the Redis **control** channel and applied via `applyRemoteRoomControl`.
+
+### 23.2 TOGGLE_BOARD_LOCK
+
+`RoomContext.isBoardCreationLocked` defaults **true**. Hosts with `PERM_MANAGE_ROOM` send `TOGGLE_BOARD_LOCK { locked }`; the server sets the flag and broadcasts the same frame room-wide. `NetworkClient.RoomState` mirrors the flag for the roster lock toggle.
+
+While locked, members requesting a non-existent `initialBoardId` on `JOIN_ROOM` are redirected to an existing board (`resolveJoinBoardId`). `NioServerBoardLockTest` and `NioServerJoinRoleUpdateTest` cover lock and join permission sync.
+
+### 23.3 CollaborationRoster UI
+
+| Concern | Implementation |
+|---------|----------------|
+| Layout | Right-aligned slide-out (`VIEW_ID = collaboration-roster`), 250 px panel |
+| Grouping | `VBox` sections per `currentBoardId`, expand/collapse preserved across rebuilds |
+| Host indicator | Crown on row where `clientId == hostClientId` |
+| Moderation menu | Context menu: Kick, Revoke Speak, Grant Speak — visible when local `PERM_MANAGE_USERS` |
+| Feedback | `ToastNotification` for kicks, speak changes, session revoked |
+| Board lock | Toggle bound to `RoomState.boardCreationLockedProperty()` |
+
+`CollaborationRosterModerationTest`, `WhiteboardAppModerationUiTest`, and `WhiteboardAppPermissionsTest` lock menu visibility and handler wiring without a manual pass.
+
+### 23.4 Bidirectional JOIN_ROOM / LEAVE_ROOM
+
+| Direction | Payload | When |
+|-----------|---------|------|
+| C→S `JOIN_ROOM` | `{ roomId, initialBoardId? }` | Client enters room |
+| S→peer `JOIN_ROOM` | `{ clientId, authorName }` | Member joined |
+| C→S `LEAVE_ROOM` | `""` | Client returns to lobby |
+| S→peer `LEAVE_ROOM` | `"clientId"` | Member left, disconnected, or kicked |
+
+`RoomMembershipListener` and `NioServerRoomMembershipBroadcastTest` cover peer join/leave fan-out.
+
+---
+
+## 24. Sequence Diagram — Two-Client Collaboration Flow
 
 The diagram below shows the current lifecycle: handshake into lobby, explicit room join, board snapshot hydration (with lazy WAL replay on first board open), live draw relay, durable mutation, and distributed undo.
 
@@ -1075,7 +1220,7 @@ sequenceDiagram
 
 | Step | What is happening |
 |------|-------------------|
-| 1–10 | Client connects, sends `HANDSHAKE`, enters lobby, and then sends `JOIN_ROOM`. `SNAPSHOT` is sent only after join processing. |
+| 1–10 | Client connects, sends `HANDSHAKE`, enters lobby, and then sends `JOIN_ROOM`. `SNAPSHOT` is sent only after join processing. First joiner receives `OWNER` permissions and becomes `hostClientId`. Peers receive server→client `JOIN_ROOM` membership notifications. |
 | 11–16 | Board hydration happens lazily: opening a board triggers `WalManager.recover(roomId, boardId)` replay for that board only. |
 | 17–19 | `PING`/`PONG` runs continuously after handshake; client computes RTT from echoed origin timestamp. |
 | 20–27 | Live draw (`SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT`) is relayed only, not persisted. |

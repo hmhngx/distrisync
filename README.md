@@ -17,7 +17,9 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 **Workspace Boards:** Rooms now support multiple isolated boards within a single shared space. Each board maintains its own independent `CanvasStateManager` and Write-Ahead Log (`{roomId}_{boardId}.wal`), enabling zero-overhead board creation and persistent recovery. Clients receive a `BOARD_LIST_UPDATE` on join and whenever a new board is created; the `SWITCH_BOARD` message allows in-room navigation between boards. Shape mutations are scoped to the active board and broadcast only to connected peers viewing the same board, preventing cross-board interference. A Figma-style Task View board switcher with live thumbnails facilitates rapid board discovery and navigation.
 
-**Horizontal scaling:** Multiple `NioServer` JVMs can share room state through an optional **Redis Pub/Sub backplane** (Lettuce). After a local WAL commit, mutations are published as `BackplaneEnvelope` records on `distrisync:room:{roomId}`; peer nodes apply them idempotently via `BackplaneEventDedup` and fan out to local TCP clients. Ephemeral cursor positions use `CURSOR_SYNC` on TCP and a dedicated Redis presence channel (`distrisync:room:{roomId}:presence`) for cross-node relay. Cold nodes request hydration with `STATE_REQUEST` / `STATE_SNAPSHOT` backplane events. Configure via `REDIS_HOST` + `REDIS_PORT` or `DISTRISYNC_REDIS_URI`, and `NODE_ID` / `DISTRISYNC_NODE_ID`.
+**Horizontal scaling:** Multiple `NioServer` JVMs can share room state through an optional **Redis Pub/Sub backplane** (Lettuce). After a local WAL commit, mutations are published as `BackplaneEnvelope` records on `distrisync:room:{roomId}`; peer nodes apply them idempotently via `BackplaneEventDedup` and fan out to local TCP clients. Ephemeral cursor positions use `CURSOR_SYNC` on TCP and a dedicated Redis presence channel (`distrisync:room:{roomId}:presence`) for cross-node relay. Room-level moderation and board-presence events use a third **control** channel (`distrisync:room:{roomId}:control`). Cold nodes request hydration with `STATE_REQUEST` / `STATE_SNAPSHOT` backplane events. Configure via `REDIS_HOST` + `REDIS_PORT` or `DISTRISYNC_REDIS_URI`, and `NODE_ID` / `DISTRISYNC_NODE_ID`.
+
+**Room governance:** Each room has a **host** (`RoomContext.hostClientId`) with full `RoomPermissions.OWNER` capabilities. Permissions are a zero-allocation `int` bitmask (`PERM_DRAW`, `PERM_SPEAK`, `PERM_MANAGE_USERS`, `PERM_DELETE_ROOM`, `PERM_MANAGE_ROOM`). The server enforces RBAC on the NIO hot path (drawing, UDP audio relay, moderation, board-lock toggles). When the host disconnects, `selectHostCandidate` elects the oldest connected session (lexicographic `clientId` tie-break) and broadcasts `ROLE_UPDATE` to all peers. Moderators with `PERM_MANAGE_USERS` can **KICK**, **REVOKE_SPEAK**, or **GRANT_SPEAK** via `MODERATION_ACTION`; kicked clients receive `SESSION_REVOKED` and return to the lobby.
 
 ---
 
@@ -69,13 +71,23 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Global Canvas Context & Shape Factory** — `GlobalCanvasContext` centralises active stroke colour (`ObjectProperty<Color>`), stroke width (`DoubleProperty`), and eraser brush geometry (`EraserType` circle vs square). `GlobalCanvasShapeFactory` commits `Line`, `Circle`, `RectangleNode`, `EllipseNode`, `ArrowNode`, and `TextNode` instances using the current context, keeping the properties bar and network payloads consistent.
 
-- **Participant Roster HUD (`ParticipantManager` / `ParticipantListView`)** — each `NetworkClient` owns a `ParticipantManager` that maintains an `ObservableList<Participant>` keyed by `clientId`. `ParticipantListView` binds to the list and renders per-peer rows with mute and speaking indicators. Hardware mute state is synchronised over TCP via `VOICE_STATE` (`0x17`, payload `{ clientId, isMuted }`); live speaking activity remains on the UDP audio path (`UserSpeakingListener` → `setSpeaking`). `wireParticipantHud()` integrates the roster into the in-room chrome.
+- **Room RBAC (`RoomPermissions`)** — bitmask permissions on `ClientSession` and `Participant`. `OWNER` grants draw, speak, manage users, delete room, and manage room settings; `MEMBER` grants draw + speak; `SPECTATOR` is lobby-only. Server rejects `MUTATION` / live strokes without `PERM_DRAW`, UDP audio without `PERM_SPEAK`, `MODERATION_ACTION` without `PERM_MANAGE_USERS`, and `TOGGLE_BOARD_LOCK` without `PERM_MANAGE_ROOM`.
+
+- **Host Election & `ROLE_UPDATE`** — first joiner becomes host with `OWNER` permissions. On host disconnect, `NioServer.selectHostCandidate` promotes the longest-connected peer and fans out `ROLE_UPDATE` (`0x1D`, `{ newHostClientId, newPermissions, roomHostClientId? }`) so every client updates crowns and local capability flags.
+
+- **Moderation (`MODERATION_ACTION` / `SESSION_REVOKED`)** — hosts and moderators send `MODERATION_ACTION` (`0x1B`) with `actionType` `KICK`, `REVOKE_SPEAK`, or `GRANT_SPEAK`. Commands publish on the Redis control channel in cluster mode. **KICK** disconnects the target and broadcasts peer `LEAVE_ROOM`; the victim receives `SESSION_REVOKED` (`0x1C`, `{ reason }`). **REVOKE_SPEAK** / **GRANT_SPEAK** toggle `PERM_SPEAK` and push `ROLE_UPDATE` to the affected client; `AudioEngine` hard-stops capture when speak is revoked.
+
+- **Collaboration Roster (`CollaborationRoster`)** — slide-out panel grouped by active board (`Participant.currentBoardId`), host crown indicators, mute/speaking badges, and a context menu (Kick / Revoke Speak / Grant Speak) when `PERM_MANAGE_USERS` is held. Integrates `ParticipantManager`, `RoomState`, and `ToastNotification` for moderation feedback. `ParticipantListView` remains for compact HUD rows; `wireCollaborationRoster()` is the primary in-room presence UI.
+
+- **Board Presence & Lock (`BOARD_SWITCH` / `TOGGLE_BOARD_LOCK`)** — when a peer switches boards, the server broadcasts `BOARD_SWITCH` (`0x1E`, `{ clientId, newBoardId }`) room-wide so the roster regroups without polling. Hosts toggle `RoomContext.boardCreationLocked` via `TOGGLE_BOARD_LOCK` (`0x1F`, `{ locked }`); members cannot create new boards while locked and fall back to an existing board on join. `RoomState.boardCreationLockedProperty()` drives the roster lock control.
+
+- **Bidirectional Room Membership (`JOIN_ROOM` / `LEAVE_ROOM`)** — client→server `JOIN_ROOM` carries `{ roomId, initialBoardId? }`; server→peer `JOIN_ROOM` notifies `{ clientId, authorName }`. Client→server `LEAVE_ROOM` is empty; server→peer `LEAVE_ROOM` carries the departing `clientId` string (including moderation kicks and disconnects).
 
 - **Canvas Viewport Resize Coalescing** — `CanvasViewportResizeHandler` listens to the canvas container's width/height properties and coalesces invalidations into a single `Platform.runLater` redraw, avoiding redundant full-canvas repaints when JavaFX resizes the `Canvas` surface (which would otherwise clear pixel buffers at 0×0 during layout).
 
 - **Properties Bar & Floating Tool Chrome** — `styles.css` defines a Tailwind-inspired properties bar (colour picker, stroke slider, eraser-type toggles) and floating tool-dock layout. Extensive `WhiteboardApp*` TestFX/Mockito tests (`WhiteboardAppPropertiesBarTest`, `WhiteboardAppToolDockTest`, `WhiteboardAppFloatingLayoutTest`, etc.) lock layout IDs and interaction contracts without a manual QA pass.
 
-- **Redis Backplane (Multi-Node Fan-Out)** — when `ServerEnvironment.resolveRedisUri()` is set, `WhiteboardServer` starts `RedisBackplanePublisher` (async worker pool, never blocks the selector) and `RedisBackplaneSubscriber` (mailbox + `selector.wakeup()`). Each envelope carries `eventId`, `originNodeId`, `roomId`, `boardId`, and a full wire frame. `BackplaneEventDedup` (10-minute TTL, 50k cap) prevents double-apply on the originating node and on redelivery. `RoomManager` subscribes Redis channels when a room is first created locally.
+- **Redis Backplane (Multi-Node Fan-Out)** — when `ServerEnvironment.resolveRedisUri()` is set, `WhiteboardServer` starts `RedisBackplanePublisher` (async worker pool, never blocks the selector) and `RedisBackplaneSubscriber` (mailbox + `selector.wakeup()`). Each envelope carries `eventId`, `originNodeId`, `roomId`, `boardId`, and a full wire frame. Three channels per room: mutations (`distrisync:room:{roomId}`), presence (`:presence` for `CURSOR_SYNC`), and control (`:control` for `MODERATION_ACTION`, `BOARD_SWITCH`, `TOGGLE_BOARD_LOCK`). `BackplaneEventDedup` (10-minute TTL, 50k cap) prevents double-apply on the originating node and on redelivery. `RoomManager` subscribes all channels when a room is first created locally.
 
 - **TCP Multiplayer Cursors (`CURSOR_SYNC` / `RemoteCursorManager`)** — clients publish cursor position over TCP at ~15 Hz (`CURSOR_SYNC_MIN_INTERVAL_MS = 66`). `RemoteCursorManager` renders peer cursors on the FX thread with LERP (`LERP_FACTOR = 0.3`), 2 s stale timeout, and 250 ms fade-out. `CursorSyncListener` bridges `NetworkClient` to the manager; cross-node peers receive the same frames via the Redis presence channel.
 
@@ -94,7 +106,7 @@ distrisync/
 ├── src/
 │   ├── main/
 │   │   ├── java/com/distrisync/
-│   │   │   ├── client/              # JavaFX UI, TCP client, audio, spatial tools, participant HUD
+│   │   │   ├── client/              # JavaFX UI, TCP client, audio, roster, moderation
 │   │   │   │   ├── WhiteboardApp.java
 │   │   │   │   ├── NetworkClient.java
 │   │   │   │   ├── WhiteboardClient.java
@@ -110,6 +122,13 @@ distrisync/
 │   │   │   │   ├── Participant.java
 │   │   │   │   ├── ParticipantManager.java
 │   │   │   │   ├── ParticipantListView.java
+│   │   │   │   ├── CollaborationRoster.java
+│   │   │   │   ├── RoomState.java
+│   │   │   │   ├── ToastNotification.java
+│   │   │   │   ├── RoomMembershipListener.java
+│   │   │   │   ├── RoleUpdateListener.java
+│   │   │   │   ├── SessionRevokedListener.java
+│   │   │   │   ├── BoardPresenceListener.java
 │   │   │   │   ├── GlobalCanvasContext.java
 │   │   │   │   ├── GlobalCanvasShapeFactory.java
 │   │   │   │   ├── EraserType.java
@@ -145,9 +164,10 @@ distrisync/
 │   │   │   ├── tools/               # Headless load / chaos utilities
 │   │   │   │   ├── BotSwarm.java
 │   │   │   │   └── SlowConsumerChaosTest.java
-│   │   │   ├── protocol/            # Binary framing and message type registry
+│   │   │   ├── protocol/            # Binary framing, message types, RBAC bitmasks
 │   │   │   │   ├── MessageCodec.java
 │   │   │   │   ├── MessageType.java
+│   │   │   │   ├── RoomPermissions.java
 │   │   │   │   ├── Message.java
 │   │   │   │   └── PartialMessageException.java
 │   │   │   └── model/               # Sealed shape hierarchy
@@ -170,6 +190,7 @@ distrisync/
 │           │   ├── EraserSpatialIntersectionTest.java
 │           │   ├── NetworkClientTelemetryTest.java
 │           │   ├── ParticipantManagerTest.java
+│           │   ├── CollaborationRosterModerationTest.java
 │           │   ├── PointerStateTrackerTest.java
 │           │   ├── RemoteCursorManagerTest.java
 │           │   ├── ShapeMathUtilsTest.java
@@ -179,7 +200,10 @@ distrisync/
 │           ├── integration/
 │           │   ├── ClientServerIntegrationTest.java
 │           │   └── VoiceStateBroadcastTest.java
-│           ├── protocol/MessageCodecTest.java
+│           ├── protocol/
+│           │   ├── MessageCodecTest.java
+│           │   ├── MessageCodecModerationTest.java
+│           │   └── RoomPermissionsTest.java
 │           ├── resources/mockito-extensions/
 │           └── server/
 │               ├── backplane/          # Redis publisher/subscriber tests
@@ -189,6 +213,17 @@ distrisync/
 │               ├── NioServerDistributedHydrationTest.java
 │               ├── NioServerRemoteAuthorityTest.java
 │               ├── NioServerRemoteMailboxTest.java
+│               ├── NioServerRbacTest.java
+│               ├── NioServerModerationKickTest.java
+│               ├── NioServerModerationRevokeSpeakTest.java
+│               ├── NioServerModerationGrantSpeakTest.java
+│               ├── NioServerHostMigrationTest.java
+│               ├── NioServerJoinRoleUpdateTest.java
+│               ├── NioServerRoomMembershipBroadcastTest.java
+│               ├── NioServerBoardPresenceTest.java
+│               ├── NioServerBoardLockTest.java
+│               ├── HostElectionTest.java
+│               ├── RoomContextClientIndexTest.java
 │               ├── NioServerTest.java
 │               ├── NioServerLifecycleTest.java
 │               ├── NioServerUdpRoutingBufferTest.java
@@ -225,8 +260,8 @@ distrisync/
 | `SHAPE_DELETE` | `0x0A` | S → C | **Yes** | Broadcast shape removal after undo |
 | `TEXT_UPDATE` | `0x0B` | C ↔ S | No | Live text ghost preview; relayed to board peers, not persisted |
 | `LOBBY_STATE` | `0x0C` | S → C | No | JSON array of `{ roomId, userCount }` for room discovery |
-| `JOIN_ROOM` | `0x0D` | C → S | No | JSON object `{ roomId, initialBoardId? }` (legacy JSON string roomId accepted); defaults to `Board-1` |
-| `LEAVE_ROOM` | `0x0E` | C → S | No | Return from a room to lobby (empty payload) |
+| `JOIN_ROOM` | `0x0D` | C ↔ S | No | **C→S:** `{ roomId, initialBoardId? }` (legacy string roomId accepted). **S→peers:** `{ clientId, authorName }` on member join |
+| `LEAVE_ROOM` | `0x0E` | C ↔ S | No | **C→S:** return to lobby (empty). **S→peers:** JSON string `clientId` when a member leaves or is kicked |
 | `SWITCH_BOARD` | `0x0F` | C → S | No | JSON string target board id; server responds with `SNAPSHOT` |
 | `BOARD_LIST_UPDATE` | `0x10` | S → C | No | JSON array of board id strings actively in use within the room |
 | `UDP_ADMISSION` | `0x11` | S → C | No | JSON object `{ udpToken }` granting access to the UDP audio data plane; client calls `AudioEngine.onUdpAdmission()` on receipt |
@@ -239,6 +274,11 @@ distrisync/
 | `STATE_REQUEST` | `0x18` | Backplane | No | Cold node requests room state hydration (`{}`); published on Redis room channel |
 | `STATE_SNAPSHOT` | `0x19` | Backplane | No | Hot node bulk board payload (same JSON array shape as `SNAPSHOT`); backplane hydration only |
 | `CURSOR_SYNC` | `0x1A` | C ↔ S | No | Ephemeral multiplayer cursor: `{ clientId, authorName, x, y }`; relayed in-room on TCP and via Redis `:presence` channel cross-node |
+| `MODERATION_ACTION` | `0x1B` | C → S / Backplane | No | `{ actionType, targetClientId, reason }` — `KICK`, `REVOKE_SPEAK`, or `GRANT_SPEAK`; requires `PERM_MANAGE_USERS` |
+| `SESSION_REVOKED` | `0x1C` | S → C | No | `{ reason }` — target session ended by moderation; client returns to lobby |
+| `ROLE_UPDATE` | `0x1D` | S → C | No | `{ newHostClientId, newPermissions, roomHostClientId? }` — permission sync / host migration |
+| `BOARD_SWITCH` | `0x1E` | S → room | No | `{ clientId, newBoardId }` — peer active board for roster grouping |
+| `TOGGLE_BOARD_LOCK` | `0x1F` | C ↔ S | No | **C→S:** `{ locked }` (host). **S→room:** broadcast current lock; gates new board creation for members |
 
 ---
 
