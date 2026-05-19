@@ -430,6 +430,93 @@ public final class MessageCodec {
     }
 
     /**
+     * Server→client {@code JOIN_ROOM}: notifies peers that a member entered the room.
+     */
+    public record RoomMemberJoinedPayload(String clientId, String authorName) {}
+
+    /**
+     * Encodes server→client {@code JOIN_ROOM} with {@code { clientId, authorName }}.
+     */
+    public static ByteBuffer encodeRoomMemberJoined(String clientId, String authorName) {
+        if (clientId == null) throw new IllegalArgumentException("clientId must not be null");
+        JsonObject o = new JsonObject();
+        o.addProperty("clientId", clientId);
+        o.addProperty("authorName", authorName != null ? authorName : "");
+        return encode(new Message(MessageType.JOIN_ROOM, GSON.toJson(o)));
+    }
+
+    /**
+     * Decodes server→client {@code JOIN_ROOM} peer-join notification.
+     *
+     * @throws IllegalArgumentException if payload is not a {@code { clientId, authorName }} object
+     */
+    public static RoomMemberJoinedPayload decodeRoomMemberJoined(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.JOIN_ROOM) {
+            throw new IllegalArgumentException("expected JOIN_ROOM, got " + msg.type());
+        }
+        String raw = msg.payload();
+        if (raw == null || raw.isBlank()) {
+            throw new IllegalArgumentException("JOIN_ROOM peer-join payload is blank");
+        }
+        try {
+            var el = JsonParser.parseString(raw.strip());
+            if (!el.isJsonObject()) {
+                throw new IllegalArgumentException("JOIN_ROOM peer-join payload must be a JSON object");
+            }
+            JsonObject o = el.getAsJsonObject();
+            if (o.has("roomId") && !o.get("roomId").isJsonNull()) {
+                throw new IllegalArgumentException("JOIN_ROOM payload is a client join request, not peer-join");
+            }
+            if (!o.has("clientId") || o.get("clientId").isJsonNull()) {
+                throw new IllegalArgumentException("JOIN_ROOM peer-join missing clientId");
+            }
+            String cid = o.get("clientId").getAsString().strip();
+            if (cid.isBlank()) {
+                throw new IllegalArgumentException("JOIN_ROOM peer-join clientId is blank");
+            }
+            String name = "";
+            if (o.has("authorName") && !o.get("authorName").isJsonNull()) {
+                name = o.get("authorName").getAsString();
+            }
+            return new RoomMemberJoinedPayload(cid, name);
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Malformed JOIN_ROOM peer-join: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Encodes server→client {@code LEAVE_ROOM} with a JSON string {@code clientId} payload.
+     */
+    public static ByteBuffer encodeRoomMemberLeft(String clientId) {
+        if (clientId == null) throw new IllegalArgumentException("clientId must not be null");
+        return encode(new Message(MessageType.LEAVE_ROOM, GSON.toJson(clientId)));
+    }
+
+    /**
+     * Decodes server→client {@code LEAVE_ROOM} peer-depart notification.
+     *
+     * @throws IllegalArgumentException if payload is empty or not a JSON string clientId
+     */
+    public static String decodeRoomMemberLeft(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.LEAVE_ROOM) {
+            throw new IllegalArgumentException("expected LEAVE_ROOM, got " + msg.type());
+        }
+        String raw = msg.payload();
+        if (raw == null || raw.isBlank()) {
+            throw new IllegalArgumentException("LEAVE_ROOM peer-depart payload is blank");
+        }
+        String clientId = GSON.fromJson(raw.strip(), String.class);
+        if (clientId == null || clientId.isBlank()) {
+            throw new IllegalArgumentException("LEAVE_ROOM peer-depart clientId is blank");
+        }
+        return clientId.strip();
+    }
+
+    /**
      * Encodes {@code FETCH_LOBBY} with the required empty JSON object body {@code {}}.
      */
     public static ByteBuffer encodeFetchLobby() {
@@ -746,6 +833,185 @@ public final class MessageCodec {
         CursorSyncPayload p = GSON.fromJson(msg.payload(), CursorSyncPayload.class);
         if (p == null || p.clientId() == null) {
             throw new IllegalArgumentException("CURSOR_SYNC missing clientId");
+        }
+        return p;
+    }
+
+    // -------------------------------------------------------------------------
+    // MODERATION_ACTION / SESSION_REVOKED
+    // -------------------------------------------------------------------------
+
+    /**
+     * JSON body for {@link MessageType#MODERATION_ACTION}: cluster-wide user moderation command.
+     */
+    public record ModerationActionPayload(String actionType, String targetClientId, String reason) {}
+
+    public static ByteBuffer encodeModerationAction(String actionType, String targetClientId, String reason) {
+        if (actionType == null) throw new IllegalArgumentException("actionType must not be null");
+        if (targetClientId == null) throw new IllegalArgumentException("targetClientId must not be null");
+        JsonObject o = new JsonObject();
+        o.addProperty("actionType", actionType);
+        o.addProperty("targetClientId", targetClientId);
+        o.addProperty("reason", reason != null ? reason : "");
+        return encode(new Message(MessageType.MODERATION_ACTION, GSON.toJson(o)));
+    }
+
+    public static ModerationActionPayload decodeModerationAction(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.MODERATION_ACTION) {
+            throw new IllegalArgumentException("expected MODERATION_ACTION, got " + msg.type());
+        }
+        String raw = msg.payload();
+        if (raw == null || raw.isBlank()) {
+            throw new IllegalArgumentException("MODERATION_ACTION payload is blank");
+        }
+        try {
+            JsonObject o = JsonParser.parseString(raw.strip()).getAsJsonObject();
+            if (!o.has("actionType") || o.get("actionType").isJsonNull()) {
+                throw new IllegalArgumentException("MODERATION_ACTION missing actionType");
+            }
+            if (!o.has("targetClientId") || o.get("targetClientId").isJsonNull()) {
+                throw new IllegalArgumentException("MODERATION_ACTION missing targetClientId");
+            }
+            String actionType = o.get("actionType").getAsString().strip();
+            String targetClientId = o.get("targetClientId").getAsString().strip();
+            if (actionType.isBlank()) {
+                throw new IllegalArgumentException("MODERATION_ACTION actionType is blank");
+            }
+            if (targetClientId.isBlank()) {
+                throw new IllegalArgumentException("MODERATION_ACTION targetClientId is blank");
+            }
+            String reason = o.has("reason") && !o.get("reason").isJsonNull()
+                    ? o.get("reason").getAsString()
+                    : "";
+            return new ModerationActionPayload(actionType, targetClientId, reason);
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Malformed MODERATION_ACTION: " + e.getMessage(), e);
+        }
+    }
+
+    public static ByteBuffer encodeSessionRevoked(String reason) {
+        JsonObject o = new JsonObject();
+        o.addProperty("reason", reason != null ? reason : "");
+        return encode(new Message(MessageType.SESSION_REVOKED, GSON.toJson(o)));
+    }
+
+    public static String decodeSessionRevoked(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.SESSION_REVOKED) {
+            throw new IllegalArgumentException("expected SESSION_REVOKED, got " + msg.type());
+        }
+        String raw = msg.payload();
+        if (raw == null || raw.isBlank()) {
+            return "";
+        }
+        try {
+            JsonObject o = JsonParser.parseString(raw.strip()).getAsJsonObject();
+            if (!o.has("reason") || o.get("reason").isJsonNull()) {
+                return "";
+            }
+            return o.get("reason").getAsString();
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Malformed SESSION_REVOKED: " + e.getMessage(), e);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // ROLE_UPDATE helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * JSON body for {@link MessageType#ROLE_UPDATE}: permission change for {@code newHostClientId}
+     * (affected client). {@code roomHostClientId} is set on join sync; omitted for host migration
+     * and moderation when Gson decodes legacy frames.
+     */
+    public record RoleUpdatePayload(String newHostClientId, int newPermissions, String roomHostClientId) {}
+
+    public static ByteBuffer encodeRoleUpdate(String affectedClientId, int permissions) {
+        return encodeRoleUpdate(affectedClientId, permissions, null);
+    }
+
+    public static ByteBuffer encodeRoleUpdate(String affectedClientId, int permissions, String roomHostClientId) {
+        if (affectedClientId == null) {
+            throw new IllegalArgumentException("affectedClientId must not be null");
+        }
+        return encodeObject(MessageType.ROLE_UPDATE,
+                new RoleUpdatePayload(affectedClientId, permissions, roomHostClientId));
+    }
+
+    public static RoleUpdatePayload decodeRoleUpdate(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.ROLE_UPDATE) {
+            throw new IllegalArgumentException("expected ROLE_UPDATE, got " + msg.type());
+        }
+        RoleUpdatePayload p = GSON.fromJson(msg.payload(), RoleUpdatePayload.class);
+        if (p == null || p.newHostClientId() == null || p.newHostClientId().isBlank()) {
+            throw new IllegalArgumentException("ROLE_UPDATE missing newHostClientId");
+        }
+        return p;
+    }
+
+    // -------------------------------------------------------------------------
+    // BOARD_SWITCH helpers
+    // -------------------------------------------------------------------------
+
+    public record BoardSwitchPayload(String clientId, String newBoardId) {}
+
+    public static ByteBuffer encodeBoardSwitch(String clientId, String newBoardId) {
+        if (clientId == null) throw new IllegalArgumentException("clientId must not be null");
+        if (newBoardId == null) throw new IllegalArgumentException("newBoardId must not be null");
+        return encodeObject(MessageType.BOARD_SWITCH, new BoardSwitchPayload(clientId, newBoardId));
+    }
+
+    public static BoardSwitchPayload decodeBoardSwitch(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.BOARD_SWITCH) {
+            throw new IllegalArgumentException("expected BOARD_SWITCH, got " + msg.type());
+        }
+        BoardSwitchPayload p = GSON.fromJson(msg.payload(), BoardSwitchPayload.class);
+        if (p == null || p.clientId() == null || p.clientId().isBlank()) {
+            throw new IllegalArgumentException("BOARD_SWITCH missing clientId");
+        }
+        if (p.newBoardId() == null || p.newBoardId().isBlank()) {
+            throw new IllegalArgumentException("BOARD_SWITCH missing newBoardId");
+        }
+        return p;
+    }
+
+    // -------------------------------------------------------------------------
+    // TOGGLE_BOARD_LOCK helpers
+    // -------------------------------------------------------------------------
+
+    public record BoardLockPayload(boolean locked) {}
+
+    /** Client→server: set room board-creation lock to {@code locked}. */
+    public static ByteBuffer encodeBoardLockCommand(boolean locked) {
+        return encodeObject(MessageType.TOGGLE_BOARD_LOCK, new BoardLockPayload(locked));
+    }
+
+    public static BoardLockPayload decodeBoardLockCommand(Message msg) {
+        return decodeBoardLockPayload(msg);
+    }
+
+    /** Server→room: broadcast current lock state. */
+    public static ByteBuffer encodeBoardLockState(boolean locked) {
+        return encodeBoardLockCommand(locked);
+    }
+
+    public static BoardLockPayload decodeBoardLockState(Message msg) {
+        return decodeBoardLockPayload(msg);
+    }
+
+    private static BoardLockPayload decodeBoardLockPayload(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.TOGGLE_BOARD_LOCK) {
+            throw new IllegalArgumentException("expected TOGGLE_BOARD_LOCK, got " + msg.type());
+        }
+        BoardLockPayload p = GSON.fromJson(msg.payload(), BoardLockPayload.class);
+        if (p == null) {
+            throw new IllegalArgumentException("TOGGLE_BOARD_LOCK missing payload");
         }
         return p;
     }

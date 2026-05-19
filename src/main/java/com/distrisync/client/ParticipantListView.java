@@ -5,6 +5,7 @@ import javafx.beans.value.ChangeListener;
 import javafx.collections.ListChangeListener;
 import javafx.geometry.Pos;
 import javafx.scene.Node;
+import javafx.scene.control.Button;
 import javafx.scene.control.Label;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Region;
@@ -16,6 +17,7 @@ import javafx.scene.shape.SVGPath;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.BiConsumer;
 
 /**
  * Top-right voice roster: avatar initials, speaking ring, and mute indicator per
@@ -32,6 +34,11 @@ public final class ParticipantListView extends VBox {
 
     private ParticipantManager boundManager;
     private ListChangeListener<Participant> participantListListener;
+
+    private String localClientId = "";
+    private BiConsumer<String, String> kickHandler;
+    private BiConsumer<String, String> revokeSpeakHandler;
+    private boolean moderationButtonsVisible;
 
     public ParticipantListView() {
         setId(VIEW_ID);
@@ -77,6 +84,37 @@ public final class ParticipantListView extends VBox {
         manager.getParticipants().addListener(participantListListener);
         for (Participant participant : manager.getParticipants()) {
             addParticipantRow(participant);
+        }
+    }
+
+    /**
+     * @param localClientId session id of this user; kick is hidden for that row
+     */
+    public void setLocalClientId(String localClientId) {
+        this.localClientId = localClientId != null ? localClientId : "";
+    }
+
+    /**
+     * @param handler invoked with {@code (targetClientId, displayName)} when kick is confirmed
+     */
+    public void setKickHandler(BiConsumer<String, String> handler) {
+        this.kickHandler = handler;
+    }
+
+    /**
+     * @param handler invoked with {@code (targetClientId, displayName)} when revoke-speak is pressed
+     */
+    public void setRevokeSpeakHandler(BiConsumer<String, String> handler) {
+        this.revokeSpeakHandler = handler;
+    }
+
+    /**
+     * Shows or hides kick / revoke-speak controls on all rows (call from {@code bindPermissionsToUI}).
+     */
+    public void setKickButtonsVisible(boolean visible) {
+        moderationButtonsVisible = visible;
+        for (ParticipantRow row : rowsByClientId.values()) {
+            row.applyModerationVisibility();
         }
     }
 
@@ -168,6 +206,8 @@ public final class ParticipantListView extends VBox {
         private final Label initialsLabel;
         private final Label nameLabel;
         private final Node muteIcon;
+        private final Button revokeSpeakBtn;
+        private final Button kickBtn;
 
         private final ChangeListener<String> nameListener;
         private final ChangeListener<Boolean> mutedListener;
@@ -192,7 +232,30 @@ public final class ParticipantListView extends VBox {
 
             muteIcon = createMutedMicIcon();
 
-            root = new HBox(8, avatar, nameLabel, muteIcon);
+            revokeSpeakBtn = new Button("\uD83D\uDD07");
+            revokeSpeakBtn.getStyleClass().addAll("participant-revoke-speak-btn");
+            revokeSpeakBtn.setFocusTraversable(false);
+            revokeSpeakBtn.setMnemonicParsing(false);
+            revokeSpeakBtn.setTooltip(new javafx.scene.control.Tooltip("Revoke microphone"));
+            revokeSpeakBtn.setOnAction(e -> {
+                if (revokeSpeakHandler != null) {
+                    revokeSpeakHandler.accept(participant.getClientId(), participant.getName());
+                }
+            });
+
+            kickBtn = new Button("✕");
+            kickBtn.getStyleClass().addAll("danger-btn", "participant-kick-btn");
+            kickBtn.setFocusTraversable(false);
+            kickBtn.setMnemonicParsing(false);
+            kickBtn.setTooltip(new javafx.scene.control.Tooltip("Remove from room"));
+            kickBtn.setOnAction(e -> {
+                if (kickHandler != null) {
+                    kickHandler.accept(participant.getClientId(), participant.getName());
+                }
+            });
+            applyModerationVisibility();
+
+            root = new HBox(8, avatar, nameLabel, muteIcon, revokeSpeakBtn, kickBtn);
             root.setAlignment(Pos.CENTER_LEFT);
             root.getStyleClass().add("participant-row");
 
@@ -213,6 +276,7 @@ public final class ParticipantListView extends VBox {
             initialsLabel.setText(initialsFor(participant.getName()));
             applyMutedVisual(participant.isMuted());
             applySpeakingRing(participant.isSpeaking());
+            applyModerationVisibility();
         }
 
         void dispose() {
@@ -235,6 +299,15 @@ public final class ParticipantListView extends VBox {
             } else {
                 avatar.getStyleClass().remove("speaking-ring");
             }
+        }
+
+        private void applyModerationVisibility() {
+            boolean isLocal = participant.getClientId().equals(localClientId);
+            boolean show = moderationButtonsVisible && !isLocal;
+            revokeSpeakBtn.setVisible(show);
+            revokeSpeakBtn.setManaged(show);
+            kickBtn.setVisible(show);
+            kickBtn.setManaged(show);
         }
     }
 }

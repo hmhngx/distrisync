@@ -176,6 +176,33 @@ class MessageCodecTest {
     }
 
     @Test
+    void roomMemberJoined_roundTrip() {
+        ByteBuffer frame = MessageCodec.encodeRoomMemberJoined("peer-1", "Alice");
+        Message msg = MessageCodec.decode(frame);
+        assertThat(msg.type()).isEqualTo(MessageType.JOIN_ROOM);
+        MessageCodec.RoomMemberJoinedPayload p = MessageCodec.decodeRoomMemberJoined(msg);
+        assertThat(p.clientId()).isEqualTo("peer-1");
+        assertThat(p.authorName()).isEqualTo("Alice");
+    }
+
+    @Test
+    void roomMemberJoined_decode_rejectsClientJoinPayload() {
+        ByteBuffer frame = MessageCodec.encodeJoinRoom("my-room");
+        Message msg = MessageCodec.decode(frame);
+        assertThatThrownBy(() -> MessageCodec.decodeRoomMemberJoined(msg))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("client join request");
+    }
+
+    @Test
+    void roomMemberLeft_roundTrip() {
+        ByteBuffer frame = MessageCodec.encodeRoomMemberLeft("peer-2");
+        Message msg = MessageCodec.decode(frame);
+        assertThat(msg.type()).isEqualTo(MessageType.LEAVE_ROOM);
+        assertThat(MessageCodec.decodeRoomMemberLeft(msg)).isEqualTo("peer-2");
+    }
+
+    @Test
     void boardListUpdate_roundTrip() {
         List<String> in = List.of("Default", "Diagrams", "Math");
         ByteBuffer frame = MessageCodec.encodeBoardListUpdate(in);
@@ -490,6 +517,56 @@ class MessageCodecTest {
         assertThat(p.authorName()).isEqualTo("Alice");
         assertThat(p.x()).isEqualTo(12.5);
         assertThat(p.y()).isEqualTo(99.0);
+    }
+
+    @Test
+    void roleUpdate_roundTrip() {
+        ByteBuffer frame = MessageCodec.encodeRoleUpdate("host-client", 31);
+        Message decoded = MessageCodec.decode(frame);
+
+        assertThat(decoded.type()).isEqualTo(MessageType.ROLE_UPDATE);
+        MessageCodec.RoleUpdatePayload p = MessageCodec.decodeRoleUpdate(decoded);
+        assertThat(p.newHostClientId()).isEqualTo("host-client");
+        assertThat(p.newPermissions()).isEqualTo(31);
+        assertThat(p.roomHostClientId()).isNull();
+    }
+
+    @Test
+    void roleUpdate_roundTrip_withRoomHostClientId() {
+        ByteBuffer frame = MessageCodec.encodeRoleUpdate("member-client", 3, "owner-client");
+        Message decoded = MessageCodec.decode(frame);
+
+        assertThat(decoded.type()).isEqualTo(MessageType.ROLE_UPDATE);
+        MessageCodec.RoleUpdatePayload p = MessageCodec.decodeRoleUpdate(decoded);
+        assertThat(p.newHostClientId()).isEqualTo("member-client");
+        assertThat(p.newPermissions()).isEqualTo(3);
+        assertThat(p.roomHostClientId()).isEqualTo("owner-client");
+    }
+
+    @Test
+    void boardSwitch_roundTrip() {
+        ByteBuffer frame = MessageCodec.encodeBoardSwitch("client-a", "Diagrams");
+        Message decoded = MessageCodec.decode(frame);
+        assertThat(decoded.type()).isEqualTo(MessageType.BOARD_SWITCH);
+        MessageCodec.BoardSwitchPayload p = MessageCodec.decodeBoardSwitch(decoded);
+        assertThat(p.clientId()).isEqualTo("client-a");
+        assertThat(p.newBoardId()).isEqualTo("Diagrams");
+    }
+
+    @Test
+    void boardLockState_roundTrip() {
+        ByteBuffer frame = MessageCodec.encodeBoardLockState(true);
+        Message decoded = MessageCodec.decode(frame);
+        assertThat(decoded.type()).isEqualTo(MessageType.TOGGLE_BOARD_LOCK);
+        assertThat(MessageCodec.decodeBoardLockState(decoded).locked()).isTrue();
+    }
+
+    @Test
+    void boardLockCommand_roundTrip() {
+        ByteBuffer frame = MessageCodec.encodeBoardLockCommand(false);
+        Message decoded = MessageCodec.decode(frame);
+        assertThat(decoded.type()).isEqualTo(MessageType.TOGGLE_BOARD_LOCK);
+        assertThat(MessageCodec.decodeBoardLockCommand(decoded).locked()).isFalse();
     }
 
     @Test

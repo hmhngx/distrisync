@@ -24,7 +24,9 @@ import java.util.Map;
  *                             payload: { objectId, clientId, x, y, currentText }
  * 0x0C        LOBBY_STATE   – server→client: JSON list of { roomId, userCount } for discovery
  * 0x0D        JOIN_ROOM     – client→server: JSON object { roomId, initialBoardId? }; legacy JSON string roomId accepted
+ *                             server→client: JSON object { clientId, authorName } — peer entered the room
  * 0x0E        LEAVE_ROOM    – client→server: return to lobby (empty payload)
+ *                             server→client: JSON string clientId — peer left or disconnected
  * 0x0F        SWITCH_BOARD      – client→server: JSON string target boardId (e.g. "Board-1")
  * 0x10        BOARD_LIST_UPDATE – server→client: JSON array of board id strings active in the room
  * 0x11        UDP_ADMISSION     – server→client: JSON object { udpToken } for joining the UDP audio data plane
@@ -37,6 +39,11 @@ import java.util.Map;
  * 0x18        STATE_REQUEST     – backplane only: cold node requests room state hydration (payload: {})
  * 0x19        STATE_SNAPSHOT    – backplane only: hot node bulk board state (payload: same JSON array as SNAPSHOT)
  * 0x1A        CURSOR_SYNC       – ephemeral multiplayer cursor position (payload: clientId, authorName, x, y)
+ * 0x1B        MODERATION_ACTION – client→server / backplane control: { actionType, targetClientId, reason }
+ * 0x1C        SESSION_REVOKED   – server→client: session ended by moderation (payload: { reason })
+ * 0x1D        ROLE_UPDATE       – server→client: host migration (payload: { newHostClientId, newPermissions })
+ * 0x1E        BOARD_SWITCH      – server→room: peer active board (payload: { clientId, newBoardId })
+ * 0x1F        TOGGLE_BOARD_LOCK – client→server: set { locked }; server→room: broadcast { locked }
  * </pre>
  */
 public enum MessageType {
@@ -66,7 +73,12 @@ public enum MessageType {
     VOICE_STATE      ((byte) 0x17),
     STATE_REQUEST    ((byte) 0x18),
     STATE_SNAPSHOT   ((byte) 0x19),
-    CURSOR_SYNC      ((byte) 0x1A);
+    CURSOR_SYNC      ((byte) 0x1A),
+    MODERATION_ACTION((byte) 0x1B),
+    SESSION_REVOKED  ((byte) 0x1C),
+    ROLE_UPDATE      ((byte) 0x1D),
+    BOARD_SWITCH     ((byte) 0x1E),
+    TOGGLE_BOARD_LOCK((byte) 0x1F);
 
     private final byte wireCode;
 

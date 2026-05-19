@@ -148,6 +148,11 @@ public final class AudioEngine implements AutoCloseable {
         return micMutedAtomic.get();
     }
 
+    /** {@code true} after {@link #close()}; the instance must not be reused. */
+    public boolean isClosed() {
+        return closed.get();
+    }
+
     public void setMicMuted(boolean muted) {
         micMutedAtomic.set(muted);
         syncMicMutedProperty(muted);
@@ -423,6 +428,8 @@ public final class AudioEngine implements AutoCloseable {
                 markLocalVoiceActive(false);
                 TargetDataLine line = captureLine;
                 if (line != null) {
+                    Arrays.fill(buffer, (byte) 0);
+                    System.arraycopy(udpIdentityBytes, 0, buffer, 0, UDP_IDENTITY_BYTES);
                     flushCaptureLineBuffer(line);
                 }
                 parkMuted();
@@ -677,6 +684,7 @@ public final class AudioEngine implements AutoCloseable {
 
     private void expireRemoteSpeakers() {
         long now = millisClock.getAsLong();
+        boolean flushedPlayback = false;
         for (Map.Entry<String, Long> entry : remoteLastSpokenAt.entrySet()) {
             String speakerId = entry.getKey();
             Long lastAt = entry.getValue();
@@ -688,6 +696,10 @@ public final class AudioEngine implements AutoCloseable {
                 ParticipantManager manager = participantManager;
                 if (manager != null) {
                     manager.setSpeaking(speakerId, false);
+                }
+                if (!flushedPlayback) {
+                    flushPlaybackBuffer();
+                    flushedPlayback = true;
                 }
             }
         }
@@ -714,6 +726,20 @@ public final class AudioEngine implements AutoCloseable {
             line.open(AUDIO_FORMAT, LINE_BUFFER_BYTES);
             line.start();
             playbackLine = line;
+        }
+    }
+
+    /** Drops queued PCM on the shared playback line without closing it. */
+    private void flushPlaybackBuffer() {
+        synchronized (playbackLock) {
+            SourceDataLine line = playbackLine;
+            if (line != null && line.isOpen()) {
+                try {
+                    line.flush();
+                } catch (Exception ignored) {
+                    /* best-effort */
+                }
+            }
         }
     }
 
@@ -800,6 +826,13 @@ public final class AudioEngine implements AutoCloseable {
     /** Same-package unit tests inject a mock {@link TargetDataLine}. */
     void setMicLineFactoryForTests(MicLineFactory factory) {
         this.micLineFactory = factory;
+    }
+
+    /** Same-package unit tests inject a mock {@link SourceDataLine} for playback flush assertions. */
+    void setPlaybackLineForTests(SourceDataLine line) {
+        synchronized (playbackLock) {
+            playbackLine = line;
+        }
     }
 
     void setMillisClockForTests(LongSupplier clock) {

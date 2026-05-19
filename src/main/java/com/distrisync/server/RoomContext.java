@@ -29,11 +29,22 @@ final class RoomContext {
 
     final String roomId;
 
+    /**
+     * {@link ClientSession#clientId} of the first client that created this room (size == 1 on join).
+     */
+    volatile String hostClientId = "";
+
+    /** When true, only clients with {@link com.distrisync.protocol.RoomPermissions#PERM_MANAGE_ROOM} may create boards. */
+    volatile boolean isBoardCreationLocked = true;
+
     private final WalManager wal;
 
     private final ConcurrentHashMap<String, CanvasStateManager> boards = new ConcurrentHashMap<>();
 
     private final Set<SelectionKey> activeKeys = ConcurrentHashMap.newKeySet();
+
+    /** Reverse index: {@link ClientSession#clientId} → local TCP {@link SelectionKey}. */
+    private final ConcurrentHashMap<String, SelectionKey> clientIndex = new ConcurrentHashMap<>();
 
     private volatile long lastActivityTimestamp = System.currentTimeMillis();
 
@@ -68,11 +79,34 @@ final class RoomContext {
 
     void addKey(SelectionKey key) {
         activeKeys.add(key);
+        if (key.attachment() instanceof ClientSession session) {
+            String clientId = session.clientId;
+            if (clientId != null && !clientId.isBlank()) {
+                clientIndex.put(clientId, key);
+            }
+        }
         touchActivity();
     }
 
     boolean removeKey(SelectionKey key) {
+        if (key.attachment() instanceof ClientSession session) {
+            String clientId = session.clientId;
+            if (clientId != null && !clientId.isBlank()) {
+                clientIndex.remove(clientId, key);
+            }
+        }
         return activeKeys.remove(key);
+    }
+
+    /**
+     * Returns the local {@link SelectionKey} for {@code clientId}, or {@code null} if this node
+     * does not host that client in this room.
+     */
+    SelectionKey lookupClientKey(String clientId) {
+        if (clientId == null || clientId.isBlank()) {
+            return null;
+        }
+        return clientIndex.get(clientId);
     }
 
     Set<SelectionKey> getActiveKeys() {

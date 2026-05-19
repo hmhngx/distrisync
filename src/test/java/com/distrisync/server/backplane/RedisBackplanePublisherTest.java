@@ -1,5 +1,6 @@
 package com.distrisync.server.backplane;
 
+import com.distrisync.protocol.MessageCodec;
 import com.distrisync.server.ServerMetrics;
 
 import org.junit.jupiter.api.AfterEach;
@@ -108,5 +109,34 @@ class RedisBackplanePublisherTest {
 
         assertThat(publishFinished.await(2, TimeUnit.SECONDS)).isTrue();
         verify(redisClient).publish(eq(BackplaneEnvelopeCodec.presenceChannel("room-a")), any(byte[].class));
+    }
+
+    @Test
+    void testPublishControlUsesControlChannel() throws Exception {
+        doNothing().when(redisClient).close();
+
+        CountDownLatch publishFinished = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            publishFinished.countDown();
+            return 0L;
+        }).when(redisClient).publish(anyString(), any(byte[].class));
+
+        publisher = new RedisBackplanePublisher(
+                "test-node-id",
+                redisClient,
+                Executors.newSingleThreadExecutor(),
+                true);
+
+        BackplaneEnvelope envelope = new BackplaneEnvelope(
+                "event-kick",
+                "test-node-id",
+                "room-a",
+                "Board-1",
+                MessageCodec.encodeModerationAction("KICK", "victim-id", "reason"));
+
+        publisher.publishControl(envelope);
+
+        assertThat(publishFinished.await(2, TimeUnit.SECONDS)).isTrue();
+        verify(redisClient).publish(eq(BackplaneEnvelopeCodec.controlChannel("room-a")), any(byte[].class));
     }
 }

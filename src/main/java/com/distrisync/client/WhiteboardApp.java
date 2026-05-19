@@ -1,5 +1,7 @@
 package com.distrisync.client;
 
+import com.distrisync.protocol.MessageCodec;
+import com.distrisync.protocol.RoomPermissions;
 import com.distrisync.model.ArrowNode;
 import com.distrisync.model.Circle;
 import com.distrisync.model.EllipseNode;
@@ -33,6 +35,7 @@ import javafx.scene.image.ImageView;
 import javafx.scene.canvas.GraphicsContext;
 import javafx.scene.control.Alert;
 import javafx.scene.control.Button;
+import javafx.scene.control.ButtonBar;
 import javafx.scene.control.ButtonType;
 import javafx.scene.control.ColorPicker;
 import javafx.scene.control.DialogPane;
@@ -174,6 +177,7 @@ public class WhiteboardApp extends Application {
     static final String TOOL_DOCK_ARROW_BUTTON_ID = "whiteboard-tool-arrow";
     /** Leave Room control on the canvas HUD (contrast / TestFX hooks). */
     static final String LEAVE_ROOM_BUTTON_ID = "whiteboard-leave-room-button";
+    static final String DELETE_ROOM_BUTTON_ID = "whiteboard-delete-room-button";
     /** Chevron control that collapses / expands the tool dock beside the boards strip. */
     static final String TOOL_DOCK_TOGGLE_BUTTON_ID = "whiteboard-tool-dock-toggle";
     /** Login card primary action (flat button reset / TestFX). */
@@ -255,9 +259,17 @@ public class WhiteboardApp extends Application {
 
     /** Bottom-left Discord-style mute / unmute control on the canvas scene. */
     private Button micToggleBtn;
-    private ParticipantListView participantListView;
+    private Button btnDeleteRoom;
+    private CollaborationRoster collaborationRoster;
+    private VBox newBoardSwitcherCard;
     private Tooltip micToggleTooltip;
     private boolean micToggleHudWired;
+    /** Tool dock row + properties bar — disabled when the user cannot draw. */
+    private HBox      drawingToolbar;
+    private HBox      workspacePropertiesBar;
+    private List<RoomInfo> lastLobbyRooms = List.of();
+    private final AtomicBoolean sessionRevokedOverlayShown = new AtomicBoolean(false);
+    private StackPane sessionRevokedOverlay;
 
     private static final String MIC_ON_GLYPH  = "\uD83C\uDFA4";
     private static final String MIC_OFF_GLYPH = "\uD83D\uDD07";
@@ -450,19 +462,18 @@ public class WhiteboardApp extends Application {
                 WORKSPACE_TOOLBAR_LAYER_ID);
         StackPane dockLayer = wrapFloatingNode(toolsChromeRow, Pos.TOP_LEFT, new Insets(64, 0, 0, 16),
                 WORKSPACE_DOCK_LAYER_ID);
-        HBox propertiesBar = buildPropertiesBar();
-        StackPane propertiesBarLayer = wrapFloatingNode(propertiesBar, Pos.TOP_CENTER, new Insets(16, 0, 0, 0),
+        workspacePropertiesBar = buildPropertiesBar();
+        drawingToolbar = toolsChromeRow;
+        StackPane propertiesBarLayer = wrapFloatingNode(workspacePropertiesBar, Pos.TOP_CENTER, new Insets(16, 0, 0, 0),
                 WORKSPACE_PROPERTIES_LAYER_ID);
 
-        participantListView = new ParticipantListView();
+        collaborationRoster = new CollaborationRoster();
         HBox topRightIsland = buildTopRightHud();
         topRightIsland.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
-        VBox topRightColumn = new VBox(8, participantListView, topRightIsland);
-        topRightColumn.setAlignment(Pos.TOP_RIGHT);
-        topRightColumn.setFillWidth(false);
-        topRightColumn.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
-        StackPane topRightLayer = wrapFloatingNode(topRightColumn, Pos.TOP_RIGHT, new Insets(16, 16, 0, 0),
+        StackPane topRightLayer = wrapFloatingNode(topRightIsland, Pos.TOP_RIGHT, new Insets(16, 16, 0, 0),
                 WORKSPACE_PARTICIPANT_LAYER_ID);
+        StackPane rosterLayer = wrapFloatingNode(collaborationRoster, Pos.CENTER_RIGHT, new Insets(16, 0, 16, 0),
+                "whiteboard-workspace-roster-layer");
 
         telemetryTcpLabel = new Label("TCP: …");
         telemetryUdpLabel = new Label("UDP: …");
@@ -495,14 +506,24 @@ public class WhiteboardApp extends Application {
             if (networkClient == null) {
                 return;
             }
-            networkClient.getAudioEngine().toggleMic();
+            int perms = networkClient.getParticipantManager().getLocalPermissions();
+            if (!RoomPermissions.canSpeak(perms)) {
+                return;
+            }
+            AudioEngine audio = networkClient.getAudioEngine();
+            audio.toggleMic();
+            ParticipantManager participantManager = networkClient.getParticipantManager();
+            Participant local = participantManager.get(networkClient.getClientId());
+            if (local != null) {
+                local.setMuted(audio.isMicMuted());
+            }
         });
 
         StackPane micLayer = wrapFloatingNode(micToggleBtn, Pos.BOTTOM_LEFT, new Insets(0, 0, 16, 16),
                 WORKSPACE_MIC_LAYER_ID);
 
         canvasSceneRoot.getChildren().addAll(canvasContainer, boardsLayer, dockLayer, propertiesBarLayer,
-                topRightLayer, micLayer, telemetryLayer);
+                topRightLayer, rosterLayer, micLayer, telemetryLayer);
 
         Platform.runLater(this::updateToolsDrawerClipAndHostWidth);
 
@@ -791,8 +812,8 @@ public class WhiteboardApp extends Application {
         for (String boardId : resolveKnownBoardIdsForSwitcher()) {
             switcherBoardGrid.getChildren().add(createBoardSwitcherCard(boardId));
         }
-        VBox newBoardCard = createNewBoardSwitcherCard();
-        switcherBoardGrid.getChildren().add(newBoardCard);
+        newBoardSwitcherCard = createNewBoardSwitcherCard();
+        switcherBoardGrid.getChildren().add(newBoardSwitcherCard);
     }
 
     private VBox createBoardSwitcherCard(String boardId) {
@@ -1239,13 +1260,23 @@ public class WhiteboardApp extends Application {
         leaveRoomBtn.setOnAction(e -> leaveCanvasRoom(true));
         leaveRoomBtn.setTooltip(new Tooltip("Return to the lobby"));
 
+        btnDeleteRoom = new Button("Delete Room");
+        btnDeleteRoom.setId(DELETE_ROOM_BUTTON_ID);
+        btnDeleteRoom.getStyleClass().add("danger-btn");
+        btnDeleteRoom.setFocusTraversable(false);
+        btnDeleteRoom.setMnemonicParsing(false);
+        btnDeleteRoom.setVisible(false);
+        btnDeleteRoom.setManaged(false);
+        btnDeleteRoom.setTooltip(new Tooltip("Permanently delete this room"));
+        btnDeleteRoom.setOnAction(e -> confirmDeleteCurrentRoom());
+
         statusLabel = new Label("⬤ Offline");
         statusLabel.getStyleClass().add("status-text");
         statusLabel.setTextFill(Color.web(RED));
         statusLabel.setWrapText(true);
         statusLabel.setMaxWidth(200);
 
-        HBox row = new HBox(10, leaveRoomBtn, statusLabel);
+        HBox row = new HBox(10, leaveRoomBtn, btnDeleteRoom, statusLabel);
         row.setAlignment(Pos.CENTER_LEFT);
         row.getStyleClass().add("hud-panel");
         row.setPickOnBounds(false);
@@ -1527,6 +1558,257 @@ public class WhiteboardApp extends Application {
         scheduleLobbyJoinWatchdog();
     }
 
+    /** True when speak permission was removed between two server-provided bitmasks. */
+    static boolean lostSpeakPermission(int oldPerms, int newPerms) {
+        return RoomPermissions.canSpeak(oldPerms) && !RoomPermissions.canSpeak(newPerms);
+    }
+
+    /**
+     * Applies a {@link com.distrisync.protocol.MessageType#ROLE_UPDATE} on the FX thread.
+     */
+    private void applyRoleUpdate(MessageCodec.RoleUpdatePayload payload) {
+        if (networkClient == null || payload == null) {
+            return;
+        }
+        String affectedId = payload.newHostClientId();
+        int newPerms = payload.newPermissions();
+        ParticipantManager manager = networkClient.getParticipantManager();
+        // Roster crowns and moderation UI follow permissions for every affected client, not only local.
+        manager.updatePermissions(affectedId, newPerms);
+        boolean isLocal = affectedId.equals(networkClient.getClientId());
+        int oldPerms = isLocal ? manager.getLocalPermissions() : 0;
+        if (payload.roomHostClientId() != null && !payload.roomHostClientId().isBlank()) {
+            manager.setHostClientId(payload.roomHostClientId());
+        } else if (RoomPermissions.canDeleteRoom(newPerms)) {
+            manager.setHostClientId(affectedId);
+        }
+        if (isLocal) {
+            manager.setLocalPermissions(newPerms);
+            if (lostSpeakPermission(oldPerms, newPerms)) {
+                enforceAdminMicRevoke();
+            }
+            bindPermissionsToUI();
+        }
+    }
+
+    /**
+     * Hard-stops capture hardware and locks the mic toggle after {@code PERM_SPEAK} is revoked.
+     */
+    private void enforceAdminMicRevoke() {
+        if (canvasSceneRoot != null) {
+            ToastNotification.show(canvasSceneRoot,
+                    "An Admin has revoked your microphone access.",
+                    "lobby-status-disconnected");
+        }
+        if (networkClient != null) {
+            AudioEngine audio = networkClient.getAudioEngine();
+            audio.setMicMuted(true);
+            networkClient.sendVoiceState(true);
+        }
+        if (micToggleBtn != null) {
+            micToggleBtn.setDisable(true);
+        }
+    }
+
+    /**
+     * Applies {@link ParticipantManager#getLocalPermissions()} to canvas chrome. FX thread only.
+     */
+    private void bindPermissionsToUI() {
+        if (!Platform.isFxApplicationThread()) {
+            Platform.runLater(this::bindPermissionsToUI);
+            return;
+        }
+        int perms = networkClient != null
+                ? networkClient.getParticipantManager().getLocalPermissions()
+                : RoomPermissions.SPECTATOR;
+        boolean canDraw = RoomPermissions.canDraw(perms);
+        boolean canSpeak = RoomPermissions.canSpeak(perms);
+        boolean canDelete = RoomPermissions.canDeleteRoom(perms);
+        boolean canManage = RoomPermissions.canManageUsers(perms);
+        boolean canManageRoom = RoomPermissions.canManageRoom(perms);
+
+        if (drawingToolbar != null) {
+            drawingToolbar.setDisable(!canDraw);
+        }
+        if (workspacePropertiesBar != null) {
+            workspacePropertiesBar.setDisable(!canDraw);
+        }
+        if (canvasToolDock != null) {
+            canvasToolDock.setDisable(!canDraw);
+        }
+        if (btnDeleteRoom != null) {
+            btnDeleteRoom.setVisible(canDelete);
+            btnDeleteRoom.setManaged(canDelete);
+        }
+        if (micToggleBtn != null) {
+            micToggleBtn.setDisable(!canSpeak);
+        }
+        if (collaborationRoster != null) {
+            collaborationRoster.setModerationEnabled(canManage);
+            collaborationRoster.setBoardLockToggleVisible(canManageRoom);
+        }
+        bindBoardCreationLockToNewBoardCard();
+    }
+
+    private void bindBoardCreationLockToNewBoardCard() {
+        if (newBoardSwitcherCard == null || networkClient == null) {
+            return;
+        }
+        ParticipantManager manager = networkClient.getParticipantManager();
+        RoomState roomState = networkClient.getRoomState();
+        BooleanBinding blocked = Bindings.and(
+                roomState.boardCreationLockedProperty(),
+                Bindings.not(Bindings.createBooleanBinding(
+                        () -> RoomPermissions.canManageRoom(manager.getLocalPermissions()),
+                        manager.localPermissionsProperty())));
+        newBoardSwitcherCard.disableProperty().bind(blocked);
+        if (collaborationRoster != null) {
+            collaborationRoster.syncBoardLockCheckbox(roomState.isBoardCreationLocked());
+        }
+    }
+
+    private void confirmDeleteCurrentRoom() {
+        if (networkClient == null || !networkClient.isRunning()) {
+            return;
+        }
+        String rid = roomId != null ? roomId.strip() : "";
+        if (rid.isBlank()) {
+            rid = networkClient.getActiveRoomId();
+        }
+        if (rid == null || rid.isBlank()) {
+            return;
+        }
+        Alert confirm = new Alert(Alert.AlertType.CONFIRMATION);
+        confirm.setTitle("Delete Room");
+        confirm.setHeaderText("Delete room '" + rid + "'?");
+        confirm.setContentText(
+                "This will permanently delete all boards and drawings. Everyone will be removed.");
+        confirm.initModality(Modality.APPLICATION_MODAL);
+        if (primaryStage != null) {
+            confirm.initOwner(primaryStage);
+        }
+        Optional<ButtonType> response = confirm.showAndWait();
+        if (response.isPresent() && response.get() == ButtonType.OK) {
+            networkClient.sendDeleteRoom(rid);
+        }
+    }
+
+    private void confirmKickParticipant(String targetClientId, String displayName) {
+        if (networkClient == null || !networkClient.isRunning()) {
+            return;
+        }
+        String label = displayName != null && !displayName.isBlank() ? displayName : targetClientId;
+        Alert confirm = new Alert(Alert.AlertType.CONFIRMATION);
+        confirm.setTitle("Remove participant");
+        confirm.setHeaderText("Remove '" + label + "' from this room?");
+        confirm.setContentText("They will be disconnected immediately.");
+        confirm.initModality(Modality.APPLICATION_MODAL);
+        if (primaryStage != null) {
+            confirm.initOwner(primaryStage);
+        }
+        Optional<ButtonType> response = confirm.showAndWait();
+        if (response.isPresent() && response.get() == ButtonType.OK) {
+            networkClient.sendModerationKick(targetClientId, "removed by moderator");
+        }
+    }
+
+    private void revokeSpeakParticipant(String targetClientId, String displayName) {
+        if (networkClient == null || !networkClient.isRunning()) {
+            return;
+        }
+        String label = displayName != null && !displayName.isBlank() ? displayName : targetClientId;
+        networkClient.sendModerationRevokeSpeak(targetClientId, "microphone revoked by moderator");
+        if (canvasSceneRoot != null) {
+            ToastNotification.show(canvasSceneRoot, "Revoked microphone for " + label + ".");
+        }
+    }
+
+    private void grantSpeakParticipant(Participant p) {
+        if (networkClient == null || !networkClient.isRunning() || p == null) {
+            return;
+        }
+        String targetClientId = p.getClientId();
+        String displayName = p.getName();
+        String label = displayName != null && !displayName.isBlank() ? displayName : targetClientId;
+        networkClient.sendModerationGrantSpeak(targetClientId, "microphone granted by moderator");
+        if (canvasSceneRoot != null) {
+            ToastNotification.show(canvasSceneRoot, "Granted microphone for " + label + ".");
+        }
+    }
+
+    private void onSessionRevoked(String reason) {
+        if (!sessionRevokedOverlayShown.compareAndSet(false, true)) {
+            return;
+        }
+        if (remoteCursorManager != null) {
+            remoteCursorManager.stop();
+        }
+        if (networkClient != null) {
+            networkClient.getAudioEngine().close();
+        }
+        if (canvasSceneRoot == null) {
+            finishSessionRevokedReturn();
+            return;
+        }
+        removeSessionRevokedOverlay();
+        Label message = new Label(
+                "Session Revoked: You have been kicked by an administrator.");
+        message.getStyleClass().add("session-revoked-message");
+        message.setWrapText(true);
+        message.setMaxWidth(480);
+        message.setTextFill(Color.web(RED));
+
+        VBox panelChildren = new VBox(12);
+        panelChildren.setAlignment(Pos.CENTER);
+        panelChildren.getChildren().add(message);
+        if (reason != null && !reason.isBlank()) {
+            Label reasonLine = new Label(reason);
+            reasonLine.getStyleClass().add("lobby-status-muted");
+            reasonLine.setWrapText(true);
+            reasonLine.setMaxWidth(480);
+            panelChildren.getChildren().add(reasonLine);
+        }
+
+        Button returnBtn = new Button("Return to Lobby");
+        returnBtn.getStyleClass().add("primary-btn");
+        returnBtn.setDefaultButton(true);
+        returnBtn.setOnAction(e -> finishSessionRevokedReturn());
+
+        panelChildren.getChildren().add(returnBtn);
+        VBox panel = new VBox(24, panelChildren);
+        panel.setAlignment(Pos.CENTER);
+        panel.setMaxWidth(Region.USE_PREF_SIZE);
+
+        sessionRevokedOverlay = new StackPane(panel);
+        sessionRevokedOverlay.getStyleClass().add("session-revoked-overlay");
+        sessionRevokedOverlay.setPickOnBounds(true);
+        StackPane.setAlignment(panel, Pos.CENTER);
+        canvasSceneRoot.getChildren().add(sessionRevokedOverlay);
+        sessionRevokedOverlay.toFront();
+    }
+
+    private void removeSessionRevokedOverlay() {
+        if (sessionRevokedOverlay != null && canvasSceneRoot != null) {
+            canvasSceneRoot.getChildren().remove(sessionRevokedOverlay);
+        }
+        sessionRevokedOverlay = null;
+    }
+
+    private void finishSessionRevokedReturn() {
+        removeSessionRevokedOverlay();
+        sessionRevokedOverlayShown.set(false);
+        leaveCanvasRoom(false);
+        if (networkClient != null) {
+            networkClient.reinitializeAudioEngine();
+            micToggleHudWired = false;
+            wireMicToggleHud(networkClient.getAudioEngine());
+            rewireLocalParticipantMicHud(networkClient.getAudioEngine());
+            networkClient.getParticipantManager().setLocalPermissions(RoomPermissions.SPECTATOR);
+            bindPermissionsToUI();
+            networkClient.resumeAfterSessionRevoked();
+        }
+    }
+
     /**
      * Lobby-only destructive action: confirms then sends {@link MessageType#DELETE_ROOM}.
      */
@@ -1651,6 +1933,8 @@ public class WhiteboardApp extends Application {
             Button deleteBtn = new Button("Delete");
             deleteBtn.getStyleClass().add("danger-btn");
             deleteBtn.setDisable(networkClient == null || !networkClient.isRunning());
+            deleteBtn.setVisible(false);
+            deleteBtn.setManaged(false);
             deleteBtn.setOnAction(e -> confirmDeleteRoomFromLobby(rid, idLab, joinBtn, deleteBtn));
 
             FlowPane actions = new FlowPane(10, 10, joinBtn, deleteBtn);
@@ -1685,6 +1969,8 @@ public class WhiteboardApp extends Application {
     }
 
     private void leaveCanvasRoom(boolean sendLeaveRoomToServer) {
+        removeSessionRevokedOverlay();
+        sessionRevokedOverlayShown.set(false);
         cancelLobbyJoinWatchdog();
         hideBoardSwitcher();
         boardSnapshots.clear();
@@ -1695,12 +1981,52 @@ public class WhiteboardApp extends Application {
         if (networkClient != null && sendLeaveRoomToServer) {
             networkClient.sendLeaveRoom();
         }
+        if (networkClient != null) {
+            networkClient.getParticipantManager().setLocalPermissions(RoomPermissions.SPECTATOR);
+        }
         clearLocalCanvasState();
+        bindPermissionsToUI();
         if (primaryStage != null && lobbyScene != null) {
             primaryStage.setScene(lobbyScene);
             primaryStage.setTitle("DistriSync – Lobby");
         }
         setStatus("⬤ In lobby", FG_MUTED);
+    }
+
+    private void handlePeerJoined(String clientId, String authorName) {
+        if (networkClient == null || clientId == null || clientId.isBlank()) {
+            return;
+        }
+        if (clientId.equals(networkClient.getClientId())) {
+            return;
+        }
+        if (networkClient.getActiveRoomId() == null || networkClient.getActiveRoomId().isBlank()) {
+            return;
+        }
+        String displayName = authorName != null && !authorName.isBlank() ? authorName : clientId;
+        networkClient.getParticipantManager().putParticipant(clientId, displayName);
+        if (primaryStage != null && primaryStage.getScene() == canvasScene && canvasSceneRoot != null) {
+            ToastNotification.show(canvasSceneRoot, displayName + " joined the room.");
+        }
+    }
+
+    private void handlePeerLeft(String clientId) {
+        if (networkClient == null || clientId == null || clientId.isBlank()) {
+            return;
+        }
+        if (clientId.equals(networkClient.getClientId())) {
+            return;
+        }
+        ParticipantManager manager = networkClient.getParticipantManager();
+        Participant peer = manager.get(clientId);
+        String displayName = peer != null && !peer.getName().isBlank() ? peer.getName() : clientId;
+        if (primaryStage != null && primaryStage.getScene() == canvasScene && canvasSceneRoot != null) {
+            ToastNotification.show(canvasSceneRoot, displayName + " left the room.");
+        }
+        manager.remove(clientId);
+        if (remoteCursorManager != null) {
+            remoteCursorManager.removePeer(clientId);
+        }
     }
 
     /**
@@ -1726,16 +2052,52 @@ public class WhiteboardApp extends Application {
     /**
      * Binds {@link #micToggleBtn} to {@link AudioEngine} mute/speaking properties (once per session).
      */
-    private void wireParticipantHud(ParticipantManager manager) {
-        if (participantListView == null || manager == null || networkClient == null) {
+    /** Re-binds local participant mute state after {@link NetworkClient#reinitializeAudioEngine()}. */
+    private void rewireLocalParticipantMicHud(AudioEngine audio) {
+        if (networkClient == null || audio == null) {
             return;
         }
-        participantListView.bindTo(manager);
+        Participant local = networkClient.getParticipantManager().get(networkClient.getClientId());
+        if (local != null) {
+            local.setMuted(audio.isMicMuted());
+            audio.isMicMutedProperty().addListener((obs, was, muted) ->
+                    local.setMuted(Boolean.TRUE.equals(muted)));
+        }
+    }
+
+    private void recreateRemoteCursorManager() {
+        if (cursorPane == null) {
+            return;
+        }
+        if (remoteCursorManager != null) {
+            remoteCursorManager.stop();
+        }
+        remoteCursorManager = new RemoteCursorManager(cursorPane, clientId);
+    }
+
+    private void wireParticipantHud(ParticipantManager manager) {
+        if (collaborationRoster == null || manager == null || networkClient == null) {
+            return;
+        }
+        collaborationRoster.bindTo(manager);
+        collaborationRoster.setLocalClientId(networkClient.getClientId());
+        collaborationRoster.setKickHandler(this::confirmKickParticipant);
+        collaborationRoster.setRevokeSpeakHandler(this::revokeSpeakParticipant);
+        collaborationRoster.setGrantSpeakHandler(this::grantSpeakParticipant);
+        collaborationRoster.setBoardLockToggleHandler(networkClient::sendBoardLockState);
+        networkClient.getRoomState().boardCreationLockedProperty().addListener((obs, was, locked) ->
+                collaborationRoster.syncBoardLockCheckbox(Boolean.TRUE.equals(locked)));
         String displayName = networkClient.getAuthorName();
         if (displayName == null || displayName.isBlank()) {
             displayName = "You";
         }
         manager.putParticipant(networkClient.getClientId(), displayName);
+        manager.setCurrentBoardId(networkClient.getClientId(), networkClient.getCurrentBoardId());
+        if (RoomPermissions.canManageRoom(manager.getLocalPermissions())
+                || RoomPermissions.canDeleteRoom(manager.getLocalPermissions())) {
+            manager.setHostClientId(networkClient.getClientId());
+        }
+        bindBoardCreationLockToNewBoardCard();
         AudioEngine audio = networkClient.getAudioEngine();
         Participant local = manager.get(networkClient.getClientId());
         if (local != null && audio != null) {
@@ -2474,13 +2836,40 @@ public class WhiteboardApp extends Application {
         networkPort = port;
 
         networkClient = new NetworkClient(host, port, authorName, clientId);
+        networkClient.getParticipantManager().putParticipant(
+                networkClient.getClientId(),
+                networkClient.getAuthorName());
         wireTelemetryHud(networkClient);
         wireMicToggleHud(networkClient.getAudioEngine());
         wireParticipantHud(networkClient.getParticipantManager());
         networkClient.addLobbyListener(rooms ->
-                Platform.runLater(() -> refreshLobbyRooms(rooms)));
+                Platform.runLater(() -> {
+                    lastLobbyRooms = rooms != null ? List.copyOf(rooms) : List.of();
+                    refreshLobbyRooms(lastLobbyRooms);
+                }));
         networkClient.addRoomDeletedListener(() ->
                 Platform.runLater(this::onRoomDeletedByServer));
+        networkClient.addSessionRevokedListener(reason ->
+                Platform.runLater(() -> onSessionRevoked(reason)));
+        networkClient.addRoleUpdateListener(payload ->
+                Platform.runLater(() -> applyRoleUpdate(payload)));
+        networkClient.addRoomMembershipListener(new RoomMembershipListener() {
+            @Override
+            public void onPeerJoined(String clientId, String authorName) {
+                Platform.runLater(() -> handlePeerJoined(clientId, authorName));
+            }
+
+            @Override
+            public void onPeerLeft(String clientId) {
+                Platform.runLater(() -> handlePeerLeft(clientId));
+            }
+        });
+        networkClient.addBoardPresenceListener((clientId, boardId) ->
+                Platform.runLater(() -> {
+                    if (networkClient != null) {
+                        networkClient.getParticipantManager().setCurrentBoardId(clientId, boardId);
+                    }
+                }));
 
         // Callbacks arrive on distrisync-read; marshal to FX thread before touching state
         networkClient.addListener(new CanvasUpdateListener() {
@@ -2492,6 +2881,11 @@ public class WhiteboardApp extends Application {
                     if (canvasContainer != null) {
                         wireMouseEvents(canvasContainer);
                     }
+                    if (networkClient != null) {
+                        networkClient.getParticipantManager().setCurrentBoardId(
+                                networkClient.getClientId(),
+                                networkClient.getCurrentBoardId());
+                    }
                     List<Shape> list = incoming != null ? incoming : List.of();
                     roomId = networkClient != null ? networkClient.getActiveRoomId() : "";
                     Scene cur = primaryStage != null ? primaryStage.getScene() : null;
@@ -2499,7 +2893,9 @@ public class WhiteboardApp extends Application {
                     // still be size 0 / not laid out; drawing first could throw and block the switch.
                     if (primaryStage != null && canvasScene != null && cur != null
                             && cur != canvasScene && (loginScene == null || cur != loginScene)) {
+                        recreateRemoteCursorManager();
                         primaryStage.setScene(canvasScene);
+                        bindPermissionsToUI();
                         primaryStage.setTitle("DistriSync – " + authorName + "  [" + roomId + "]");
                         controlPane.toFront();
                         setStatus("⬤ Connected", GREEN);

@@ -48,7 +48,7 @@ class WhiteboardAppParticipantHudTest extends ApplicationTest {
             participant.setSpeaking(true);
         });
 
-        String avatarId = ParticipantListView.avatarNodeId(TEST_CLIENT_ID);
+        String avatarId = CollaborationRoster.avatarNodeId(TEST_CLIENT_ID);
         StackPane avatar = lookup("#" + avatarId).queryAs(StackPane.class);
         verifyThat(avatar, isVisible());
 

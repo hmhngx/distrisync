@@ -9,6 +9,7 @@ import com.distrisync.protocol.Message;
 import com.distrisync.protocol.MessageCodec;
 import com.distrisync.protocol.MessageType;
 import com.distrisync.protocol.PartialMessageException;
+import com.distrisync.protocol.RoomPermissions;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.slf4j.Logger;
@@ -555,9 +556,17 @@ public final class NioServer implements Runnable {
                 MessageCodec.HandshakePayload hp = MessageCodec.decodeHandshake(msg);
                 session.authorName = hp.authorName();
                 session.clientId   = hp.clientId();
+                ByteBuffer selfJoin = MessageCodec.encodeRoomMemberJoined(
+                        session.clientId, session.authorName);
+                if (safeEnqueue(session, senderKey, selfJoin, OutboundClass.CRITICAL)
+                        != EnqueueResult.OVERFLOW_DISCONNECT) {
+                    flushWriteQueue(session, senderKey);
+                }
                 session.roomId     = "";
                 session.currentBoardId = "";
                 session.handshakeComplete = true;
+                session.connectedAtMillis = System.currentTimeMillis();
+                session.permissions = RoomPermissions.SPECTATOR;
 
                 roomManager.registerHandshakeToLobby(senderKey);
 
@@ -589,10 +598,29 @@ public final class NioServer implements Runnable {
                     session.udpToken = udpToken;
                     udpTokenToSession.put(udpToken, session);
                     session.roomId = rid;
-                    session.currentBoardId = jp.initialBoardId();
+                    String requestedBoardId = jp.initialBoardId();
+                    String resolvedBoardId = resolveJoinBoardId(room, requestedBoardId, session.permissions);
+                    if (!resolvedBoardId.equals(requestedBoardId)) {
+                        log.warn("JOIN_ROOM board override — board creation locked  session={} requested='{}' resolved='{}'",
+                                session.sessionId, requestedBoardId, resolvedBoardId);
+                    }
+                    session.currentBoardId = resolvedBoardId;
+                    ByteBuffer roleFrame = MessageCodec.encodeRoleUpdate(
+                            session.clientId, session.permissions, room.hostClientId);
+                    broadcastToRoom(rid, roleFrame, null, OutboundClass.CRITICAL);
                     sendSnapshot(session, senderKey, room);
                     sendUdpAdmission(session, senderKey, udpToken);
                     broadcastBoardList(room);
+                    broadcastToRoom(rid,
+                            MessageCodec.encodeRoomMemberJoined(session.clientId, session.authorName),
+                            senderKey, OutboundClass.CRITICAL);
+                    fanoutBoardSwitch(room, session.clientId, session.currentBoardId, senderKey);
+                    hydrateBoardPresenceForJoiner(room, senderKey, session);
+                    ByteBuffer lockFrame = MessageCodec.encodeBoardLockState(room.isBoardCreationLocked);
+                    if (safeEnqueue(session, senderKey, lockFrame, OutboundClass.CRITICAL)
+                            != EnqueueResult.OVERFLOW_DISCONNECT) {
+                        flushWriteQueue(session, senderKey);
+                    }
                     log.info("[TCP] Client {} joined Room '{}'. Active users: {}.",
                             clientLogLabel(session), rid, room.getActiveClientCount());
                 } catch (IllegalArgumentException e) {
@@ -609,10 +637,17 @@ public final class NioServer implements Runnable {
                     break;
                 }
                 String cur = session.roomId;
+                String departingClientId = session.clientId;
+                if (!departingClientId.isBlank()) {
+                    broadcastToRoom(cur, MessageCodec.encodeRoomMemberLeft(departingClientId),
+                            senderKey, OutboundClass.CRITICAL);
+                }
                 roomManager.returnClientToLobby(senderKey, cur);
                 revokeUdpAdmission(session);
                 session.roomId = "";
                 session.currentBoardId = "";
+                session.permissions = RoomPermissions.SPECTATOR;
+                maybePromoteHostAfterDepart(cur, departingClientId);
                 log.info("LEAVE_ROOM session={} → lobby", session.sessionId);
             }
 
@@ -640,6 +675,9 @@ public final class NioServer implements Runnable {
             }
 
             case DELETE_ROOM -> {
+                if (!RoomPermissions.canDeleteRoom(session.permissions)) {
+                    return;
+                }
                 if (!session.handshakeComplete) {
                     log.warn("DELETE_ROOM before HANDSHAKE session={}", session.sessionId);
                     break;
@@ -669,6 +707,9 @@ public final class NioServer implements Runnable {
             }
 
             case MUTATION -> {
+                if (!RoomPermissions.canDraw(session.permissions)) {
+                    return;
+                }
                 RoomContext room = resolveRoom(session, senderKey);
                 if (room == null) return;
                 if (session.currentBoardId.isBlank()) {
@@ -716,7 +757,41 @@ public final class NioServer implements Runnable {
                 }
             }
 
+            case SHAPE_DELETE -> {
+                if (!RoomPermissions.canDraw(session.permissions)) {
+                    return;
+                }
+                RoomContext room = resolveRoom(session, senderKey);
+                if (room == null) return;
+                if (session.currentBoardId.isBlank()) {
+                    log.warn("SHAPE_DELETE with no active board session={} — ignoring", session.sessionId);
+                    return;
+                }
+
+                UUID shapeId;
+                try {
+                    JsonObject p = JsonParser.parseString(msg.payload()).getAsJsonObject();
+                    shapeId = UUID.fromString(p.get("shapeId").getAsString());
+                } catch (Exception e) {
+                    log.warn("Malformed SHAPE_DELETE payload from session={}: {}", session.sessionId, e.getMessage());
+                    return;
+                }
+
+                CanvasStateManager board = room.getBoard(session.currentBoardId);
+                if (!board.deleteShape(shapeId)) {
+                    log.debug("SHAPE_DELETE no-op  shapeId={} session={}", shapeId, session.sessionId);
+                    return;
+                }
+
+                roomManager.appendToWal(session.roomId, session.currentBoardId, msg);
+                ByteBuffer frame = MessageCodec.encode(msg);
+                broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey, OutboundClass.CRITICAL);
+            }
+
             case SHAPE_START, SHAPE_UPDATE, SHAPE_COMMIT -> {
+                if (!RoomPermissions.canDraw(session.permissions)) {
+                    return;
+                }
                 RoomContext room = resolveRoom(session, senderKey);
                 if (room == null) return;
                 if (session.currentBoardId.isBlank()) {
@@ -745,6 +820,9 @@ public final class NioServer implements Runnable {
             }
 
             case CLEAR_USER_SHAPES -> {
+                if (!RoomPermissions.canDraw(session.permissions)) {
+                    return;
+                }
                 RoomContext room = resolveRoom(session, senderKey);
                 if (room == null) return;
                 if (session.currentBoardId.isBlank()) {
@@ -772,6 +850,9 @@ public final class NioServer implements Runnable {
             }
 
             case UNDO_REQUEST -> {
+                if (!RoomPermissions.canDraw(session.permissions)) {
+                    return;
+                }
                 RoomContext room = resolveRoom(session, senderKey);
                 if (room == null) return;
                 if (session.currentBoardId.isBlank()) {
@@ -830,13 +911,47 @@ public final class NioServer implements Runnable {
                     break;
                 }
                 boolean boardExisted = room.getActiveBoardIds().contains(bid);
+                if (!boardExisted && room.isBoardCreationLocked
+                        && !RoomPermissions.canManageRoom(session.permissions)) {
+                    log.warn("SWITCH_BOARD rejected — board creation locked  session={} board='{}'",
+                            session.sessionId, bid);
+                    break;
+                }
                 session.currentBoardId = bid;
                 sendSnapshot(session, senderKey, room);
                 if (!boardExisted) {
                     broadcastBoardList(room);
                 }
+                fanoutBoardSwitch(room, session.clientId, bid, senderKey);
                 log.info("[STATE] Client {} switched to Board '{}'. Hydrating state.",
                         clientLogLabel(session), bid);
+            }
+
+            case TOGGLE_BOARD_LOCK -> {
+                if (!session.handshakeComplete) {
+                    log.warn("TOGGLE_BOARD_LOCK before HANDSHAKE session={}", session.sessionId);
+                    break;
+                }
+                if (!RoomPermissions.canManageRoom(session.permissions)) {
+                    log.debug("TOGGLE_BOARD_LOCK denied — insufficient permissions session={}",
+                            session.sessionId);
+                    break;
+                }
+                RoomContext lockRoom = resolveRoom(session, senderKey);
+                if (lockRoom == null) {
+                    return;
+                }
+                boolean locked;
+                try {
+                    locked = MessageCodec.decodeBoardLockCommand(msg).locked();
+                } catch (Exception e) {
+                    log.warn("Malformed TOGGLE_BOARD_LOCK session={}: {}", session.sessionId, e.getMessage());
+                    break;
+                }
+                lockRoom.isBoardCreationLocked = locked;
+                fanoutBoardLockState(lockRoom, locked);
+                log.info("Board creation lock set  room='{}' locked={} by={}",
+                        lockRoom.roomId, locked, clientLogLabel(session));
             }
 
             case LOBBY_STATE -> log.trace("Ignoring client-originated LOBBY_STATE echo session={}", session.sessionId);
@@ -884,10 +999,11 @@ public final class NioServer implements Runnable {
                             session.sessionId, vs.clientId(), session.clientId);
                     break;
                 }
+                session.micMuted = vs.isMuted();
                 log.debug("VOICE_STATE relayed  room='{}' clientId='{}' muted={}",
                         session.roomId, vs.clientId(), vs.isMuted());
                 ByteBuffer frame = MessageCodec.encodeVoiceState(vs.clientId(), vs.isMuted());
-                broadcastToRoom(session.roomId, frame, senderKey);
+                broadcastToRoom(session.roomId, frame, senderKey, OutboundClass.CRITICAL);
             }
 
             case CURSOR_SYNC -> {
@@ -915,6 +1031,47 @@ public final class NioServer implements Runnable {
                         cs.clientId(), cs.authorName(), cs.x(), cs.y());
                 broadcastToRoom(session.roomId, cursorFrame, senderKey);
                 publishPresenceEnvelope(session.roomId, msg);
+            }
+
+            case MODERATION_ACTION -> {
+                if (!RoomPermissions.canManageUsers(session.permissions)) {
+                    return;
+                }
+                if (!session.handshakeComplete) {
+                    log.warn("MODERATION_ACTION before HANDSHAKE session={}", session.sessionId);
+                    break;
+                }
+                RoomContext modRoom = resolveRoom(session, senderKey);
+                if (modRoom == null) {
+                    return;
+                }
+                MessageCodec.ModerationActionPayload modPayload;
+                try {
+                    modPayload = MessageCodec.decodeModerationAction(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed MODERATION_ACTION session={}: {}", session.sessionId, e.getMessage());
+                    break;
+                }
+                String actionType = modPayload.actionType();
+                if ("KICK".equals(actionType)) {
+                    publishControlEnvelope(session.roomId, msg);
+                    executeModerationKick(modRoom, modPayload);
+                    log.info("MODERATION_ACTION KICK  room='{}' target='{}' by={}",
+                            session.roomId, modPayload.targetClientId(), clientLogLabel(session));
+                } else if ("REVOKE_SPEAK".equals(actionType)) {
+                    publishControlEnvelope(session.roomId, msg);
+                    executeModerationRevokeSpeak(modRoom, modPayload);
+                    log.info("MODERATION_ACTION REVOKE_SPEAK  room='{}' target='{}' by={}",
+                            session.roomId, modPayload.targetClientId(), clientLogLabel(session));
+                } else if ("GRANT_SPEAK".equals(actionType)) {
+                    publishControlEnvelope(session.roomId, msg);
+                    executeModerationGrantSpeak(modRoom, modPayload);
+                    log.info("MODERATION_ACTION GRANT_SPEAK  room='{}' target='{}' by={}",
+                            session.roomId, modPayload.targetClientId(), clientLogLabel(session));
+                } else {
+                    log.debug("MODERATION_ACTION ignored unsupported actionType='{}' session={}",
+                            actionType, session.sessionId);
+                }
             }
 
             default -> log.warn("Unexpected message type={} from session={} — ignoring",
@@ -1010,6 +1167,9 @@ public final class NioServer implements Runnable {
         if (speaker == null) {
             return;
         }
+        if (!RoomPermissions.canSpeak(speaker.permissions)) {
+            return;
+        }
         InetSocketAddress registered = speaker.udpEndpoint;
         if (registered == null || !registered.equals(sender)) {
             return;
@@ -1087,6 +1247,29 @@ public final class NioServer implements Runnable {
         }
     }
 
+    /**
+     * Resolves the board id for {@code JOIN_ROOM} before {@link #sendSnapshot} materializes a board.
+     * Non-managers cannot create boards when {@link RoomContext#isBoardCreationLocked} is set.
+     */
+    private String resolveJoinBoardId(RoomContext room, String requestedBoardId, int permissions) {
+        String requested = requestedBoardId != null ? requestedBoardId.strip() : "";
+        if (requested.isBlank()) {
+            requested = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+        }
+        if (room.getActiveBoardIds().contains(requested)) {
+            return requested;
+        }
+        if (room.isBoardCreationLocked && !RoomPermissions.canManageRoom(permissions)) {
+            var active = room.getActiveBoardIds();
+            if (active.isEmpty()) {
+                log.warn("JOIN_ROOM: no active boards for locked member fallback  room='{}'", room.roomId);
+                return MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+            }
+            return active.stream().sorted().findFirst().orElse(MessageCodec.DEFAULT_INITIAL_BOARD_ID);
+        }
+        return requested;
+    }
+
     private void sendSnapshot(ClientSession session, SelectionKey key, RoomContext room) {
         List<Shape> shapes = room.getBoard(session.currentBoardId).snapshot();
         String payload = ShapeCodec.encodeSnapshot(shapes);
@@ -1148,6 +1331,11 @@ public final class NioServer implements Runnable {
             }
             if (peek.type() == MessageType.CURSOR_SYNC) {
                 fanoutRemoteCursorSync(envelope);
+            } else if (peek.type() == MessageType.MODERATION_ACTION) {
+                applyRemoteModerationAction(envelope);
+            } else if (peek.type() == MessageType.BOARD_SWITCH
+                    || peek.type() == MessageType.TOGGLE_BOARD_LOCK) {
+                applyRemoteControlEnvelope(envelope);
             } else {
                 fanoutRemoteEnvelope(envelope);
             }
@@ -1194,6 +1382,190 @@ public final class NioServer implements Runnable {
                 roomId,
                 MessageCodec.DEFAULT_INITIAL_BOARD_ID,
                 MessageCodec.encode(msg)));
+    }
+
+    /**
+     * Publishes a moderation command to the room control channel (no WAL).
+     */
+    private void publishControlEnvelope(String roomId, Message msg) {
+        if (backplanePublisher == null) {
+            return;
+        }
+        String eventId = UUID.randomUUID().toString();
+        backplaneEventDedup.tryRecord(eventId);
+        backplanePublisher.publishControl(new BackplaneEnvelope(
+                eventId,
+                backplanePublisher.originNodeId(),
+                roomId,
+                MessageCodec.DEFAULT_INITIAL_BOARD_ID,
+                MessageCodec.encode(msg)));
+    }
+
+    /**
+     * Applies a remote {@code MODERATION_ACTION} from the control channel on the selector thread.
+     * Must not be called from the Redis subscriber thread.
+     */
+    private void applyRemoteModerationAction(BackplaneEnvelope envelope) {
+        if (envelope.originNodeId().equals(localNodeId)) {
+            return;
+        }
+        if (!backplaneEventDedup.tryRecord(envelope.eventId())) {
+            log.trace("Remote moderation duplicate dropped  eventId='{}'", envelope.eventId());
+            return;
+        }
+
+        Message msg;
+        try {
+            ByteBuffer decodeBuf = envelope.serializedPayload().duplicate();
+            msg = MessageCodec.decode(decodeBuf);
+        } catch (Exception e) {
+            log.warn("Remote moderation decode failed  room='{}' eventId='{}': {}",
+                    envelope.roomId(), envelope.eventId(), e.getMessage());
+            return;
+        }
+
+        if (msg.type() != MessageType.MODERATION_ACTION) {
+            return;
+        }
+
+        MessageCodec.ModerationActionPayload payload;
+        try {
+            payload = MessageCodec.decodeModerationAction(msg);
+        } catch (Exception e) {
+            log.warn("Remote MODERATION_ACTION malformed  room='{}' eventId='{}': {}",
+                    envelope.roomId(), envelope.eventId(), e.getMessage());
+            return;
+        }
+
+        String actionType = payload.actionType();
+        if (!"KICK".equals(actionType) && !"REVOKE_SPEAK".equals(actionType)
+                && !"GRANT_SPEAK".equals(actionType)) {
+            log.debug("Remote MODERATION_ACTION ignored actionType='{}'  room='{}'",
+                    actionType, envelope.roomId());
+            return;
+        }
+
+        RoomContext room = roomManager.getRoom(envelope.roomId());
+        if (room == null) {
+            log.trace("Remote moderation no local room  room='{}' target='{}' action='{}'",
+                    envelope.roomId(), payload.targetClientId(), actionType);
+            return;
+        }
+
+        if ("KICK".equals(actionType)) {
+            executeModerationKick(room, payload);
+        } else if ("REVOKE_SPEAK".equals(actionType)) {
+            executeModerationRevokeSpeak(room, payload);
+        } else {
+            executeModerationGrantSpeak(room, payload);
+        }
+    }
+
+    /**
+     * Terminates the local TCP session for {@code targetClientId} when hosted in {@code room},
+     * then fans out a peer-depart {@link MessageType#LEAVE_ROOM} to every local room client so
+     * observers (including admins on other cluster nodes' local TCP paths) update immediately.
+     * Selector-thread only.
+     */
+    private void executeModerationKick(RoomContext room, MessageCodec.ModerationActionPayload payload) {
+        SelectionKey targetKey = room.lookupClientKey(payload.targetClientId());
+        if (targetKey != null && targetKey.isValid()) {
+            severSession(targetKey, payload.reason());
+        } else {
+            log.trace("KICK target not on this node  room='{}' target='{}'",
+                    room.roomId, payload.targetClientId());
+        }
+        broadcastToRoom(room.roomId,
+                MessageCodec.encodeRoomMemberLeft(payload.targetClientId()),
+                null,
+                OutboundClass.CRITICAL);
+    }
+
+    /**
+     * Clears {@link RoomPermissions#PERM_SPEAK} for {@code targetClientId} when local, then
+     * broadcasts {@link MessageType#ROLE_UPDATE} to all local room clients. Selector-thread only.
+     */
+    private void executeModerationRevokeSpeak(RoomContext room, MessageCodec.ModerationActionPayload payload) {
+        int newPerms = RoomPermissions.PERM_DRAW;
+        SelectionKey targetKey = room.lookupClientKey(payload.targetClientId());
+        if (targetKey != null && targetKey.isValid()) {
+            Object attachment = targetKey.attachment();
+            if (attachment instanceof ClientSession targetSession) {
+                if (targetSession.clientId.equals(room.hostClientId)
+                        && RoomPermissions.canDeleteRoom(targetSession.permissions)) {
+                    log.trace("REVOKE_SPEAK ignored for room owner  room='{}' target='{}'",
+                            room.roomId, payload.targetClientId());
+                    return;
+                }
+                if (!RoomPermissions.canSpeak(targetSession.permissions)) {
+                    log.trace("REVOKE_SPEAK no-op — target already cannot speak  room='{}' target='{}'",
+                            room.roomId, payload.targetClientId());
+                    return;
+                }
+                targetSession.permissions &= ~RoomPermissions.PERM_SPEAK;
+                newPerms = targetSession.permissions;
+            }
+        } else {
+            log.trace("REVOKE_SPEAK target not on this node  room='{}' target='{}'",
+                    room.roomId, payload.targetClientId());
+        }
+        ByteBuffer frame = MessageCodec.encodeRoleUpdate(
+                payload.targetClientId(), newPerms, room.hostClientId);
+        broadcastToRoom(room.roomId, frame, null, OutboundClass.CRITICAL);
+    }
+
+    /**
+     * Sets {@link RoomPermissions#PERM_SPEAK} for {@code targetClientId} when local, then
+     * broadcasts {@link MessageType#ROLE_UPDATE} to all local room clients. Selector-thread only.
+     */
+    private void executeModerationGrantSpeak(RoomContext room, MessageCodec.ModerationActionPayload payload) {
+        int newPerms = RoomPermissions.PERM_DRAW | RoomPermissions.PERM_SPEAK;
+        SelectionKey targetKey = room.lookupClientKey(payload.targetClientId());
+        if (targetKey != null && targetKey.isValid()) {
+            Object attachment = targetKey.attachment();
+            if (attachment instanceof ClientSession targetSession) {
+                if (targetSession.clientId.equals(room.hostClientId)
+                        && RoomPermissions.canDeleteRoom(targetSession.permissions)) {
+                    log.trace("GRANT_SPEAK ignored for room owner  room='{}' target='{}'",
+                            room.roomId, payload.targetClientId());
+                    return;
+                }
+                if (RoomPermissions.canSpeak(targetSession.permissions)) {
+                    log.trace("GRANT_SPEAK no-op — target already can speak  room='{}' target='{}'",
+                            room.roomId, payload.targetClientId());
+                    return;
+                }
+                targetSession.permissions |= RoomPermissions.PERM_SPEAK;
+                newPerms = targetSession.permissions;
+            }
+        } else {
+            log.trace("GRANT_SPEAK target not on this node  room='{}' target='{}'",
+                    room.roomId, payload.targetClientId());
+        }
+        ByteBuffer frame = MessageCodec.encodeRoleUpdate(
+                payload.targetClientId(), newPerms, room.hostClientId);
+        broadcastToRoom(room.roomId, frame, null, OutboundClass.CRITICAL);
+    }
+
+    /**
+     * Notifies the client with {@link MessageType#SESSION_REVOKED}, then closes the connection.
+     * Selector-thread only — must never be invoked from the Redis subscriber thread.
+     */
+    private void severSession(SelectionKey targetKey, String reason) {
+        Object attachment = targetKey.attachment();
+        if (!(attachment instanceof ClientSession session)) {
+            closeKey(targetKey);
+            return;
+        }
+
+        ByteBuffer frame = MessageCodec.encodeSessionRevoked(reason);
+        if (safeEnqueue(session, targetKey, frame, OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
+            return;
+        }
+        flushWriteQueue(session, targetKey);
+        closeKey(targetKey);
+        log.info("Session severed  session={} clientId='{}' room='{}'",
+                session.sessionId, session.clientId, session.roomId);
     }
 
     /**
@@ -1576,6 +1948,11 @@ public final class NioServer implements Runnable {
      * not scoped to a single board.
      */
     private void broadcastToRoom(String roomId, ByteBuffer frame, SelectionKey senderKey) {
+        broadcastToRoom(roomId, frame, senderKey, OutboundClass.EPHEMERAL);
+    }
+
+    private void broadcastToRoom(String roomId, ByteBuffer frame, SelectionKey senderKey,
+                               OutboundClass outboundClass) {
         var activeKeys = roomManager.getActiveClientKeys(roomId);
         if (activeKeys.isEmpty()) {
             if (roomManager.getRoom(roomId) == null) {
@@ -1594,7 +1971,7 @@ public final class NioServer implements Runnable {
             }
 
             ClientSession peer = (ClientSession) key.attachment();
-            EnqueueResult result = safeEnqueue(peer, key, frame, OutboundClass.EPHEMERAL);
+            EnqueueResult result = safeEnqueue(peer, key, frame, outboundClass);
             if (result == EnqueueResult.OVERFLOW_DISCONNECT) {
                 continue;
             }
@@ -1614,6 +1991,115 @@ public final class NioServer implements Runnable {
      * Broadcasts {@link MessageType#BOARD_LIST_UPDATE} to every TCP client currently in
      * {@code room} (all boards). Uses a deterministic lexicographic ordering of ids on the wire.
      */
+    private void fanoutBoardSwitch(RoomContext room, String clientId, String boardId, SelectionKey excludeKey) {
+        if (clientId == null || clientId.isBlank() || boardId == null || boardId.isBlank()) {
+            return;
+        }
+        ByteBuffer frame = MessageCodec.encodeBoardSwitch(clientId, boardId);
+        broadcastToRoom(room.roomId, frame, excludeKey, OutboundClass.CRITICAL);
+        publishControlEnvelope(room.roomId,
+                new Message(MessageType.BOARD_SWITCH,
+                        MessageCodec.gson().toJson(new MessageCodec.BoardSwitchPayload(clientId, boardId))));
+    }
+
+    private void hydrateBoardPresenceForJoiner(RoomContext room, SelectionKey joinerKey, ClientSession joiner) {
+        for (SelectionKey key : room.activeKeysForSelectorIteration()) {
+            if (!key.isValid() || key == joinerKey) {
+                continue;
+            }
+            if (!(key.attachment() instanceof ClientSession peer)) {
+                continue;
+            }
+            String peerId = peer.clientId;
+            if (peerId == null || peerId.isBlank()) {
+                continue;
+            }
+            ByteBuffer joinFrame = MessageCodec.encodeRoomMemberJoined(peerId, peer.authorName);
+            if (safeEnqueue(joiner, joinerKey, joinFrame, OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
+                return;
+            }
+            ByteBuffer roleFrame = MessageCodec.encodeRoleUpdate(
+                    peerId, peer.permissions, room.hostClientId);
+            if (safeEnqueue(joiner, joinerKey, roleFrame, OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
+                return;
+            }
+            String peerBoard = peer.currentBoardId;
+            if (peerBoard != null && !peerBoard.isBlank()) {
+                ByteBuffer boardFrame = MessageCodec.encodeBoardSwitch(peerId, peerBoard);
+                if (safeEnqueue(joiner, joinerKey, boardFrame, OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
+                    return;
+                }
+                ByteBuffer voiceFrame = MessageCodec.encodeVoiceState(peerId, peer.micMuted);
+                if (safeEnqueue(joiner, joinerKey, voiceFrame, OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
+                    return;
+                }
+            }
+        }
+        flushWriteQueue(joiner, joinerKey);
+    }
+
+    private void fanoutBoardLockState(RoomContext room, boolean locked) {
+        ByteBuffer frame = MessageCodec.encodeBoardLockState(locked);
+        broadcastToRoom(room.roomId, frame, null, OutboundClass.CRITICAL);
+        publishControlEnvelope(room.roomId,
+                new Message(MessageType.TOGGLE_BOARD_LOCK,
+                        MessageCodec.gson().toJson(new MessageCodec.BoardLockPayload(locked))));
+    }
+
+    /**
+     * Applies {@code BOARD_SWITCH} or {@code TOGGLE_BOARD_LOCK} from the control channel on this node.
+     */
+    private void applyRemoteControlEnvelope(BackplaneEnvelope envelope) {
+        if (envelope.originNodeId().equals(localNodeId)) {
+            return;
+        }
+        if (!backplaneEventDedup.tryRecord(envelope.eventId())) {
+            log.trace("Remote control duplicate dropped  eventId='{}'", envelope.eventId());
+            return;
+        }
+
+        Message msg;
+        try {
+            ByteBuffer decodeBuf = envelope.serializedPayload().duplicate();
+            msg = MessageCodec.decode(decodeBuf);
+        } catch (Exception e) {
+            log.warn("Remote control decode failed  room='{}' eventId='{}': {}",
+                    envelope.roomId(), envelope.eventId(), e.getMessage());
+            return;
+        }
+
+        RoomContext room = roomManager.getRoom(envelope.roomId());
+        if (room == null) {
+            return;
+        }
+
+        if (msg.type() == MessageType.TOGGLE_BOARD_LOCK) {
+            try {
+                MessageCodec.BoardLockPayload lockPayload = MessageCodec.decodeBoardLockState(msg);
+                room.isBoardCreationLocked = lockPayload.locked();
+                ByteBuffer frame = MessageCodec.encodeBoardLockState(lockPayload.locked());
+                broadcastToRoom(room.roomId, frame, null, OutboundClass.CRITICAL);
+            } catch (Exception e) {
+                log.warn("Remote TOGGLE_BOARD_LOCK malformed  room='{}': {}", room.roomId, e.getMessage());
+            }
+            return;
+        }
+
+        if (msg.type() == MessageType.BOARD_SWITCH) {
+            try {
+                MessageCodec.BoardSwitchPayload payload = MessageCodec.decodeBoardSwitch(msg);
+                SelectionKey targetKey = room.lookupClientKey(payload.clientId());
+                if (targetKey != null && targetKey.attachment() instanceof ClientSession targetSession) {
+                    targetSession.currentBoardId = payload.newBoardId();
+                }
+                ByteBuffer frame = MessageCodec.encodeBoardSwitch(payload.clientId(), payload.newBoardId());
+                broadcastToRoom(room.roomId, frame, null, OutboundClass.CRITICAL);
+            } catch (Exception e) {
+                log.warn("Remote BOARD_SWITCH malformed  room='{}': {}", room.roomId, e.getMessage());
+            }
+        }
+    }
+
     private void broadcastBoardList(RoomContext room) {
         List<String> ids = new ArrayList<>(room.getActiveBoardIds());
         Collections.sort(ids);
@@ -1704,6 +2190,78 @@ public final class NioServer implements Runnable {
     }
 
     // =========================================================================
+    // Host migration (local election on OWNER depart)
+    // =========================================================================
+
+    /**
+     * When the room host disconnects or leaves, promotes the oldest remaining session
+     * ({@link ClientSession#connectedAtMillis}, then lexicographic {@code clientId}).
+     */
+    private void maybePromoteHostAfterDepart(String roomId, String departingClientId) {
+        if (roomId == null || roomId.isBlank()) {
+            return;
+        }
+        if (departingClientId == null || departingClientId.isBlank()) {
+            return;
+        }
+        RoomContext room = roomManager.getRoom(roomId);
+        if (room == null) {
+            return;
+        }
+        if (!departingClientId.equals(room.hostClientId)) {
+            return;
+        }
+        if (room.getActiveClientCount() == 0) {
+            return;
+        }
+
+        ClientSession newHost = selectHostCandidate(room);
+        if (newHost == null) {
+            return;
+        }
+
+        room.hostClientId = newHost.clientId;
+        newHost.permissions = RoomPermissions.OWNER;
+
+        ByteBuffer frame = MessageCodec.encodeRoleUpdate(newHost.clientId, RoomPermissions.OWNER);
+        broadcastToRoom(roomId, frame, null, OutboundClass.CRITICAL);
+
+        log.info("Host migration  room='{}' departed='{}' newHost='{}'",
+                roomId, departingClientId, newHost.clientId);
+    }
+
+    /**
+     * Selects the session with the minimum {@link ClientSession#connectedAtMillis};
+     * ties break on lexicographically smaller {@code clientId}.
+     */
+    static ClientSession selectHostCandidate(RoomContext room) {
+        ClientSession best = null;
+        for (SelectionKey key : room.activeKeysForSelectorIteration()) {
+            if (!key.isValid()) {
+                continue;
+            }
+            if (!(key.attachment() instanceof ClientSession session)) {
+                continue;
+            }
+            String clientId = session.clientId;
+            if (clientId == null || clientId.isBlank()) {
+                continue;
+            }
+            if (best == null) {
+                best = session;
+                continue;
+            }
+            int cmp = Long.compare(session.connectedAtMillis, best.connectedAtMillis);
+            if (cmp < 0) {
+                best = session;
+            } else if (cmp == 0 && clientId.compareTo(best.clientId) < 0) {
+                best = session;
+            }
+        }
+        return best;
+    }
+
+    // =========================================================================
     // Session teardown
     // =========================================================================
 
@@ -1711,11 +2269,18 @@ public final class NioServer implements Runnable {
         Object attachment = key.attachment();
 
         if (attachment instanceof ClientSession s) {
+            String roomId = s.roomId;
+            String departingClientId = s.clientId;
             revokeUdpAdmission(s);
             if (roomManager.isInLobby(key)) {
                 roomManager.removeFromLobby(key);
-            } else if (!s.roomId.isBlank()) {
-                roomManager.removeClientFromRoom(s.roomId, key);
+            } else if (!roomId.isBlank()) {
+                roomManager.removeClientFromRoom(roomId, key);
+                if (departingClientId != null && !departingClientId.isBlank()) {
+                    broadcastToRoom(roomId, MessageCodec.encodeRoomMemberLeft(departingClientId),
+                            key, OutboundClass.CRITICAL);
+                }
+                maybePromoteHostAfterDepart(roomId, departingClientId);
             }
             activeTcpSockets.decrementAndGet();
             log.info("Closing channel  session={} room='{}'", s.sessionId,

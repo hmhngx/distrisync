@@ -86,6 +86,15 @@ public final class RedisBackplanePublisher implements AutoCloseable {
                 envelope, BackplaneEnvelopeCodec.presenceChannel(envelope.roomId())));
     }
 
+    /**
+     * Publishes to the room control channel for cross-node moderation (no WAL).
+     */
+    public void publishControl(BackplaneEnvelope envelope) {
+        Objects.requireNonNull(envelope, "envelope must not be null");
+        executor.execute(() -> publishOnWorker(
+                envelope, BackplaneEnvelopeCodec.controlChannel(envelope.roomId())));
+    }
+
     private void publishOnWorker(BackplaneEnvelope envelope, String channel) {
         try {
             byte[] body = BackplaneEnvelopeCodec.encode(envelope);
