@@ -159,6 +159,25 @@ public final class NetworkClient implements AutoCloseable {
     private final CopyOnWriteArrayList<CursorSyncListener> cursorSyncListeners =
             new CopyOnWriteArrayList<>();
 
+    private final CopyOnWriteArrayList<SessionRevokedListener> sessionRevokedListeners =
+            new CopyOnWriteArrayList<>();
+
+    private final CopyOnWriteArrayList<RoleUpdateListener> roleUpdateListeners =
+            new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<RoomMembershipListener> roomMembershipListeners =
+            new CopyOnWriteArrayList<>();
+
+    private final CopyOnWriteArrayList<BoardPresenceListener> boardPresenceListeners =
+            new CopyOnWriteArrayList<>();
+
+    private final RoomState roomState = new RoomState();
+
+    /**
+     * When {@code false}, {@link #handleDisconnect} does not run the reconnect loop
+     * (e.g. after {@link MessageType#SESSION_REVOKED}).
+     */
+    private final AtomicBoolean autoReconnectEnabled = new AtomicBoolean(true);
+
     /** Minimum interval between {@link #sendCursorSync} frames (~15 Hz). */
     private static final long CURSOR_SYNC_MIN_INTERVAL_MS = 66;
 
@@ -167,7 +186,7 @@ public final class NetworkClient implements AutoCloseable {
     /** Opaque UDP relay token from the latest {@link MessageType#UDP_ADMISSION}; empty until admitted. */
     private volatile String udpToken = "";
 
-    private final AudioEngine audioEngine = new AudioEngine();
+    private volatile AudioEngine audioEngine = new AudioEngine();
 
     private final ParticipantManager participantManager = new ParticipantManager();
 
@@ -413,6 +432,77 @@ public final class NetworkClient implements AutoCloseable {
     }
 
     /**
+     * Requests removal of a peer from the current room ({@link MessageType#MODERATION_ACTION} KICK).
+     * No-op when not connected, not in a room, or {@code targetClientId} is blank.
+     */
+    public void sendModerationKick(String targetClientId, String reason) {
+        if (!running.get()) {
+            return;
+        }
+        String rid = activeRoomId;
+        if (rid == null || rid.isBlank()) {
+            log.debug("sendModerationKick ignored — not in a room");
+            return;
+        }
+        String target = targetClientId != null ? targetClientId.strip() : "";
+        if (target.isBlank()) {
+            log.debug("sendModerationKick ignored — blank targetClientId");
+            return;
+        }
+        String r = reason != null ? reason : "";
+        enqueueFrame(MessageCodec.encodeModerationAction("KICK", target, r));
+        log.debug("MODERATION_ACTION KICK enqueued targetClientId='{}'", target);
+    }
+
+    /**
+     * Requests revocation of a peer's speak permission ({@link MessageType#MODERATION_ACTION}
+     * {@code REVOKE_SPEAK}). No-op when not connected, not in a room, or {@code targetClientId}
+     * is blank.
+     */
+    public void sendModerationRevokeSpeak(String targetClientId, String reason) {
+        if (!running.get()) {
+            return;
+        }
+        String rid = activeRoomId;
+        if (rid == null || rid.isBlank()) {
+            log.debug("sendModerationRevokeSpeak ignored — not in a room");
+            return;
+        }
+        String target = targetClientId != null ? targetClientId.strip() : "";
+        if (target.isBlank()) {
+            log.debug("sendModerationRevokeSpeak ignored — blank targetClientId");
+            return;
+        }
+        String r = reason != null ? reason : "";
+        enqueueFrame(MessageCodec.encodeModerationAction("REVOKE_SPEAK", target, r));
+        log.debug("MODERATION_ACTION REVOKE_SPEAK enqueued targetClientId='{}'", target);
+    }
+
+    /**
+     * Requests restoration of a peer's speak permission ({@link MessageType#MODERATION_ACTION}
+     * {@code GRANT_SPEAK}). No-op when not connected, not in a room, or {@code targetClientId}
+     * is blank.
+     */
+    public void sendModerationGrantSpeak(String targetClientId, String reason) {
+        if (!running.get()) {
+            return;
+        }
+        String rid = activeRoomId;
+        if (rid == null || rid.isBlank()) {
+            log.debug("sendModerationGrantSpeak ignored — not in a room");
+            return;
+        }
+        String target = targetClientId != null ? targetClientId.strip() : "";
+        if (target.isBlank()) {
+            log.debug("sendModerationGrantSpeak ignored — blank targetClientId");
+            return;
+        }
+        String r = reason != null ? reason : "";
+        enqueueFrame(MessageCodec.encodeModerationAction("GRANT_SPEAK", target, r));
+        log.debug("MODERATION_ACTION GRANT_SPEAK enqueued targetClientId='{}'", target);
+    }
+
+    /**
      * Sends an {@code UNDO_REQUEST} to the server asking it to delete the shape
      * identified by {@code shapeId}.  If the shape exists in the authoritative
      * state the server removes it and broadcasts a {@code SHAPE_DELETE} frame to
@@ -497,9 +587,30 @@ public final class NetworkClient implements AutoCloseable {
         return audioEngine;
     }
 
+    /**
+     * Replaces the audio engine after {@link MessageType#SESSION_REVOKED} closed the prior instance.
+     * Safe to call from the FX thread when returning to the lobby.
+     */
+    public void reinitializeAudioEngine() {
+        AudioEngine old = audioEngine;
+        old.close();
+        AudioEngine fresh = new AudioEngine();
+        fresh.setVoiceStateSync(this::sendVoiceState);
+        fresh.setParticipantManager(participantManager);
+        audioEngine = fresh;
+        if (running.get()) {
+            fresh.startReceiveDaemon();
+        }
+    }
+
     /** Room participant roster and peer audio state for UI binding. */
     public ParticipantManager getParticipantManager() {
         return participantManager;
+    }
+
+    /** Room-level flags (board lock, etc.) for UI binding. */
+    public RoomState getRoomState() {
+        return roomState;
     }
 
     /**
@@ -588,6 +699,54 @@ public final class NetworkClient implements AutoCloseable {
         }
     }
 
+    public void addSessionRevokedListener(SessionRevokedListener listener) {
+        if (listener != null) {
+            sessionRevokedListeners.addIfAbsent(listener);
+        }
+    }
+
+    public void removeSessionRevokedListener(SessionRevokedListener listener) {
+        if (listener != null) {
+            sessionRevokedListeners.remove(listener);
+        }
+    }
+
+    public void addRoleUpdateListener(RoleUpdateListener listener) {
+        if (listener != null) {
+            roleUpdateListeners.addIfAbsent(listener);
+        }
+    }
+
+    public void removeRoleUpdateListener(RoleUpdateListener listener) {
+        if (listener != null) {
+            roleUpdateListeners.remove(listener);
+        }
+    }
+
+    public void addRoomMembershipListener(RoomMembershipListener listener) {
+        if (listener != null) {
+            roomMembershipListeners.addIfAbsent(listener);
+        }
+    }
+
+    public void removeRoomMembershipListener(RoomMembershipListener listener) {
+        if (listener != null) {
+            roomMembershipListeners.remove(listener);
+        }
+    }
+
+    public void addBoardPresenceListener(BoardPresenceListener listener) {
+        if (listener != null) {
+            boardPresenceListeners.addIfAbsent(listener);
+        }
+    }
+
+    public void removeBoardPresenceListener(BoardPresenceListener listener) {
+        if (listener != null) {
+            boardPresenceListeners.remove(listener);
+        }
+    }
+
     /**
      * Publishes this client's canvas cursor position to peers ({@link MessageType#CURSOR_SYNC}).
      * Rate-limited to ~15 Hz. Silently no-ops when not connected.
@@ -663,6 +822,7 @@ public final class NetworkClient implements AutoCloseable {
         currentBoardId = "";
         lastSnapshotBoardId = "";
         participantManager.clear();
+        runOnFxThreadIfPossible(roomState::reset);
         notifyWorkspaceListeners();
     }
 
@@ -830,9 +990,26 @@ public final class NetworkClient implements AutoCloseable {
         currentBoardId = bid;
         lastSnapshotBoardId = bid;
         ensureBoardKnown(bid);
+        participantManager.setCurrentBoardId(clientId, bid);
         notifyWorkspaceListeners();
         enqueueFrame(MessageCodec.encodeSwitchBoard(bid));
         log.debug("SWITCH_BOARD enqueued boardId='{}'", bid);
+    }
+
+    /**
+     * Sets the room board-creation lock on the server (requires {@link com.distrisync.protocol.RoomPermissions#PERM_MANAGE_ROOM}).
+     */
+    public void sendBoardLockState(boolean locked) {
+        if (!running.get()) {
+            return;
+        }
+        String rid = activeRoomId;
+        if (rid == null || rid.isBlank()) {
+            log.debug("sendBoardLockState ignored — not in a room");
+            return;
+        }
+        enqueueFrame(MessageCodec.encodeBoardLockCommand(locked));
+        log.debug("TOGGLE_BOARD_LOCK enqueued roomId='{}' locked={}", rid, locked);
     }
 
     /**
@@ -1194,8 +1371,36 @@ public final class NetworkClient implements AutoCloseable {
                     log.debug("Malformed LOBBY_STATE ignored: {}", e.getMessage());
                 }
             }
-            case JOIN_ROOM, LEAVE_ROOM ->
-                    log.trace("Ignoring echoed client-bound message type: {}", msg.type());
+            case JOIN_ROOM -> {
+                try {
+                    MessageCodec.RoomMemberJoinedPayload p = MessageCodec.decodeRoomMemberJoined(msg);
+                    participantManager.putParticipant(p.clientId(), p.authorName());
+                    if (p.clientId().equals(clientId)) {
+                        break;
+                    }
+                    log.debug("JOIN_ROOM peer-join clientId='{}' authorName='{}'",
+                            p.clientId(), p.authorName());
+                    for (RoomMembershipListener listener : roomMembershipListeners) {
+                        listener.onPeerJoined(p.clientId(), p.authorName());
+                    }
+                } catch (IllegalArgumentException e) {
+                    log.trace("JOIN_ROOM not a peer-join notification: {}", e.getMessage());
+                }
+            }
+            case LEAVE_ROOM -> {
+                try {
+                    String peerId = MessageCodec.decodeRoomMemberLeft(msg);
+                    if (peerId.equals(clientId)) {
+                        break;
+                    }
+                    log.debug("LEAVE_ROOM peer-depart clientId='{}'", peerId);
+                    for (RoomMembershipListener listener : roomMembershipListeners) {
+                        listener.onPeerLeft(peerId);
+                    }
+                } catch (IllegalArgumentException e) {
+                    log.trace("LEAVE_ROOM not a peer-depart notification: {}", e.getMessage());
+                }
+            }
             case ROOM_DELETED -> {
                 log.info("ROOM_DELETED received — clearing local room state");
                 activeRoomId = "";
@@ -1277,6 +1482,77 @@ public final class NetworkClient implements AutoCloseable {
             }
             case FETCH_LOBBY ->
                     log.trace("Ignoring unexpected inbound FETCH_LOBBY (client-originated type)");
+            case SESSION_REVOKED -> {
+                String reason;
+                try {
+                    reason = MessageCodec.decodeSessionRevoked(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed SESSION_REVOKED ignored: {}", e.getMessage());
+                    reason = "";
+                }
+                log.info("SESSION_REVOKED received reason='{}'", reason);
+                suppressAutoReconnect();
+                activeRoomId = "";
+                resetWorkspaceForLobby();
+                publishUdpActive(false);
+                audioEngine.stopCaptureDaemon();
+                // UI teardown (overlay, cursors) is handled by SessionRevokedListener implementations.
+                for (SessionRevokedListener listener : sessionRevokedListeners) {
+                    try {
+                        listener.onSessionRevoked(reason);
+                    } catch (Exception e) {
+                        log.warn("sessionRevokedListener failed: {}", e.getMessage());
+                    }
+                }
+            }
+            case ROLE_UPDATE -> {
+                try {
+                    MessageCodec.RoleUpdatePayload p = MessageCodec.decodeRoleUpdate(msg);
+                    log.debug("ROLE_UPDATE received clientId='{}' perms={}",
+                            p.newHostClientId(), p.newPermissions());
+                    participantManager.updatePermissions(p.newHostClientId(), p.newPermissions());
+                    if (p.newHostClientId().equals(clientId)) {
+                        participantManager.setLocalPermissions(p.newPermissions());
+                    }
+                    for (RoleUpdateListener listener : roleUpdateListeners) {
+                        try {
+                            listener.onRoleUpdate(p);
+                        } catch (Exception e) {
+                            log.warn("roleUpdateListener failed: {}", e.getMessage());
+                        }
+                    }
+                } catch (Exception e) {
+                    log.warn("Malformed ROLE_UPDATE ignored: {}", e.getMessage());
+                }
+            }
+            case BOARD_SWITCH -> {
+                try {
+                    MessageCodec.BoardSwitchPayload p = MessageCodec.decodeBoardSwitch(msg);
+                    if (p.clientId().equals(clientId)) {
+                        break;
+                    }
+                    log.debug("BOARD_SWITCH peer='{}' board='{}'", p.clientId(), p.newBoardId());
+                    participantManager.setCurrentBoardId(p.clientId(), p.newBoardId());
+                    for (BoardPresenceListener listener : boardPresenceListeners) {
+                        try {
+                            listener.onPeerBoardSwitch(p.clientId(), p.newBoardId());
+                        } catch (Exception e) {
+                            log.warn("boardPresenceListener failed: {}", e.getMessage());
+                        }
+                    }
+                } catch (Exception e) {
+                    log.warn("Malformed BOARD_SWITCH ignored: {}", e.getMessage());
+                }
+            }
+            case TOGGLE_BOARD_LOCK -> {
+                try {
+                    MessageCodec.BoardLockPayload p = MessageCodec.decodeBoardLockState(msg);
+                    log.debug("TOGGLE_BOARD_LOCK state locked={}", p.locked());
+                    runOnFxThreadIfPossible(() -> roomState.setBoardCreationLocked(p.locked()));
+                } catch (Exception e) {
+                    log.warn("Malformed TOGGLE_BOARD_LOCK ignored: {}", e.getMessage());
+                }
+            }
             default -> log.warn("Ignoring unexpected inbound message type={} — check client/server versions",
                     msg.type());
         }
@@ -1292,6 +1568,41 @@ public final class NetworkClient implements AutoCloseable {
         dispatchMessage(new Message(MessageType.ROOM_DELETED, ""));
         // Leaves {@code running} / {@code protocolReady} armed so async eviction UI can call
         // {@link #sendFetchLobby()}; {@link #close()} when the harness is done.
+    }
+
+    /**
+     * Feeds {@code SESSION_REVOKED} through {@link #dispatchMessage} for unit tests.
+     */
+    void ingestSessionRevokedForStateTest(String reason) {
+        running.set(true);
+        protocolReady.set(true);
+        activeRoomId = "test-room";
+        try {
+            ByteBuffer frame = MessageCodec.encodeSessionRevoked(reason != null ? reason : "");
+            Message msg = MessageCodec.decode(frame);
+            dispatchMessage(msg);
+        } catch (Exception e) {
+            throw new IllegalStateException("SESSION_REVOKED test frame failed", e);
+        }
+    }
+
+    /**
+     * Feeds {@code ROLE_UPDATE} through {@link #dispatchMessage} for unit tests.
+     */
+    void ingestRoleUpdateForStateTest(String affectedClientId, int permissions, String roomHostClientId) {
+        running.set(true);
+        protocolReady.set(true);
+        try {
+            ByteBuffer frame = MessageCodec.encodeRoleUpdate(affectedClientId, permissions, roomHostClientId);
+            Message msg = MessageCodec.decode(frame);
+            dispatchMessage(msg);
+        } catch (Exception e) {
+            throw new IllegalStateException("ROLE_UPDATE test frame failed", e);
+        }
+    }
+
+    boolean isAutoReconnectEnabledForTest() {
+        return autoReconnectEnabled.get();
     }
 
     /**
@@ -1382,7 +1693,55 @@ public final class NetworkClient implements AutoCloseable {
         }
     }
 
+    private void suppressAutoReconnect() {
+        autoReconnectEnabled.set(false);
+    }
+
+    /**
+     * Restores TCP after a moderation kick once the user returns to the lobby.
+     * Re-enables auto-reconnect and performs handshake + lobby fetch without re-joining a room.
+     */
+    public void resumeAfterSessionRevoked() {
+        if (!running.get()) {
+            return;
+        }
+        autoReconnectEnabled.set(true);
+        Thread t = new Thread(() -> {
+            try {
+                synchronized (this) {
+                    publishUdpActive(false);
+                    protocolReady.set(false);
+                    deferredJoinRoomId = "";
+                    deferredJoinBoardId = "";
+                    SocketChannel stale = channel;
+                    if (stale != null) {
+                        try {
+                            stale.close();
+                        } catch (IOException ignored) {
+                        }
+                    }
+                    channel = connectWithBackoff();
+                    sendHandshake();
+                    protocolReady.set(true);
+                    sendFetchLobby();
+                    log.info("Resumed TCP to {}:{} after SESSION_REVOKED (lobby)", host, port);
+                }
+            } catch (IOException e) {
+                log.warn("resumeAfterSessionRevoked failed: {}", e.getMessage());
+                publishTcpConnected(false);
+            }
+        }, "distrisync-resume");
+        t.setDaemon(true);
+        t.start();
+    }
+
     private void handleDisconnect(String reason) {
+        if (!autoReconnectEnabled.get()) {
+            log.info("Disconnected ({}) — auto-reconnect suppressed (session revoked)", reason);
+            publishTcpConnected(false);
+            publishUdpActive(false);
+            return;
+        }
         log.warn("Disconnected ({}); starting reconnect sequence…", reason);
         try {
             reconnect();

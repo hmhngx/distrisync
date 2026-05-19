@@ -41,4 +41,75 @@ class ParticipantManagerTest {
             assertThat(participant.isMutedProperty().get()).isTrue();
         });
     }
+
+    @Test
+    void setCurrentBoardId_updatesParticipantBoard() {
+        ParticipantManager participantManager = new ParticipantManager();
+        participantManager.putParticipant("peer-1", "Peer One");
+        participantManager.setCurrentBoardId("peer-1", "Board-2");
+
+        await().atMost(3, TimeUnit.SECONDS).untilAsserted(() -> {
+            Participant participant = participantManager.get("peer-1");
+            assertThat(participant).isNotNull();
+            assertThat(participant.getCurrentBoardId()).isEqualTo("Board-2");
+        });
+    }
+
+    @Test
+    void putParticipant_overwritesUuidSeedWhenRealNameArrives() {
+        String clientId = "550e8400-e29b-41d4-a716-446655440000";
+        ParticipantManager participantManager = new ParticipantManager();
+        participantManager.setCurrentBoardId(clientId, "Board-1");
+        participantManager.putParticipant(clientId, "Alice");
+
+        await().atMost(3, TimeUnit.SECONDS).untilAsserted(() -> {
+            Participant participant = participantManager.get(clientId);
+            assertThat(participant).isNotNull();
+            assertThat(participant.getName()).isEqualTo("Alice");
+        });
+    }
+
+    @Test
+    void putParticipant_overwritesClientIdPlaceholderWhenRealNameArrives() {
+        String clientId = "client-a";
+        ParticipantManager participantManager = new ParticipantManager();
+        participantManager.setCurrentBoardId(clientId, "Board-1");
+        participantManager.putParticipant(clientId, "Alice");
+
+        await().atMost(3, TimeUnit.SECONDS).untilAsserted(() -> {
+            Participant participant = participantManager.get(clientId);
+            assertThat(participant).isNotNull();
+            assertThat(participant.getName()).isEqualTo("Alice");
+        });
+    }
+
+    @Test
+    void putParticipant_overwritesStaleNameWhenRealNameArrives() {
+        String clientId = "client-a";
+        ParticipantManager participantManager = new ParticipantManager();
+        participantManager.putParticipant(clientId, "Stale Name");
+        participantManager.putParticipant(clientId, "Alice");
+
+        await().atMost(3, TimeUnit.SECONDS).untilAsserted(() -> {
+            Participant participant = participantManager.get(clientId);
+            assertThat(participant).isNotNull();
+            assertThat(participant.getName()).isEqualTo("Alice");
+        });
+    }
+
+    @Test
+    void remove_evictsParticipantFromRoster() {
+        ParticipantManager participantManager = new ParticipantManager();
+        participantManager.putParticipant("peer-1", "Peer One");
+
+        await().atMost(3, TimeUnit.SECONDS).untilAsserted(() ->
+                assertThat(participantManager.getParticipants()).hasSize(1));
+
+        participantManager.remove("peer-1");
+
+        await().atMost(3, TimeUnit.SECONDS).untilAsserted(() -> {
+            assertThat(participantManager.get("peer-1")).isNull();
+            assertThat(participantManager.getParticipants()).isEmpty();
+        });
+    }
 }

@@ -1,6 +1,11 @@
 package com.distrisync.client;
 
+import com.distrisync.protocol.MessageCodec;
+import com.distrisync.protocol.RoomPermissions;
+
 import javafx.application.Platform;
+import javafx.beans.property.IntegerProperty;
+import javafx.beans.property.SimpleIntegerProperty;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 
@@ -18,11 +23,69 @@ public final class ParticipantManager implements VoiceStateListener {
     private final ConcurrentHashMap<String, Participant> byClientId = new ConcurrentHashMap<>();
     private final ObservableList<Participant> participants = FXCollections.observableArrayList();
 
+    private final IntegerProperty localPermissionsProperty =
+            new SimpleIntegerProperty(RoomPermissions.SPECTATOR);
+
+    private volatile String hostClientId = "";
+
     /**
      * Live list for UI binding (ListView, etc.). Mutate only via this manager on the FX thread.
      */
     public ObservableList<Participant> getParticipants() {
         return participants;
+    }
+
+    /**
+     * Bitmask of capabilities for the local user in the current room.
+     * Updated on join and {@code ROLE_UPDATE}; read on the FX thread.
+     */
+    public int getLocalPermissions() {
+        return localPermissionsProperty.get();
+    }
+
+    public IntegerProperty localPermissionsProperty() {
+        return localPermissionsProperty;
+    }
+
+    public String getHostClientId() {
+        return hostClientId != null ? hostClientId : "";
+    }
+
+    /**
+     * Updates the local user's permission mask (marshals to the FX application thread).
+     */
+    public void setLocalPermissions(int perms) {
+        runOnFxThread(() -> localPermissionsProperty.set(perms));
+    }
+
+    public void setHostClientId(String clientId) {
+        runOnFxThread(() -> hostClientId = clientId != null ? clientId : "");
+    }
+
+    public void updatePermissions(String clientId, int perms) {
+        if (clientId == null || clientId.isBlank()) {
+            return;
+        }
+        runOnFxThread(() -> {
+            Participant participant = byClientId.get(clientId);
+            if (participant == null) {
+                participant = ensureParticipantOnFx(clientId, clientId);
+            }
+            participant.setPermissions(perms);
+            if (RoomPermissions.canDeleteRoom(perms)) {
+                hostClientId = clientId;
+            }
+        });
+    }
+
+    public void setCurrentBoardId(String clientId, String boardId) {
+        if (clientId == null || clientId.isBlank()) {
+            return;
+        }
+        runOnFxThread(() -> {
+            Participant participant = ensureParticipantOnFx(clientId, clientId);
+            participant.setCurrentBoardId(boardId);
+        });
     }
 
     /**
@@ -42,7 +105,31 @@ public final class ParticipantManager implements VoiceStateListener {
         if (clientId == null) {
             throw new IllegalArgumentException("clientId must not be null");
         }
-        runOnFxThread(() -> ensureParticipantOnFx(clientId, displayName));
+        runOnFxThread(() -> {
+            Participant existing = byClientId.get(clientId);
+            if (existing != null) {
+                if (displayName != null && !displayName.isBlank() && !displayName.equals(clientId)) {
+                    existing.setName(displayName);
+                }
+                return;
+            }
+            ensureParticipantOnFx(clientId, displayName);
+        });
+    }
+
+    /**
+     * Removes a peer from the roster (e.g. after server {@code LEAVE_ROOM} peer-depart).
+     */
+    public void remove(String clientId) {
+        if (clientId == null || clientId.isBlank()) {
+            return;
+        }
+        runOnFxThread(() -> {
+            Participant removed = byClientId.remove(clientId);
+            if (removed != null) {
+                participants.remove(removed);
+            }
+        });
     }
 
     /**
@@ -52,6 +139,8 @@ public final class ParticipantManager implements VoiceStateListener {
         runOnFxThread(() -> {
             byClientId.clear();
             participants.clear();
+            hostClientId = "";
+            localPermissionsProperty.set(RoomPermissions.SPECTATOR);
         });
     }
 
@@ -85,17 +174,41 @@ public final class ParticipantManager implements VoiceStateListener {
     private Participant ensureParticipantOnFx(String clientId, String displayName) {
         Participant existing = byClientId.get(clientId);
         if (existing != null) {
-            if (displayName != null && !displayName.isBlank() && existing.getName().isBlank()) {
-                existing.setName(displayName);
+            if (displayName != null && !displayName.isBlank()) {
+                if (existing.getName().isBlank() || existing.getName().equals(clientId)) {
+                    existing.setName(displayName);
+                }
             }
             return existing;
         }
         Participant created = new Participant(clientId, displayName);
+        if (clientId.equals(hostClientId)) {
+            created.setPermissions(RoomPermissions.OWNER);
+        }
         byClientId.put(clientId, created);
         if (!participants.contains(created)) {
             participants.add(created);
         }
         return created;
+    }
+
+    /**
+     * Seeds a new peer with default member permissions and optional initial board id.
+     */
+    public void onPeerJoined(String clientId, String displayName, String initialBoardId) {
+        if (clientId == null) {
+            return;
+        }
+        runOnFxThread(() -> {
+            Participant participant = ensureParticipantOnFx(clientId, displayName);
+            participant.setPermissions(RoomPermissions.MEMBER);
+            if (clientId.equals(hostClientId)) {
+                participant.setPermissions(RoomPermissions.OWNER);
+            }
+            if (initialBoardId != null && !initialBoardId.isBlank()) {
+                participant.setCurrentBoardId(initialBoardId);
+            }
+        });
     }
 
     private static void runOnFxThread(Runnable action) {
