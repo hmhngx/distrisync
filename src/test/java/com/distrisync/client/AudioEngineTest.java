@@ -8,6 +8,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.SourceDataLine;
 import javax.sound.sampled.TargetDataLine;
 import java.net.DatagramSocket;
 import java.nio.charset.StandardCharsets;
@@ -146,11 +147,41 @@ class AudioEngineTest {
             assertThat(engine.isMicMuted()).isTrue();
             await().atMost(1, SECONDS).untilAsserted(() ->
                     assertThat(engine.isMicMutedProperty().get()).isTrue());
+            verify(mockLine, atLeastOnce()).flush();
             verify(mockLine, never()).close();
 
             engine.close();
             verify(mockLine, atLeastOnce()).close();
         }
+    }
+
+    @Test
+    @DisplayName("remote speaking decay flushes shared playback buffer")
+    void testRemoteSpeakingDecayFlushesPlaybackBuffer() {
+        AtomicLong clock = new AtomicLong(1_000L);
+        ParticipantManager participantManager = new ParticipantManager();
+        participantManager.putParticipant("sender-1", "Peer One");
+
+        SourceDataLine mockPlayback = mock(SourceDataLine.class);
+        when(mockPlayback.isOpen()).thenReturn(true);
+
+        AudioEngine engine = new AudioEngine();
+        engine.setMillisClockForTests(clock::get);
+        engine.setParticipantManager(participantManager);
+        engine.setDeafened(false);
+        engine.setPlaybackLineForTests(mockPlayback);
+
+        engine.ingestRemoteDatagramForTest(remoteAudioDatagram("sender-1"), 0);
+
+        await().atMost(2, SECONDS).untilAsserted(() ->
+                assertThat(participantManager.get("sender-1").isSpeakingProperty().get()).isTrue());
+
+        clock.addAndGet(300);
+        engine.runRemoteSpeakingDecayForTest();
+
+        await().atMost(2, SECONDS).untilAsserted(() ->
+                assertThat(participantManager.get("sender-1").isSpeakingProperty().get()).isFalse());
+        verify(mockPlayback).flush();
     }
 
     @Test

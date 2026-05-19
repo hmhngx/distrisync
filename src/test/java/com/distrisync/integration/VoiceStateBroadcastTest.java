@@ -21,8 +21,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.verify;
 
 /**
@@ -113,17 +113,16 @@ class VoiceStateBroadcastTest {
 
     @Test
     void testVoiceStateBroadcast() {
-        clientA.sendVoiceState(true);
+        // Late-join hydration sends default micMuted=true; use false after reset so only
+        // the live relay matches.
+        reset(listenerB);
+        clientA.sendVoiceState(false);
 
         await("Client B receives VOICE_STATE from Client A")
                 .atMost(BCAST_TIMEOUT_S, TimeUnit.SECONDS)
                 .pollInterval(POLL_MS, TimeUnit.MILLISECONDS)
                 .untilAsserted(() ->
-                        verify(listenerB, atLeastOnce()).onVoiceState(eq("client-a"), eq(true)));
-
-        MessageCodec.VoiceStatePayload received =
-                new MessageCodec.VoiceStatePayload("client-a", true);
-        verify(listenerB).onVoiceState(received.clientId(), received.isMuted());
+                        verify(listenerB).onVoiceState(eq("client-a"), eq(false)));
     }
 
     private static final class SnapshotGate implements CanvasUpdateListener {
