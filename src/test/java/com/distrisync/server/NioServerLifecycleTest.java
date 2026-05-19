@@ -64,6 +64,10 @@ class NioServerLifecycleTest {
             writeFully(channel, MessageCodec.encodeHandshake("deleter", "deleter-client"));
             drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
+            // Must join as room owner — lobby clients lack PERM_DELETE_ROOM (RBAC Phase 1).
+            writeFully(channel, MessageCodec.encodeJoinRoom(roomId, boardId));
+            drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
+
             writeFully(channel, MessageCodec.encodeDeleteRoom(roomId));
 
             Message lobbyState = readUntilType(channel, ByteBuffer.allocate(256 * 1024),

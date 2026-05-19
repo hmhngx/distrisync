@@ -486,6 +486,9 @@ class NioServerTest {
      * Two clients share one room but different boards. A mutation from the Math-Notes client
      * must apply only to that board's {@link CanvasStateManager} and must be broadcast only to
      * peers on the same board — not to clients on another board.
+     *
+     * <p>The room owner pre-creates {@code Diagrams} via {@code SWITCH_BOARD} because board
+     * creation is locked by default; members cannot materialize a new board on {@code JOIN_ROOM}.
      */
     @Test
     void testBoardCreationAndIsolation() throws Exception {
@@ -509,6 +512,23 @@ class NioServerTest {
             clientC.connect();
 
             clientA.sendJoinRoom("SharedRoom", "Math-Notes");
+
+            await("owner receives initial SNAPSHOT on Math-Notes")
+                    .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
+                    .pollInterval(POLL_MS, TimeUnit.MILLISECONDS)
+                    .until(() -> listenerA.snapshotSeen.get());
+
+            clientA.sendSwitchBoard("Diagrams");
+            await("owner materialises Diagrams board")
+                    .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
+                    .pollInterval(POLL_MS, TimeUnit.MILLISECONDS)
+                    .until(() -> {
+                        RoomContext room = roomManager.getRoom("SharedRoom");
+                        return room != null && room.getActiveBoardIds().contains("Diagrams");
+                    });
+
+            clientA.sendSwitchBoard("Math-Notes");
+
             clientB.sendJoinRoom("SharedRoom", "Diagrams");
             clientC.sendJoinRoom("SharedRoom", "Math-Notes");
 
