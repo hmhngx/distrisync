@@ -4,6 +4,7 @@ import com.distrisync.model.Shape;
 import com.distrisync.protocol.Message;
 import com.distrisync.protocol.MessageCodec;
 import com.distrisync.protocol.MessageCodec.LobbyRoomEntry;
+import com.distrisync.protocol.RoomPermissions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -164,6 +165,7 @@ public final class RoomManager {
                     }
                     session.roomId = "";
                     session.currentBoardId = "";
+                    session.permissions = RoomPermissions.SPECTATOR;
                     lobbyClients.add(key);
                     BiConsumer<ClientSession, SelectionKey> flush = flushAfterRoomDeletedHook;
                     if (flush != null) {
@@ -226,6 +228,15 @@ public final class RoomManager {
         }
         RoomContext ctx = getOrCreateRoom(newRoomId);
         ctx.addKey(key);
+        if (key.attachment() instanceof ClientSession session) {
+            if (ctx.getActiveClientCount() == 1) {
+                ctx.hostClientId = session.clientId;
+                session.permissions = RoomPermissions.OWNER;
+                // Room-wide ROLE_UPDATE for owner grant is broadcast by NioServer on JOIN_ROOM.
+            } else {
+                session.permissions = RoomPermissions.MEMBER;
+            }
+        }
         notifyLobbySubscribers();
         return ctx;
     }
@@ -243,6 +254,9 @@ public final class RoomManager {
             if (room.getActiveClientCount() == 0) {
                 rooms.remove(currentRoomId, room);
             }
+        }
+        if (key.attachment() instanceof ClientSession session) {
+            session.permissions = RoomPermissions.SPECTATOR;
         }
         lobbyClients.add(key);
         notifyLobbySubscribers();

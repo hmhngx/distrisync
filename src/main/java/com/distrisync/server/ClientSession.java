@@ -1,5 +1,7 @@
 package com.distrisync.server;
 
+import com.distrisync.protocol.RoomPermissions;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -66,6 +68,23 @@ final class ClientSession {
      * Set after the first {@code HANDSHAKE} is accepted; duplicate handshakes are ignored.
      */
     volatile boolean handshakeComplete = false;
+
+    /**
+     * Bitmask of {@link RoomPermissions} granted on {@code JOIN_ROOM}; {@link RoomPermissions#SPECTATOR}
+     * while in the lobby.
+     */
+    volatile int permissions = RoomPermissions.SPECTATOR;
+
+    /**
+     * Wall-clock millis when the first {@code HANDSHAKE} was accepted; {@code 0} before handshake.
+     */
+    volatile long connectedAtMillis = 0L;
+
+    /**
+     * Last-reported hardware mute from {@code VOICE_STATE}; default {@code true} until the client
+     * sends an update. Used when hydrating late joiners.
+     */
+    volatile boolean micMuted = true;
 
     /**
      * Opaque token for the UDP audio data plane; issued on successful {@code JOIN_ROOM}.
