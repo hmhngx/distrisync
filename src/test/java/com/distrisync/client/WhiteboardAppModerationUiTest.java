@@ -100,10 +100,14 @@ class WhiteboardAppModerationUiTest extends ApplicationTest {
 
         await().atMost(2, TimeUnit.SECONDS).untilAsserted(() -> {
             verifyThat(lookup(".session-revoked-overlay"), isVisible());
-            Label headline = lookup(".session-revoked-message").queryAs(Label.class);
-            assertThat(headline.getText())
-                    .isEqualTo("Session Revoked: You have been kicked by an administrator.");
-            Button returnBtn = lookup(".primary-btn").queryButton();
+            Label title = lookup(".session-revoked-title").queryAs(Label.class);
+            assertThat(title.getText()).isEqualTo("Session Revoked");
+            Label subtitle = lookup(".session-revoked-subtitle").queryAs(Label.class);
+            assertThat(subtitle.getText())
+                    .isEqualTo("You have been removed from this room by an administrator.");
+            Label reason = lookup(".session-revoked-reason").queryAs(Label.class);
+            assertThat(reason.getText()).isEqualTo("policy violation");
+            Button returnBtn = lookup(".session-revoked-return-btn").queryButton();
             assertThat(returnBtn.getText()).isEqualTo("Return to Lobby");
         });
 

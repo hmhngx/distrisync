@@ -97,6 +97,8 @@ class WhiteboardAppFloatingLayoutTest extends ApplicationTest {
     @Test
     void canvasTracksWorkspaceRootAndToolbarRendersAboveCanvasLayer() {
         StackPane workspaceRoot = lookup("#" + WhiteboardApp.WORKSPACE_ROOT_ID).queryAs(StackPane.class);
+        assertThat(workspaceRoot.getChildren().getFirst()).isInstanceOf(StackPane.class);
+        StackPane contentLayer = (StackPane) workspaceRoot.getChildren().getFirst();
         StackPane canvasLayer = lookup("#" + WhiteboardApp.WORKSPACE_CANVAS_LAYER_ID).queryAs(StackPane.class);
         Node toolbarLayer = lookup("#" + WhiteboardApp.WORKSPACE_TOOLBAR_LAYER_ID).query();
         Canvas baseCanvas = getField(app, "baseCanvas", Canvas.class);
@@ -108,16 +110,21 @@ class WhiteboardAppFloatingLayoutTest extends ApplicationTest {
         assertThat(baseCanvas.getWidth()).isCloseTo(canvasLayer.getWidth(), within(1.0));
         assertThat(baseCanvas.getHeight()).isCloseTo(canvasLayer.getHeight(), within(1.0));
 
-        int canvasIndex = workspaceRoot.getChildren().indexOf(canvasLayer);
-        int toolbarIndex = workspaceRoot.getChildren().indexOf(toolbarLayer);
+        int canvasIndex = contentLayer.getChildren().indexOf(canvasLayer);
+        int toolbarIndex = contentLayer.getChildren().indexOf(toolbarLayer);
         assertThat(canvasIndex).isEqualTo(0);
         assertThat(toolbarIndex).isGreaterThan(canvasIndex);
     }
 
     @Test
     void testFloatingPanelsHaveCorrectEffects() {
-        VBox leftDock = lookup(".tool-dock").queryAs(VBox.class);
-        assertThat(leftDock.getEffect()).isInstanceOf(DropShadow.class);
+        StackPane dockLayer = lookup("#" + WhiteboardApp.WORKSPACE_DOCK_LAYER_ID).queryAs(StackPane.class);
+        assertThat(dockLayer.getChildren()).hasSize(1);
+        HBox toolsChrome = (HBox) dockLayer.getChildren().getFirst();
+        assertThat(toolsChrome.getEffect()).isInstanceOf(DropShadow.class);
+        StackPane propertiesBarLayer = lookup("#" + WhiteboardApp.WORKSPACE_PROPERTIES_LAYER_ID)
+                .queryAs(StackPane.class);
+        assertThat(propertiesBarLayer.getEffect()).isInstanceOf(DropShadow.class);
     }
 
     @Test

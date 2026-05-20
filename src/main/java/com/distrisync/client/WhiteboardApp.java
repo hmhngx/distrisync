@@ -286,12 +286,15 @@ public class WhiteboardApp extends Application {
     private Scene   canvasScene;
     /** Root {@link StackPane} of {@link #canvasScene} — hosts overlay and floating board switcher control. */
     private StackPane canvasSceneRoot;
+    /** Canvas + floating HUD; blurred when {@link #onSessionRevoked} overlay is shown (sibling of kick overlay). */
+    private StackPane workspaceContentLayer;
     /** Full-screen Task View–style board picker; added/removed from {@link #canvasSceneRoot} when toggled. */
     private StackPane switcherOverlay;
     private FlowPane  switcherBoardGrid;
     /** Thumbnails captured from {@link #baseCanvas} before leaving each board (FX thread only). */
     private final Map<String, Image> boardSnapshots = new HashMap<>();
     private final GaussianBlur boardSwitcherCanvasBlur = new GaussianBlur(14);
+    private final GaussianBlur sessionRevokedWorkspaceBlur = new GaussianBlur(18);
     /** Layered workspace: three {@link Canvas} layers plus cursor and control {@link Pane}s; sizes follow this stack. */
     private StackPane canvasContainer;
     private CanvasViewportResizeHandler canvasViewportResizeHandler;
@@ -405,9 +408,14 @@ public class WhiteboardApp extends Application {
         canvasSceneRoot.setPrefSize(Region.USE_COMPUTED_SIZE, Region.USE_COMPUTED_SIZE);
 
         canvasSceneRoot.setId(WORKSPACE_ROOT_ID);
+        workspaceContentLayer = new StackPane();
+        workspaceContentLayer.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
+        workspaceContentLayer.prefWidthProperty().bind(canvasSceneRoot.widthProperty());
+        workspaceContentLayer.prefHeightProperty().bind(canvasSceneRoot.heightProperty());
+
         canvasContainer.setId(WORKSPACE_CANVAS_LAYER_ID);
-        canvasContainer.prefWidthProperty().bind(canvasSceneRoot.widthProperty());
-        canvasContainer.prefHeightProperty().bind(canvasSceneRoot.heightProperty());
+        canvasContainer.prefWidthProperty().bind(workspaceContentLayer.widthProperty());
+        canvasContainer.prefHeightProperty().bind(workspaceContentLayer.heightProperty());
 
         buildBoardSwitcherOverlay();
 
@@ -457,6 +465,8 @@ public class WhiteboardApp extends Application {
         toolDrawer.heightProperty().addListener((o, a, b) -> updateToolsDrawerClipAndHostWidth());
         toolDockToggleButton.widthProperty().addListener((o, a, b) -> updateToolsDrawerClipAndHostWidth());
 
+        toolsChromeRow.setEffect(UiEffects.toolbarDropShadow());
+
         /* Floating chrome: strict 16px workspace perimeter (margins on root StackPane children, not inner padding). */
         StackPane boardsLayer = wrapFloatingNode(boardsIsland, Pos.TOP_LEFT, new Insets(16, 0, 0, 16),
                 WORKSPACE_TOOLBAR_LAYER_ID);
@@ -466,6 +476,7 @@ public class WhiteboardApp extends Application {
         drawingToolbar = toolsChromeRow;
         StackPane propertiesBarLayer = wrapFloatingNode(workspacePropertiesBar, Pos.TOP_CENTER, new Insets(16, 0, 0, 0),
                 WORKSPACE_PROPERTIES_LAYER_ID);
+        propertiesBarLayer.setEffect(UiEffects.toolbarDropShadow());
 
         collaborationRoster = new CollaborationRoster();
         HBox topRightIsland = buildTopRightHud();
@@ -522,8 +533,9 @@ public class WhiteboardApp extends Application {
         StackPane micLayer = wrapFloatingNode(micToggleBtn, Pos.BOTTOM_LEFT, new Insets(0, 0, 16, 16),
                 WORKSPACE_MIC_LAYER_ID);
 
-        canvasSceneRoot.getChildren().addAll(canvasContainer, boardsLayer, dockLayer, propertiesBarLayer,
+        workspaceContentLayer.getChildren().addAll(canvasContainer, boardsLayer, dockLayer, propertiesBarLayer,
                 topRightLayer, rosterLayer, micLayer, telemetryLayer);
+        canvasSceneRoot.getChildren().add(workspaceContentLayer);
 
         Platform.runLater(this::updateToolsDrawerClipAndHostWidth);
 
@@ -848,6 +860,26 @@ public class WhiteboardApp extends Application {
             thumb.getChildren().add(placeholder);
         }
 
+        Button trashButton = new Button("✕");
+        trashButton.getStyleClass().add("board-switcher-trash-btn");
+        trashButton.setFocusTraversable(false);
+        trashButton.setTooltip(new Tooltip("Delete board"));
+        trashButton.setPickOnBounds(true);
+        if (networkClient != null) {
+            trashButton.setVisible(
+                    RoomPermissions.canManageRoom(networkClient.getParticipantManager().getLocalPermissions())
+                            && !boardId.equals(MessageCodec.DEFAULT_INITIAL_BOARD_ID));
+        } else {
+            trashButton.setVisible(false);
+        }
+        trashButton.setOnAction(e -> {
+            e.consume();
+            confirmDeleteBoard(boardId);
+        });
+        StackPane.setAlignment(trashButton, Pos.TOP_RIGHT);
+        StackPane.setMargin(trashButton, new Insets(4, 4, 0, 0));
+        thumb.getChildren().add(trashButton);
+
         Label name = new Label(boardId);
         name.setWrapText(true);
         name.setMaxWidth(220);
@@ -1100,7 +1132,7 @@ public class WhiteboardApp extends Application {
     /** Vertical floating left dock for primary drawing tools. */
     VBox buildToolDrawer() {
         VBox toolDock = new VBox(6);
-        toolDock.getStyleClass().addAll("tool-dock", "floating-panel");
+        toolDock.getStyleClass().addAll("tool-dock", "floating-panel", "toolbar");
         toolDock.setAlignment(Pos.TOP_CENTER);
         toolDock.setPickOnBounds(false);
         toolDock.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
@@ -1225,7 +1257,7 @@ public class WhiteboardApp extends Application {
 
         HBox propertiesBar = new HBox(12, colorPicker, strokeSlider, eraserTypeBar);
         propertiesBar.setId(WORKSPACE_PROPERTIES_BAR_ID);
-        propertiesBar.getStyleClass().addAll("properties-bar", "floating-panel", "workspace-perimeter-node");
+        propertiesBar.getStyleClass().addAll("properties-bar", "floating-panel", "toolbar", "workspace-perimeter-node");
         propertiesBar.setAlignment(Pos.CENTER);
         propertiesBar.setPickOnBounds(false);
         propertiesBar.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
@@ -1693,6 +1725,29 @@ public class WhiteboardApp extends Application {
         }
     }
 
+    private void confirmDeleteBoard(String boardId) {
+        if (networkClient == null || !networkClient.isRunning()) {
+            return;
+        }
+        String bid = boardId != null ? boardId.strip() : "";
+        if (bid.isBlank() || bid.equals(MessageCodec.DEFAULT_INITIAL_BOARD_ID)) {
+            return;
+        }
+        Alert confirm = new Alert(Alert.AlertType.CONFIRMATION);
+        confirm.setTitle("Delete board");
+        confirm.setHeaderText("Delete board '" + bid + "'?");
+        confirm.setContentText(
+                "This permanently removes the board and its drawings for everyone in the room.");
+        confirm.initModality(Modality.APPLICATION_MODAL);
+        if (primaryStage != null) {
+            confirm.initOwner(primaryStage);
+        }
+        Optional<ButtonType> response = confirm.showAndWait();
+        if (response.isPresent() && response.get() == ButtonType.OK) {
+            networkClient.sendDeleteBoard(bid);
+        }
+    }
+
     private void confirmKickParticipant(String targetClientId, String displayName) {
         if (networkClient == null || !networkClient.isRunning()) {
             return;
@@ -1750,44 +1805,60 @@ public class WhiteboardApp extends Application {
             finishSessionRevokedReturn();
             return;
         }
+        if (isBoardSwitcherShowing()) {
+            hideBoardSwitcher();
+        }
         removeSessionRevokedOverlay();
-        Label message = new Label(
-                "Session Revoked: You have been kicked by an administrator.");
-        message.getStyleClass().add("session-revoked-message");
-        message.setWrapText(true);
-        message.setMaxWidth(480);
-        message.setTextFill(Color.web(RED));
 
-        VBox panelChildren = new VBox(12);
-        panelChildren.setAlignment(Pos.CENTER);
-        panelChildren.getChildren().add(message);
+        Label title = new Label("Session Revoked");
+        title.getStyleClass().add("session-revoked-title");
+        title.setWrapText(true);
+        title.setMaxWidth(480);
+
+        Label subtitle = new Label("You have been removed from this room by an administrator.");
+        subtitle.getStyleClass().add("session-revoked-subtitle");
+        subtitle.setWrapText(true);
+        subtitle.setMaxWidth(480);
+        VBox.setMargin(subtitle, new Insets(0, 0, 16, 0));
+
+        VBox card = new VBox(12, title, subtitle);
+        card.setAlignment(Pos.CENTER);
+        card.getStyleClass().add("session-revoked-card");
+        card.setMaxWidth(480);
+
         if (reason != null && !reason.isBlank()) {
             Label reasonLine = new Label(reason);
-            reasonLine.getStyleClass().add("lobby-status-muted");
+            reasonLine.getStyleClass().addAll("session-revoked-reason", "lobby-status-muted");
             reasonLine.setWrapText(true);
             reasonLine.setMaxWidth(480);
-            panelChildren.getChildren().add(reasonLine);
+            card.getChildren().add(reasonLine);
         }
 
         Button returnBtn = new Button("Return to Lobby");
-        returnBtn.getStyleClass().add("primary-btn");
+        returnBtn.getStyleClass().add("session-revoked-return-btn");
         returnBtn.setDefaultButton(true);
+        returnBtn.setMnemonicParsing(false);
         returnBtn.setOnAction(e -> finishSessionRevokedReturn());
+        VBox.setMargin(returnBtn, new Insets(8, 0, 0, 0));
+        card.getChildren().add(returnBtn);
 
-        panelChildren.getChildren().add(returnBtn);
-        VBox panel = new VBox(24, panelChildren);
-        panel.setAlignment(Pos.CENTER);
-        panel.setMaxWidth(Region.USE_PREF_SIZE);
-
-        sessionRevokedOverlay = new StackPane(panel);
+        sessionRevokedOverlay = new StackPane(card);
         sessionRevokedOverlay.getStyleClass().add("session-revoked-overlay");
         sessionRevokedOverlay.setPickOnBounds(true);
-        StackPane.setAlignment(panel, Pos.CENTER);
+        sessionRevokedOverlay.setStyle("-fx-background-color: transparent;");
+        StackPane.setAlignment(card, Pos.CENTER);
+
+        if (workspaceContentLayer != null) {
+            workspaceContentLayer.setEffect(sessionRevokedWorkspaceBlur);
+        }
         canvasSceneRoot.getChildren().add(sessionRevokedOverlay);
         sessionRevokedOverlay.toFront();
     }
 
     private void removeSessionRevokedOverlay() {
+        if (workspaceContentLayer != null) {
+            workspaceContentLayer.setEffect(null);
+        }
         if (sessionRevokedOverlay != null && canvasSceneRoot != null) {
             canvasSceneRoot.getChildren().remove(sessionRevokedOverlay);
         }
@@ -2849,6 +2920,20 @@ public class WhiteboardApp extends Application {
                 }));
         networkClient.addRoomDeletedListener(() ->
                 Platform.runLater(this::onRoomDeletedByServer));
+        networkClient.addBoardDeletedListener(deletedBoardId ->
+                Platform.runLater(() -> {
+                    if (deletedBoardId != null && !deletedBoardId.isBlank()) {
+                        boardSnapshots.remove(deletedBoardId);
+                    }
+                    if (isBoardSwitcherShowing()) {
+                        refreshSwitcherBoardGrid();
+                    }
+                    if (canvasSceneRoot != null && deletedBoardId != null) {
+                        ToastNotification.show(canvasSceneRoot,
+                                "Board " + deletedBoardId + " was deleted by an Admin.",
+                                "lobby-status-disconnected");
+                    }
+                }));
         networkClient.addSessionRevokedListener(reason ->
                 Platform.runLater(() -> onSessionRevoked(reason)));
         networkClient.addRoleUpdateListener(payload ->
