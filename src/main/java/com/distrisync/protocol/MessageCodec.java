@@ -424,6 +424,54 @@ public final class MessageCodec {
         return GSON.fromJson(msg.payload(), String.class);
     }
 
+    /**
+     * Encodes {@code DELETE_BOARD} with a JSON string literal payload (the target {@code boardId}).
+     */
+    public static ByteBuffer encodeDeleteBoard(String boardId) {
+        if (boardId == null) throw new IllegalArgumentException("boardId must not be null");
+        return encode(new Message(MessageType.DELETE_BOARD, GSON.toJson(boardId)));
+    }
+
+    public static String decodeDeleteBoard(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.DELETE_BOARD) {
+            throw new IllegalArgumentException("expected DELETE_BOARD, got " + msg.type());
+        }
+        String raw = GSON.fromJson(msg.payload(), String.class);
+        if (raw == null) {
+            throw new IllegalArgumentException("DELETE_BOARD payload is null");
+        }
+        String bid = raw.strip();
+        if (bid.isBlank()) {
+            throw new IllegalArgumentException("DELETE_BOARD board id is blank");
+        }
+        return bid;
+    }
+
+    /**
+     * Encodes {@code BOARD_DELETED} with a JSON string literal payload (the removed {@code boardId}).
+     */
+    public static ByteBuffer encodeBoardDeleted(String boardId) {
+        if (boardId == null) throw new IllegalArgumentException("boardId must not be null");
+        return encode(new Message(MessageType.BOARD_DELETED, GSON.toJson(boardId)));
+    }
+
+    public static String decodeBoardDeleted(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.BOARD_DELETED) {
+            throw new IllegalArgumentException("expected BOARD_DELETED, got " + msg.type());
+        }
+        String raw = GSON.fromJson(msg.payload(), String.class);
+        if (raw == null) {
+            throw new IllegalArgumentException("BOARD_DELETED payload is null");
+        }
+        String bid = raw.strip();
+        if (bid.isBlank()) {
+            throw new IllegalArgumentException("BOARD_DELETED board id is blank");
+        }
+        return bid;
+    }
+
     /** Encodes {@code LEAVE_ROOM} with an empty UTF-8 payload body. */
     public static ByteBuffer encodeLeaveRoom() {
         return encode(new Message(MessageType.LEAVE_ROOM, ""));
