@@ -44,6 +44,8 @@ import java.util.Map;
  * 0x1D        ROLE_UPDATE       – server→client: host migration (payload: { newHostClientId, newPermissions })
  * 0x1E        BOARD_SWITCH      – server→room: peer active board (payload: { clientId, newBoardId })
  * 0x1F        TOGGLE_BOARD_LOCK – client→server: set { locked }; server→room: broadcast { locked }
+ * 0x20        DELETE_BOARD      – client→server: JSON string boardId — room manager removes board (non-default)
+ * 0x21        BOARD_DELETED     – server→client: JSON string boardId — board was removed; update UI
  * </pre>
  */
 public enum MessageType {
@@ -78,7 +80,9 @@ public enum MessageType {
     SESSION_REVOKED  ((byte) 0x1C),
     ROLE_UPDATE      ((byte) 0x1D),
     BOARD_SWITCH     ((byte) 0x1E),
-    TOGGLE_BOARD_LOCK((byte) 0x1F);
+    TOGGLE_BOARD_LOCK((byte) 0x1F),
+    DELETE_BOARD     ((byte) 0x20),
+    BOARD_DELETED    ((byte) 0x21);
 
     private final byte wireCode;
 

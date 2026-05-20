@@ -76,7 +76,7 @@ class WhiteboardAppToolDockTest extends ApplicationTest {
             icon.applyCss();
             icon.layout();
         });
-        assertThat(icon.getTextFill()).isEqualTo(Color.web("#5C6CFF"));
+        assertThat(icon.getTextFill()).isEqualTo(Color.web("#6366F1"));
     }
 
     @Test

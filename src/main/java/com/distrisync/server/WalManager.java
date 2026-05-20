@@ -206,6 +206,34 @@ final class WalManager implements Closeable {
     }
 
     /**
+     * Releases the WAL {@link FileChannel} for this room/board pair and deletes exactly
+     * {@code walMapKey(roomId, boardId) + ".wal"} and {@code ... + ".wal.tmp"} under {@link #dataDir}.
+     * Does not scan prefixes; other boards in the same room are untouched.
+     */
+    public void deleteBoardFiles(String roomId, String boardId) throws IOException {
+        validateNonBlank(roomId, "roomId");
+        validateNonBlank(boardId, "boardId");
+        String baseName = walMapKey(roomId, boardId);
+
+        FileChannel live = channels.remove(baseName);
+        if (live != null) {
+            try {
+                live.close();
+            } catch (IOException e) {
+                log.warn("Error closing WAL channel during board delete  key='{}': {}", baseName, e.getMessage());
+            }
+        }
+
+        Path walFile = dataDir.resolve(baseName + ".wal");
+        Path tmpFile = dataDir.resolve(baseName + ".wal.tmp");
+        Files.deleteIfExists(walFile);
+        Files.deleteIfExists(tmpFile);
+
+        log.info("WAL board files removed  roomId='{}' boardId='{}' baseName='{}' dataDir='{}'",
+                roomId, boardId, baseName, dataDir);
+    }
+
+    /**
      * Releases WAL {@link FileChannel}s for this room and deletes matching {@code .wal} files under
      * {@link #dataDir}. Channels must be closed before file deletion so the OS lock is dropped.
      *

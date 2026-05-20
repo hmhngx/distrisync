@@ -5,7 +5,7 @@
     -fx-surface-1: #181B21;
     -fx-surface-2: #22262F;
     -fx-border-subtle: #2C313C;
-    -fx-accent: #5C6CFF;
+    -fx-accent: #6366F1;
     -fx-text-main: #EDEDED;
     -fx-text-muted: #8B93A0;
 
@@ -31,8 +31,9 @@
 
 /* Global flat control reset */
 .button {
-    -fx-background-color: -fx-accent;
-    -fx-text-fill: -fx-text-main;
+    -fx-background-color: #6366F1;
+    -fx-text-fill: #FFFFFF;
+    -fx-font-weight: bold;
     -fx-background-radius: 6px;
     -fx-padding: 8px 16px;
     -fx-cursor: hand;
@@ -43,24 +44,26 @@
     -fx-effect: null;
 }
 .button:hover {
-    -fx-background-color: derive(-fx-accent, 12%);
+    -fx-background-color: #4F46E5;
 }
 
-.text-field {
-    -fx-background-color: -fx-surface-2;
-    -fx-control-inner-background: -fx-surface-2;
-    -fx-text-fill: -fx-text-main;
+.text-field,
+.text-input {
+    -fx-background-color: #18181B;
+    -fx-control-inner-background: #18181B;
+    -fx-text-fill: #FFFFFF;
     -fx-prompt-text-fill: -fx-text-muted;
-    -fx-border-color: -fx-border-subtle;
+    -fx-border-color: #3F3F46;
     -fx-border-width: 1px;
     -fx-border-radius: 6px;
     -fx-background-radius: 6px;
-    -fx-padding: 8px 12px;
+    -fx-padding: 10px 12px;
     -fx-effect: null;
 }
-.text-field:focused {
-    -fx-border-color: -fx-accent;
-    -fx-background-color: -fx-surface-2;
+.text-field:focused,
+.text-input:focused {
+    -fx-border-color: #6366F1;
+    -fx-background-color: #18181B;
     -fx-effect: null;
 }
 
@@ -100,13 +103,52 @@
 }
 
 .session-revoked-overlay {
-    -fx-background-color: rgba(0, 0, 0, 0.85);
+    -fx-background-color: transparent;
 }
 
-.session-revoked-message {
-    -fx-font-size: 18px;
+.session-revoked-card {
+    -fx-background-color: #1E1E1E;
+    -fx-padding: 50px;
+    -fx-background-radius: 12px;
+    -fx-border-radius: 12px;
+    -fx-border-color: rgba(255, 255, 255, 0.1);
+    -fx-border-width: 1px;
+    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.5), 20, 0, 0, 0);
+}
+
+.session-revoked-title {
+    -fx-font-size: 24px;
     -fx-font-weight: bold;
+    -fx-text-fill: #F87171;
     -fx-text-alignment: center;
+    -fx-alignment: center;
+}
+
+.session-revoked-subtitle {
+    -fx-font-size: 14px;
+    -fx-text-fill: #A1A1AA;
+    -fx-text-alignment: center;
+    -fx-alignment: center;
+}
+
+.session-revoked-reason {
+    -fx-font-size: 14px;
+    -fx-text-alignment: center;
+    -fx-alignment: center;
+}
+
+.session-revoked-return-btn {
+    -fx-background-color: #EF4444;
+    -fx-text-fill: #FFFFFF;
+    -fx-font-weight: bold;
+    -fx-background-radius: 8px;
+    -fx-border-radius: 8px;
+    -fx-padding: 10px 24px;
+    -fx-cursor: hand;
+}
+
+.session-revoked-return-btn:hover {
+    -fx-background-color: #F87171;
 }
 
 .participant-revoke-speak-btn {
@@ -142,17 +184,36 @@
     -fx-border-width: 1px;
     -fx-background-radius: 8px;
     -fx-border-radius: 8px;
-    -fx-effect: dropshadow(two-pass-box, rgba(0, 0, 0, 0.4), 10, 0, 0, 4);
+    -fx-effect: null;
     -fx-text-fill: -fx-text-main;
     -fx-font-weight: 500;
 }
 
+/* CSS elevation for floating panels that do not use programmatic DropShadow */
+.lobby-floating-card.floating-panel,
+.participant-list-view.floating-panel,
+.floating-panel.telemetry-hud {
+    -fx-effect: dropshadow(two-pass-box, rgba(0, 0, 0, 0.4), 10, 0, 0, 4);
+}
+
 .floating-panel .label,
-.floating-panel .toggle-button,
-.floating-panel .button,
 .floating-panel .color-picker {
     -fx-text-fill: -fx-text-main;
     -fx-font-weight: 500;
+}
+
+.floating-panel .toggle-button,
+.floating-panel .button {
+    -fx-text-fill: -fx-text-main;
+}
+
+.floating-panel .button {
+    -fx-font-weight: bold;
+}
+
+.tool-dock.floating-panel .toggle-button.tool-btn,
+.tool-dock.floating-panel .button.tool-btn {
+    -fx-font-weight: normal;
 }
 
 .floating-panel.telemetry-hud .telemetry-hud-line,
@@ -215,12 +276,12 @@
 }
 
 .collaboration-roster {
-    -fx-background-color: -fx-surface-1;
-    -fx-background-radius: 10 0 0 10;
-    -fx-border-color: -fx-border-subtle;
+    -fx-background-color: #18181B;
+    -fx-background-radius: 8 0 0 8;
+    -fx-border-color: #27272A;
     -fx-border-width: 1 0 1 1;
-    -fx-border-radius: 10 0 0 10;
-    -fx-effect: dropshadow(two-pass-box, rgba(0, 0, 0, 0.28), 12, 0, -3, 0);
+    -fx-border-radius: 8 0 0 8;
+    -fx-effect: null;
 }
 
 .roster-toggle-btn {
@@ -234,13 +295,13 @@
     -fx-font-size: 12px;
     -fx-font-weight: bold;
     -fx-text-fill: -fx-text-muted;
-    -fx-background-color: -fx-surface-1;
+    -fx-background-color: #18181B;
     -fx-background-radius: 8 0 0 8;
-    -fx-border-color: -fx-border-subtle;
+    -fx-border-color: #27272A;
     -fx-border-width: 1 0 1 1;
     -fx-border-radius: 8 0 0 8;
     -fx-cursor: hand;
-    -fx-effect: dropshadow(two-pass-box, rgba(0, 0, 0, 0.22), 8, 0, -2, 0);
+    -fx-effect: null;
 }
 
 .roster-toggle-btn:hover {
@@ -369,6 +430,12 @@
     -fx-border-color: transparent;
 }
 
+/* Toolbar strip at canvas edge: restore visible border (perimeter rule clears it). */
+.floating-panel.toolbar.workspace-perimeter-node {
+    -fx-border-width: 1px;
+    -fx-border-color: #27272A;
+}
+
 .canvas-control-layer {
     -fx-background-color: transparent;
 }
@@ -384,18 +451,19 @@
 
 .text-input-modern,
 .lobby-textfield {
-    -fx-background-color: -fx-surface-2;
-    -fx-control-inner-background: -fx-surface-2;
-    -fx-text-fill: -fx-text-main;
+    -fx-background-color: #18181B;
+    -fx-control-inner-background: #18181B;
+    -fx-text-fill: #FFFFFF;
     -fx-prompt-text-fill: -fx-text-muted;
-    -fx-border-color: -fx-border-subtle;
+    -fx-border-color: #3F3F46;
     -fx-border-width: 1px;
     -fx-border-radius: 6px;
     -fx-background-radius: 6px;
+    -fx-padding: 10px 12px;
 }
 .text-input-modern:focused,
 .lobby-textfield:focused {
-    -fx-border-color: -fx-accent;
+    -fx-border-color: #6366F1;
 }
 
 .ghost-danger-button,
@@ -429,6 +497,13 @@
 .lobby-floating-card.floating-panel {
     -fx-max-width: 600px;
     -fx-padding: 32px;
+}
+
+/* Floating toolbars — Zinc 900 shell (radius follows .tool-dock / .floating-panel) */
+.toolbar.floating-panel {
+    -fx-background-color: #18181B;
+    -fx-border-color: #27272A;
+    -fx-border-width: 1px;
 }
 
 .lobby-container {
@@ -519,6 +594,7 @@
     -fx-border-radius: 6px;
     -fx-padding: 0;
     -fx-cursor: hand;
+    -fx-font-weight: normal;
     -fx-effect: null;
 }
 
@@ -787,6 +863,19 @@
 .board-switcher-title { -fx-text-fill: -fx-text-main; -fx-font-size: 12px; -fx-font-weight: 700; }
 .board-switcher-plus { -fx-text-fill: -fx-text-muted; -fx-font-size: 42px; -fx-font-weight: 700; }
 .board-switcher-hint { -fx-text-fill: -fx-text-muted; -fx-font-size: 12px; }
+.board-switcher-trash-btn {
+    -fx-background-color: rgba(15, 23, 42, 0.75);
+    -fx-background-radius: 6px;
+    -fx-text-fill: -fx-danger;
+    -fx-font-size: 14px;
+    -fx-font-weight: 700;
+    -fx-padding: 2 8 2 8;
+    -fx-min-width: 28px;
+    -fx-min-height: 24px;
+}
+.board-switcher-trash-btn:hover {
+    -fx-background-color: rgba(15, 23, 42, 0.92);
+}
 
 .workspace-input-dialog,
 .workspace-input-dialog .header-panel {
@@ -797,14 +886,18 @@
     -fx-font-size: 13px;
 }
 .workspace-input-dialog .text-field {
-    -fx-background-color: -fx-surface-2;
-    -fx-control-inner-background: -fx-surface-2;
-    -fx-text-fill: -fx-text-main;
+    -fx-background-color: #18181B;
+    -fx-control-inner-background: #18181B;
+    -fx-text-fill: #FFFFFF;
     -fx-prompt-text-fill: -fx-text-muted;
-    -fx-border-color: -fx-border-subtle;
+    -fx-border-color: #3F3F46;
     -fx-border-width: 1px;
-    -fx-border-radius: 8px;
-    -fx-background-radius: 8px;
+    -fx-border-radius: 6px;
+    -fx-background-radius: 6px;
+    -fx-padding: 10px 12px;
+}
+.workspace-input-dialog .text-field:focused {
+    -fx-border-color: #6366F1;
 }
 .workspace-input-dialog .button {
     -fx-background-radius: 8px;

@@ -43,7 +43,7 @@ class WhiteboardAppLoginButtonTest extends ApplicationTest {
                 .as("no linear-gradient chrome")
                 .isNotInstanceOf(LinearGradient.class)
                 .isInstanceOf(Color.class);
-        Color expected = Color.web("#5C6CFF");
+        Color expected = Color.web("#6366F1");
         Color got = (Color) fill;
         assertThat(got.getRed()).isEqualTo(expected.getRed());
         assertThat(got.getGreen()).isEqualTo(expected.getGreen());

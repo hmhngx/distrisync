@@ -52,7 +52,11 @@ public final class CollaborationRoster extends HBox {
     private static final double PANEL_WIDTH = 250;
     private static final double MAX_PANEL_HEIGHT = 380;
     private static final double SCROLL_VIEWPORT_HEIGHT = 220;
-    private static final Duration SLIDE_MS = Duration.millis(250);
+    /** Floor so the roster scroll area does not vanish when sections are collapsed. */
+    private static final double MIN_SCROLL_VIEWPORT_HEIGHT = 48;
+    private static final Duration SLIDE_MS = Duration.millis(280);
+    /** Material-style ease for open/close (smoother than EASE_BOTH on short slides). */
+    private static final Interpolator SLIDE_EASING = Interpolator.SPLINE(0.4, 0.0, 0.2, 1.0);
     private static final Duration BOARD_SECTION_ANIM_MS = Duration.millis(200);
 
     private final HBox slideRoot = new HBox(0);
@@ -102,7 +106,6 @@ public final class CollaborationRoster extends HBox {
         panel.setFillWidth(true);
         panel.setCache(true);
         panel.setCacheHint(CacheHint.SPEED);
-        panel.setTranslateX(PANEL_WIDTH);
 
         Label title = new Label("Collaboration");
         title.getStyleClass().add("roster-title");
@@ -129,16 +132,43 @@ public final class CollaborationRoster extends HBox {
         scroll.setFitToWidth(true);
         scroll.setPrefViewportHeight(SCROLL_VIEWPORT_HEIGHT);
         scroll.setMaxHeight(SCROLL_VIEWPORT_HEIGHT);
+        scroll.setMinHeight(MIN_SCROLL_VIEWPORT_HEIGHT);
         scroll.getStyleClass().add("roster-scroll");
         VBox.setVgrow(scroll, Priority.SOMETIMES);
+        sectionsContainer.heightProperty().addListener((obs, prev, now) ->
+                Platform.runLater(this::syncScrollViewportHeight));
 
         panel.getChildren().addAll(header, scroll);
         panel.setPadding(new Insets(10, 12, 10, 12));
 
-        slideRoot.setAlignment(Pos.CENTER_RIGHT);
+        /* Top-align so the sidebar chevron tracks the panel top when roster height changes. */
+        slideRoot.setAlignment(Pos.TOP_RIGHT);
+        slideRoot.setFillHeight(false);
+        slideRoot.setCache(true);
+        slideRoot.setCacheHint(CacheHint.SPEED);
         slideRoot.getChildren().addAll(toggleBtn, panel);
         HBox.setHgrow(panel, Priority.NEVER);
+        slideRoot.setTranslateX(PANEL_WIDTH);
         getChildren().setAll(slideRoot);
+        setEffect(UiEffects.toolbarDropShadow());
+        Platform.runLater(this::syncScrollViewportHeight);
+    }
+
+    /**
+     * Keeps the scroll viewport no taller than content (up to {@link #SCROLL_VIEWPORT_HEIGHT}) so collapsing
+     * board sections shrinks the panel and the sidebar toggle moves with it.
+     */
+    private void syncScrollViewportHeight() {
+        double content = sectionsContainer.getHeight();
+        if (content <= 1 && sectionsContainer.getChildren().isEmpty()) {
+            scroll.setPrefViewportHeight(SCROLL_VIEWPORT_HEIGHT);
+            scroll.setMaxHeight(SCROLL_VIEWPORT_HEIGHT);
+            return;
+        }
+        double target = Math.min(SCROLL_VIEWPORT_HEIGHT,
+                Math.max(content + 8, MIN_SCROLL_VIEWPORT_HEIGHT));
+        scroll.setPrefViewportHeight(target);
+        scroll.setMaxHeight(target);
     }
 
     public void bindTo(ParticipantManager manager) {
@@ -234,12 +264,12 @@ public final class CollaborationRoster extends HBox {
             slideTransition.stop();
         }
         isExpanded = !isExpanded;
-        double fromX = panel.getTranslateX();
+        double fromX = slideRoot.getTranslateX();
         double toX = isExpanded ? 0 : PANEL_WIDTH;
         toggleBtn.setText(isExpanded ? "<" : ">");
 
-        slideTransition = new TranslateTransition(SLIDE_MS, panel);
-        slideTransition.setInterpolator(Interpolator.EASE_BOTH);
+        slideTransition = new TranslateTransition(SLIDE_MS, slideRoot);
+        slideTransition.setInterpolator(SLIDE_EASING);
         slideTransition.setFromX(fromX);
         slideTransition.setToX(toX);
         slideTransition.setOnFinished(e -> slideTransition = null);
@@ -300,6 +330,7 @@ public final class CollaborationRoster extends HBox {
         if (!unknownBoard.isEmpty()) {
             sectionsContainer.getChildren().add(new BoardSection("Unknown", unknownBoard).root);
         }
+        Platform.runLater(this::syncScrollViewportHeight);
     }
 
     private static String initialsFor(String displayName) {
@@ -462,6 +493,7 @@ public final class CollaborationRoster extends HBox {
             }
             syncCollapsedStyleClass();
             updateChevronAndTooltips();
+            Platform.runLater(CollaborationRoster.this::syncScrollViewportHeight);
         }
 
         private void syncCollapsedStyleClass() {
