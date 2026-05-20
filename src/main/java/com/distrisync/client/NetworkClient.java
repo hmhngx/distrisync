@@ -170,6 +170,9 @@ public final class NetworkClient implements AutoCloseable {
     private final CopyOnWriteArrayList<BoardPresenceListener> boardPresenceListeners =
             new CopyOnWriteArrayList<>();
 
+    private final CopyOnWriteArrayList<BoardDeletedListener> boardDeletedListeners =
+            new CopyOnWriteArrayList<>();
+
     private final RoomState roomState = new RoomState();
 
     /**
@@ -748,6 +751,22 @@ public final class NetworkClient implements AutoCloseable {
     }
 
     /**
+     * Registers a callback for {@link com.distrisync.protocol.MessageType#BOARD_DELETED}.
+     * Duplicate registrations are ignored.
+     */
+    public void addBoardDeletedListener(BoardDeletedListener listener) {
+        if (listener != null) {
+            boardDeletedListeners.addIfAbsent(listener);
+        }
+    }
+
+    public void removeBoardDeletedListener(BoardDeletedListener listener) {
+        if (listener != null) {
+            boardDeletedListeners.remove(listener);
+        }
+    }
+
+    /**
      * Publishes this client's canvas cursor position to peers ({@link MessageType#CURSOR_SYNC}).
      * Rate-limited to ~15 Hz. Silently no-ops when not connected.
      *
@@ -994,6 +1013,32 @@ public final class NetworkClient implements AutoCloseable {
         notifyWorkspaceListeners();
         enqueueFrame(MessageCodec.encodeSwitchBoard(bid));
         log.debug("SWITCH_BOARD enqueued boardId='{}'", bid);
+    }
+
+    /**
+     * Requests removal of a board from the room (requires {@link com.distrisync.protocol.RoomPermissions#PERM_MANAGE_ROOM}).
+     * No-op when not connected, not in a room, protocol not ready, or {@code boardId} is blank.
+     */
+    public void sendDeleteBoard(String boardId) {
+        if (!running.get()) {
+            return;
+        }
+        String rid = activeRoomId;
+        if (rid == null || rid.isBlank()) {
+            log.debug("sendDeleteBoard ignored — not in a room");
+            return;
+        }
+        String bid = boardId != null ? boardId.strip() : "";
+        if (bid.isBlank()) {
+            log.debug("sendDeleteBoard ignored — blank boardId");
+            return;
+        }
+        if (!protocolReady.get()) {
+            log.debug("sendDeleteBoard ignored — protocol not ready boardId='{}'", bid);
+            return;
+        }
+        enqueueFrame(MessageCodec.encodeDeleteBoard(bid));
+        log.debug("DELETE_BOARD enqueued boardId='{}'", bid);
     }
 
     /**
@@ -1437,6 +1482,34 @@ public final class NetworkClient implements AutoCloseable {
                     notifyWorkspaceListeners();
                 } catch (Exception e) {
                     log.debug("Malformed BOARD_LIST_UPDATE ignored: {}", e.getMessage());
+                }
+            }
+            case BOARD_DELETED -> {
+                if (activeRoomId == null || activeRoomId.isBlank()) {
+                    log.trace("BOARD_DELETED ignored — not in a room");
+                    break;
+                }
+                try {
+                    String deletedId = MessageCodec.decodeBoardDeleted(msg);
+                    knownBoards.remove(deletedId);
+                    String def = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+                    if (deletedId.equals(currentBoardId) || deletedId.equals(lastSnapshotBoardId)) {
+                        currentBoardId = def;
+                        lastSnapshotBoardId = def;
+                        participantManager.setCurrentBoardId(clientId, def);
+                        ensureBoardKnown(def);
+                    }
+                    notifyWorkspaceListeners();
+                    log.debug("BOARD_DELETED applied  boardId='{}'", deletedId);
+                    for (BoardDeletedListener listener : boardDeletedListeners) {
+                        try {
+                            listener.onBoardDeleted(deletedId);
+                        } catch (Exception e) {
+                            log.warn("boardDeletedListener failed: {}", e.getMessage());
+                        }
+                    }
+                } catch (Exception e) {
+                    log.warn("Malformed BOARD_DELETED ignored: {}", e.getMessage());
                 }
             }
             case UDP_ADMISSION -> {
