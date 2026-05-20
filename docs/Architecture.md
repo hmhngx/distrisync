@@ -31,7 +31,8 @@
 21. [Host Election & ROLE_UPDATE](#21-host-election--role_update)
 22. [Moderation & SESSION_REVOKED](#22-moderation--session_revoked)
 23. [Collaboration Roster & Board Presence](#23-collaboration-roster--board-presence)
-24. [Sequence Diagram — Two-Client Collaboration Flow](#24-sequence-diagram--two-client-collaboration-flow)
+24. [Workspace Board Deletion](#24-workspace-board-deletion)
+25. [Sequence Diagram — Two-Client Collaboration Flow](#25-sequence-diagram--two-client-collaboration-flow)
 
 ---
 
@@ -99,6 +100,8 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x1D`    | `ROLE_UPDATE`      | Server → Client      | No               | `{ newHostClientId, newPermissions, roomHostClientId? }`. Syncs affected client permissions and room host id. |
 | `0x1E`    | `BOARD_SWITCH`     | Server → Room        | No               | `{ clientId, newBoardId }`. Room-wide active-board presence for roster grouping. |
 | `0x1F`    | `TOGGLE_BOARD_LOCK`| Client ↔ Server      | No               | `{ locked }`. Host sets `RoomContext.boardCreationLocked`; server broadcasts state to all room members. |
+| `0x20`    | `DELETE_BOARD`     | Client → Server      | No               | JSON string `boardId`. Requires `PERM_MANAGE_ROOM`. Cannot delete `Board-1` (default). Tombstones board + deletes WAL. |
+| `0x21`    | `BOARD_DELETED`    | Server → Room        | No               | JSON string `boardId`. Notifies all occupants to refresh board list / Task View UI. |
 
 #### Shape Envelope Format (MUTATION / SNAPSHOT)
 
@@ -438,6 +441,10 @@ Client joins or switches to board B
 4. Retry once if the barrier is not met; throw `IOException` if still not satisfied.
 
 This barrier prevents "ghost rooms" from reappearing in lobby discovery immediately after `DELETE_ROOM`.
+
+### 6.7 Per-Board Deletion (`deleteBoardFiles`)
+
+`WalManager.deleteBoardFiles(roomId, boardId)` removes a single board partition: closes the cached channel for `walMapKey(roomId, boardId)`, then deletes `{key}.wal` and `{key}.wal.tmp`. Invoked from `RoomContext.deleteBoard` when a client sends `DELETE_BOARD` (see §24). Unlike room teardown, no directory scan is required — only the targeted board files are removed.
 
 ---
 
@@ -852,6 +859,10 @@ A single application-scoped instance holds JavaFX properties consumed by the pro
 
 JavaFX clears `Canvas` pixel buffers when width or height change. `CanvasViewportResizeHandler.attachTo(Region)` registers invalidation listeners on both dimensions, coalesces rapid layout pulses into one `Platform.runLater`, and guards against painting at `0×0` (which triggers Prism `NGCanvas` NPEs). The handler invokes `redrawBaseCanvas` so vector state is re-painted after resize.
 
+### 14.3 UiEffects (floating chrome elevation)
+
+`UiEffects.toolbarDropShadow()` centralises the soft drop shadow previously expressed in CSS for toolbars and the collaboration roster. Applied from `WhiteboardApp` (tools chrome, properties bar) and `CollaborationRoster` (slide root).
+
 ---
 
 ## 15. Redis Backplane — Horizontal Scaling
@@ -1016,7 +1027,7 @@ These tools complement the Surefire suite (`server/backplane/*`, `NioServerRemot
 | `1 << 1` | `PERM_SPEAK` | UDP audio relay |
 | `1 << 2` | `PERM_MANAGE_USERS` | `MODERATION_ACTION` |
 | `1 << 3` | `PERM_DELETE_ROOM` | `DELETE_ROOM` |
-| `1 << 4` | `PERM_MANAGE_ROOM` | `TOGGLE_BOARD_LOCK`, override board lock on join |
+| `1 << 4` | `PERM_MANAGE_ROOM` | `TOGGLE_BOARD_LOCK`, `DELETE_BOARD`, override board lock on join |
 
 | Preset | Value | Typical holder |
 |--------|-------|----------------|
@@ -1026,7 +1037,7 @@ These tools complement the Surefire suite (`server/backplane/*`, `NioServerRemot
 
 `ClientSession.permissions` resets to `SPECTATOR` on `HANDSHAKE` and `LEAVE_ROOM`. Join assigns `MEMBER` unless the client is the room creator (first joiner → `OWNER` + `hostClientId`).
 
-`NioServerRbacTest` and `RoomPermissionsTest` lock deny paths for draw, speak, moderation, and board-lock commands.
+`NioServerRbacTest` and `RoomPermissionsTest` lock deny paths for draw, speak, moderation, board-lock, and board-delete commands.
 
 ---
 
@@ -1113,6 +1124,7 @@ While locked, members requesting a non-existent `initialBoardId` on `JOIN_ROOM` 
 | Moderation menu | Context menu: Kick, Revoke Speak, Grant Speak — visible when local `PERM_MANAGE_USERS` |
 | Feedback | `ToastNotification` for kicks, speak changes, session revoked |
 | Board lock | Toggle bound to `RoomState.boardCreationLockedProperty()` |
+| Elevation | `UiEffects.toolbarDropShadow()` on roster chrome (shared with tool dock / properties bar) |
 
 `CollaborationRosterModerationTest`, `WhiteboardAppModerationUiTest`, and `WhiteboardAppPermissionsTest` lock menu visibility and handler wiring without a manual pass.
 
@@ -1129,7 +1141,52 @@ While locked, members requesting a non-existent `initialBoardId` on `JOIN_ROOM` 
 
 ---
 
-## 24. Sequence Diagram — Two-Client Collaboration Flow
+## 24. Workspace Board Deletion
+
+Room managers (clients with `PERM_MANAGE_ROOM`) can remove workspace boards other than the default `Board-1`. Deletion is **durable** (WAL files removed) and **authoritative** (server tombstone prevents late packets from resurrecting state).
+
+### 24.1 DELETE_BOARD Server Path
+
+```
+Client (PERM_MANAGE_ROOM)
+    └─► DELETE_BOARD "Board-2"   (JSON string payload)
+            ├─► NioServer: reject if boardId == DEFAULT_INITIAL_BOARD_ID
+            ├─► RoomContext.deleteBoard(boardId, walManager)
+            │       ├─ deletedBoardIds.add(boardId)   // tombstone
+            │       ├─ boards.remove(boardId)         // drop in-memory CSM
+            │       └─ WalManager.deleteBoardFiles(roomId, boardId)
+            ├─► For each peer on deleted board:
+            │       currentBoardId → Board-1
+            │       BOARD_SWITCH fan-out + SNAPSHOT
+            ├─► BOARD_DELETED(boardId) → broadcastToRoom (CRITICAL)
+            └─► BOARD_LIST_UPDATE via broadcastBoardList(room)
+```
+
+`RoomContext.getBoard(tombstonedId)` returns `null`, so `MUTATION` / live-stroke handlers cannot recreate canvas state for a deleted id even if a stale client still sends frames.
+
+### 24.2 WalManager.deleteBoardFiles
+
+Deletes exactly `{sanitizedRoomId}_{sanitizedBoardId}.wal` and the matching `.wal.tmp` under `distrisync-data/`. Closes the live `FileChannel` for that map key first so the OS releases the file lock. Other boards in the same room are untouched (contrast with `deleteRoomFiles`, which scans room prefixes).
+
+### 24.3 Client Path
+
+| Component | Role |
+|-----------|------|
+| `NetworkClient.sendDeleteBoard` | Enqueues `DELETE_BOARD` when in-room and protocol-ready |
+| `NetworkClient` `BOARD_DELETED` handler | Removes id from `knownBoards`; resets `currentBoardId` if needed |
+| `BoardDeletedListener` | Callback surface for UI (`onBoardDeleted`) |
+| `WhiteboardApp` | Confirmation dialog; trash button on switcher cards (visible when `canManageRoom`); listener prunes `boardSnapshots`, refreshes switcher grid, shows toast |
+| `styles.css` | `.board-switcher-trash-btn`, card hover classes |
+
+Trash controls are hidden for `Board-1` and for members without `PERM_MANAGE_ROOM`. Occupants viewing the deleted board are relocated server-side before `BOARD_DELETED` arrives, so they receive a `SNAPSHOT` for `Board-1` rather than an empty canvas.
+
+### 24.4 UiEffects
+
+`UiEffects.toolbarDropShadow()` returns a shared JavaFX `DropShadow` (radius 12, offset Y 4, 35% black) applied to floating chrome: tools row, properties bar layer, and `CollaborationRoster` slide root. Elevation lives in code so depth stays consistent without relying on CSS `box-shadow` for those nodes.
+
+---
+
+## 25. Sequence Diagram — Two-Client Collaboration Flow
 
 The diagram below shows the current lifecycle: handshake into lobby, explicit room join, board snapshot hydration (with lazy WAL replay on first board open), live draw relay, durable mutation, and distributed undo.
 
