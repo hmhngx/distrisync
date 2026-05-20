@@ -20,6 +20,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>Board state is created lazily via {@link #getBoard(String)}; each new board replays
  * {@link WalManager#recover(String, String)} for that room/board pair when a {@link WalManager} is configured.
+ * Boards that were removed via {@link #deleteBoard(String, WalManager)} stay tombstoned: {@code getBoard}
+ * returns {@code null} for those ids so late packets cannot resurrect state.
  *
  * <p>{@link #lastActivityTimestamp} is refreshed on {@link #addKey} and {@link #touchActivity()}.
  */
@@ -41,6 +43,8 @@ final class RoomContext {
 
     private final ConcurrentHashMap<String, CanvasStateManager> boards = new ConcurrentHashMap<>();
 
+    private final Set<String> deletedBoardIds = ConcurrentHashMap.newKeySet();
+
     private final Set<SelectionKey> activeKeys = ConcurrentHashMap.newKeySet();
 
     /** Reverse index: {@link ClientSession#clientId} → local TCP {@link SelectionKey}. */
@@ -54,17 +58,54 @@ final class RoomContext {
         this.wal   = wal;
     }
 
+    public boolean isBoardDeleted(String boardId) {
+        return boardId != null && deletedBoardIds.contains(boardId);
+    }
+
+    /**
+     * Tombstones {@code boardId}, drops in-memory state, and deletes durable WAL files for this room/board.
+     */
+    public void deleteBoard(String boardId, WalManager walManager) {
+        if (boardId == null || boardId.isBlank()) {
+            throw new IllegalArgumentException("boardId must not be null or blank");
+        }
+        deletedBoardIds.add(boardId);
+        boards.remove(boardId);
+        if (walManager != null) {
+            try {
+                walManager.deleteBoardFiles(roomId, boardId);
+            } catch (IOException e) {
+                log.error("deleteBoardFiles failed  roomId='{}' boardId='{}': {}", roomId, boardId, e.getMessage(), e);
+            }
+        }
+    }
+
     /**
      * Returns the {@link CanvasStateManager} for {@code boardId}, creating it if needed and
      * replaying the WAL for this room/board when {@link WalManager} is non-null.
+     *
+     * @return {@code null} if {@code boardId} was {@linkplain #deleteBoard(String, WalManager) deleted}
+     *         (tombstone); otherwise never {@code null} for valid non-blank ids
      */
     CanvasStateManager getBoard(String boardId) {
         if (boardId == null || boardId.isBlank()) {
             throw new IllegalArgumentException("boardId must not be null or blank");
         }
-        return boards.computeIfAbsent(boardId, id -> {
+        if (isBoardDeleted(boardId)) {
+            return null;
+        }
+        return boards.compute(boardId, (id, existing) -> {
+            if (isBoardDeleted(id)) {
+                return null;
+            }
+            if (existing != null) {
+                return existing;
+            }
             CanvasStateManager csm = new CanvasStateManager();
             replayWalForBoard(id, csm);
+            if (isBoardDeleted(id)) {
+                return null;
+            }
             return csm;
         });
     }

@@ -40,6 +40,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -706,6 +707,48 @@ public final class NioServer implements Runnable {
                 log.info("DELETE_ROOM completed  roomId='{}' session={}", rid, session.sessionId);
             }
 
+            case DELETE_BOARD -> {
+                if (!RoomPermissions.canManageRoom(session.permissions)) {
+                    return;
+                }
+                if (!session.handshakeComplete) {
+                    log.warn("DELETE_BOARD before HANDSHAKE session={}", session.sessionId);
+                    break;
+                }
+                RoomContext room = resolveRoom(session, senderKey);
+                if (room == null) {
+                    return;
+                }
+                String targetBoardId;
+                try {
+                    targetBoardId = MessageCodec.decodeDeleteBoard(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed DELETE_BOARD session={}: {}", session.sessionId, e.getMessage());
+                    break;
+                }
+                if (targetBoardId.equals(MessageCodec.DEFAULT_INITIAL_BOARD_ID)) {
+                    return;
+                }
+                room.deleteBoard(targetBoardId, walManager);
+
+                for (SelectionKey peerKey : room.activeKeysForSelectorIteration()) {
+                    if (!peerKey.isValid() || !(peerKey.attachment() instanceof ClientSession peer)) {
+                        continue;
+                    }
+                    if (Objects.equals(targetBoardId, peer.currentBoardId)) {
+                        peer.currentBoardId = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+                        fanoutBoardSwitch(room, peer.clientId, MessageCodec.DEFAULT_INITIAL_BOARD_ID, peerKey);
+                        sendSnapshot(peer, peerKey, room);
+                    }
+                }
+
+                ByteBuffer deletedFrame = MessageCodec.encodeBoardDeleted(targetBoardId);
+                broadcastToRoom(room.roomId, deletedFrame, null, OutboundClass.CRITICAL);
+                broadcastBoardList(room);
+                log.info("DELETE_BOARD completed  roomId='{}' boardId='{}' session={}",
+                        room.roomId, targetBoardId, session.sessionId);
+            }
+
             case MUTATION -> {
                 if (!RoomPermissions.canDraw(session.permissions)) {
                     return;
@@ -727,6 +770,9 @@ public final class NioServer implements Runnable {
                 }
 
                 CanvasStateManager board = room.getBoard(session.currentBoardId);
+                if (board == null) {
+                    return;
+                }
                 boolean applied = board.applyMutation(shape);
 
                 if (applied) {
@@ -778,6 +824,9 @@ public final class NioServer implements Runnable {
                 }
 
                 CanvasStateManager board = room.getBoard(session.currentBoardId);
+                if (board == null) {
+                    return;
+                }
                 if (!board.deleteShape(shapeId)) {
                     log.debug("SHAPE_DELETE no-op  shapeId={} session={}", shapeId, session.sessionId);
                     return;
@@ -838,6 +887,9 @@ public final class NioServer implements Runnable {
                     return;
                 }
                 CanvasStateManager board = room.getBoard(session.currentBoardId);
+                if (board == null) {
+                    return;
+                }
                 board.clearUserShapes(targetClientId);
                 log.debug("CLEAR_USER_SHAPES  room='{}' board='{}' from session={} targetClientId='{}'",
                         session.roomId, session.currentBoardId, session.sessionId, targetClientId);
@@ -870,6 +922,9 @@ public final class NioServer implements Runnable {
                 }
 
                 CanvasStateManager board = room.getBoard(session.currentBoardId);
+                if (board == null) {
+                    return;
+                }
                 boolean deleted = board.deleteShape(shapeId);
                 if (deleted) {
                     log.debug("UNDO_REQUEST accepted  shapeId={} room='{}' board='{}' author='{}' session={}",
@@ -1271,7 +1326,13 @@ public final class NioServer implements Runnable {
     }
 
     private void sendSnapshot(ClientSession session, SelectionKey key, RoomContext room) {
-        List<Shape> shapes = room.getBoard(session.currentBoardId).snapshot();
+        CanvasStateManager boardState = room.getBoard(session.currentBoardId);
+        if (boardState == null) {
+            log.warn("sendSnapshot skipped — board tombstoned or absent  room='{}' board='{}' session={}",
+                    room.roomId, session.currentBoardId, session.sessionId);
+            return;
+        }
+        List<Shape> shapes = boardState.snapshot();
         String payload = ShapeCodec.encodeSnapshot(shapes);
         Message snapshotMsg = new Message(MessageType.SNAPSHOT, payload);
         ByteBuffer frame = MessageCodec.encode(snapshotMsg);
@@ -1583,7 +1644,11 @@ public final class NioServer implements Runnable {
             return;
         }
         for (String activeBoardId : room.getActiveBoardIds()) {
-            List<Shape> shapes = room.getBoard(activeBoardId).snapshot();
+            CanvasStateManager board = room.getBoard(activeBoardId);
+            if (board == null) {
+                continue;
+            }
+            List<Shape> shapes = board.snapshot();
             if (shapes.isEmpty()) {
                 continue;
             }
@@ -1607,6 +1672,9 @@ public final class NioServer implements Runnable {
         }
 
         CanvasStateManager board = room.getBoard(boardId);
+        if (board == null) {
+            return;
+        }
         for (Shape shape : incoming) {
             board.applyMutation(shape);
         }
@@ -1697,6 +1765,9 @@ public final class NioServer implements Runnable {
         }
 
         CanvasStateManager board = room.getBoard(boardId);
+        if (board == null) {
+            return false;
+        }
         if (!board.applyMutation(shape)) {
             log.debug("Remote MUTATION rejected (stale)  id={} room='{}' board='{}'",
                     shape.objectId(), roomId, boardId);
@@ -1720,6 +1791,9 @@ public final class NioServer implements Runnable {
         }
 
         CanvasStateManager board = room.getBoard(boardId);
+        if (board == null) {
+            return false;
+        }
         if (!board.deleteShape(shapeId)) {
             log.debug("Remote SHAPE_DELETE no-op  id={} room='{}' board='{}'", shapeId, roomId, boardId);
             return false;
@@ -1741,6 +1815,9 @@ public final class NioServer implements Runnable {
         }
 
         CanvasStateManager board = room.getBoard(boardId);
+        if (board == null) {
+            return false;
+        }
         board.clearUserShapes(targetClientId);
         roomManager.appendToWal(roomId, boardId, msg);
         fanoutFrame.rewind();
