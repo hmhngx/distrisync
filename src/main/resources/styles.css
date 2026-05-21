@@ -923,3 +923,87 @@
     -fx-background-radius: 0;
     -fx-border-radius: 0;
 }
+
+.youtube-player-node {
+    -fx-background-color: #0E1015;
+    -fx-border-color: rgba(255, 255, 255, 0.1);
+    -fx-border-width: 1px;
+    -fx-border-radius: 12px;
+    -fx-background-radius: 12px;
+}
+.youtube-header-bar {
+    -fx-background-color: rgba(24, 24, 27, 0.98);
+    -fx-padding: 6px 10px;
+    -fx-background-radius: 12 12 0 0;
+    -fx-border-color: transparent transparent rgba(255, 255, 255, 0.06) transparent;
+    -fx-border-width: 0 0 1 0;
+}
+.youtube-header-bar .youtube-url-input {
+    -fx-background-color: #18181B;
+    -fx-text-fill: #FAFAFA;
+    -fx-prompt-text-fill: #71717A;
+    -fx-background-radius: 6;
+    -fx-border-color: #3F3F46;
+    -fx-border-radius: 6;
+    -fx-padding: 4px 8px;
+    -fx-font-size: 12px;
+}
+.youtube-header-bar .youtube-load-btn {
+    -fx-background-color: #6366F1;
+    -fx-text-fill: #FFFFFF;
+    -fx-background-radius: 6;
+    -fx-padding: 4px 12px;
+    -fx-font-size: 12px;
+}
+.youtube-window-controls {
+    -fx-alignment: center-right;
+}
+.youtube-window-btn {
+    -fx-background-color: transparent;
+    -fx-text-fill: #A1A1AA;
+    -fx-background-radius: 6;
+    -fx-padding: 0;
+    -fx-font-size: 14px;
+    -fx-cursor: hand;
+}
+.youtube-window-btn:hover {
+    -fx-background-color: rgba(255, 255, 255, 0.08);
+    -fx-text-fill: #FAFAFA;
+}
+.youtube-window-close-btn:hover {
+    -fx-background-color: rgba(239, 68, 68, 0.15);
+    -fx-text-fill: #FCA5A5;
+}
+.youtube-drag-grip {
+    -fx-text-fill: #71717A;
+    -fx-font-size: 14px;
+    -fx-alignment: center;
+    -fx-padding: 0 8;
+}
+.youtube-player-webview {
+    -fx-background-color: transparent;
+}
+.youtube-controls-bar .youtube-play-btn {
+    -fx-background-color: #27272A;
+    -fx-text-fill: #FAFAFA;
+    -fx-background-radius: 6;
+    -fx-padding: 6 14;
+    -fx-font-size: 13px;
+}
+.youtube-controls-bar .youtube-play-btn:disabled {
+    -fx-opacity: 0.45;
+}
+.youtube-controls-bar .youtube-time-label {
+    -fx-text-fill: #A1A1AA;
+    -fx-font-size: 12px;
+    -fx-font-family: "Consolas", "Courier New", monospace;
+}
+.youtube-controls-bar .youtube-timeline-slider .track {
+    -fx-background-color: #3F3F46;
+}
+.youtube-controls-bar .youtube-timeline-slider .thumb {
+    -fx-background-color: #FAFAFA;
+}
+.youtube-controls-bar .youtube-timeline-slider:disabled {
+    -fx-opacity: 0.45;
+}
