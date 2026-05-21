@@ -8,7 +8,7 @@ class RoomPermissionsTest {
 
     @Test
     void roleConstants_matchBitmaskComposition() {
-        assertThat(RoomPermissions.OWNER).isEqualTo(31);
+        assertThat(RoomPermissions.OWNER).isEqualTo(63);
         assertThat(RoomPermissions.MEMBER).isEqualTo(3);
         assertThat(RoomPermissions.SPECTATOR).isZero();
         assertThat(RoomPermissions.OWNER)
@@ -16,7 +16,8 @@ class RoomPermissionsTest {
                         | RoomPermissions.PERM_SPEAK
                         | RoomPermissions.PERM_MANAGE_USERS
                         | RoomPermissions.PERM_DELETE_ROOM
-                        | RoomPermissions.PERM_MANAGE_ROOM);
+                        | RoomPermissions.PERM_MANAGE_ROOM
+                        | RoomPermissions.PERM_MANAGE_MEDIA);
     }
 
     @Test
@@ -24,6 +25,13 @@ class RoomPermissionsTest {
         assertThat(RoomPermissions.canManageRoom(RoomPermissions.OWNER)).isTrue();
         assertThat(RoomPermissions.canManageRoom(RoomPermissions.MEMBER)).isFalse();
         assertThat(RoomPermissions.canManageRoom(RoomPermissions.PERM_MANAGE_ROOM)).isTrue();
+    }
+
+    @Test
+    void canManageMedia_reflectsManageMediaBit() {
+        assertThat(RoomPermissions.canManageMedia(RoomPermissions.OWNER)).isTrue();
+        assertThat(RoomPermissions.canManageMedia(RoomPermissions.MEMBER)).isFalse();
+        assertThat(RoomPermissions.canManageMedia(RoomPermissions.PERM_MANAGE_MEDIA)).isTrue();
     }
 
     @Test

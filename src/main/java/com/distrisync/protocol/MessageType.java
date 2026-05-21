@@ -46,6 +46,10 @@ import java.util.Map;
  * 0x1F        TOGGLE_BOARD_LOCK – client→server: set { locked }; server→room: broadcast { locked }
  * 0x20        DELETE_BOARD      – client→server: JSON string boardId — room manager removes board (non-default)
  * 0x21        BOARD_DELETED     – server→client: JSON string boardId — board was removed; update UI
+ * 0x22        MEDIA_STATE_UPDATE – server→room: authoritative media snapshot
+ *                             payload: { state, mediaTimeSeconds, serverEpochMs, videoId }
+ * 0x23        MEDIA_CONTROL     – client→server: room media command (requires PERM_MANAGE_MEDIA)
+ *                             payload: { action, requestedTime, targetId } — action: PLAY, PAUSE, SEEK, LOAD
  * </pre>
  */
 public enum MessageType {
@@ -82,7 +86,9 @@ public enum MessageType {
     BOARD_SWITCH     ((byte) 0x1E),
     TOGGLE_BOARD_LOCK((byte) 0x1F),
     DELETE_BOARD     ((byte) 0x20),
-    BOARD_DELETED    ((byte) 0x21);
+    BOARD_DELETED    ((byte) 0x21),
+    MEDIA_STATE_UPDATE((byte) 0x22),
+    MEDIA_CONTROL    ((byte) 0x23);
 
     private final byte wireCode;
 

@@ -1064,6 +1064,101 @@ public final class MessageCodec {
         return p;
     }
 
+    // -------------------------------------------------------------------------
+    // MEDIA_CONTROL / MEDIA_STATE_UPDATE helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Client→server media command. {@code action}: PLAY, PAUSE, SEEK, LOAD, STOP.
+     * {@code targetId} is the video id for LOAD; empty string otherwise.
+     */
+    public record MediaControlPayload(String action, double requestedTime, String targetId) {}
+
+    /**
+     * Server→room authoritative media snapshot.
+     *
+     * <p>Playback position at client time {@code t}:
+     * <ul>
+     *   <li>{@code PLAYING}: {@code mediaTimeSeconds + (t - serverEpochMs) / 1000.0}</li>
+     *   <li>{@code PAUSED} (and after LOAD): {@code mediaTimeSeconds}</li>
+     * </ul>
+     */
+    public record MediaStatePayload(String state, double mediaTimeSeconds, long serverEpochMs, String videoId) {}
+
+    public static ByteBuffer encodeMediaControl(MediaControlPayload payload) {
+        if (payload == null) throw new IllegalArgumentException("payload must not be null");
+        return encodeObject(MessageType.MEDIA_CONTROL, payload);
+    }
+
+    public static MediaControlPayload decodeMediaControl(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.MEDIA_CONTROL) {
+            throw new IllegalArgumentException("expected MEDIA_CONTROL, got " + msg.type());
+        }
+        MediaControlPayload p = GSON.fromJson(msg.payload(), MediaControlPayload.class);
+        if (p == null || p.action() == null || p.action().isBlank()) {
+            throw new IllegalArgumentException("MEDIA_CONTROL missing action");
+        }
+        return p;
+    }
+
+    public static ByteBuffer encodeMediaState(MediaStatePayload payload) {
+        if (payload == null) throw new IllegalArgumentException("payload must not be null");
+        return encodeObject(MessageType.MEDIA_STATE_UPDATE, payload);
+    }
+
+    public static MediaStatePayload decodeMediaState(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.MEDIA_STATE_UPDATE) {
+            throw new IllegalArgumentException("expected MEDIA_STATE_UPDATE, got " + msg.type());
+        }
+        MediaStatePayload p = GSON.fromJson(msg.payload(), MediaStatePayload.class);
+        if (p == null || p.state() == null || p.state().isBlank()) {
+            throw new IllegalArgumentException("MEDIA_STATE_UPDATE missing state");
+        }
+        if (p.videoId() == null) {
+            throw new IllegalArgumentException("MEDIA_STATE_UPDATE missing videoId");
+        }
+        return p;
+    }
+
+    /**
+     * Applies a {@link MessageType#MEDIA_CONTROL} command to produce the next authoritative
+     * {@link MediaStatePayload} with {@code serverEpochMs} as the anchor wall clock.
+     */
+    public static MediaStatePayload deriveMediaState(
+            MediaControlPayload control,
+            MediaStatePayload prior,
+            long serverEpochMs) {
+        if (control == null) throw new IllegalArgumentException("control must not be null");
+        String action = control.action().strip().toUpperCase();
+        String priorVideo = prior != null ? prior.videoId() : "";
+        return switch (action) {
+            case "PLAY" -> new MediaStatePayload(
+                    "PLAYING",
+                    control.requestedTime(),
+                    serverEpochMs,
+                    priorVideo);
+            case "PAUSE" -> new MediaStatePayload(
+                    "PAUSED",
+                    control.requestedTime(),
+                    serverEpochMs,
+                    priorVideo);
+            case "SEEK" -> new MediaStatePayload(
+                    prior != null ? prior.state() : "PAUSED",
+                    control.requestedTime(),
+                    serverEpochMs,
+                    priorVideo);
+            case "LOAD" -> new MediaStatePayload(
+                    "PAUSED",
+                    control.requestedTime(),
+                    serverEpochMs,
+                    control.targetId() != null ? control.targetId() : "");
+            case "STOP" -> new MediaStatePayload("STOP", 0, serverEpochMs, "");
+            default -> throw new IllegalArgumentException("unsupported MEDIA_CONTROL action: " + action);
+        };
+    }
+
     /**
      * Exposes the shared {@link Gson} instance for callers that need custom
      * serialization (e.g. registering type adapters for {@code UUID} or
