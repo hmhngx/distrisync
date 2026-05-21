@@ -222,6 +222,8 @@ public class WhiteboardApp extends Application {
     private StackPane dockSlideClipStack;
     private Rectangle dockClipRect;
     private VBox      canvasToolDock;
+    /** Opens / hides the spatial YouTube player (decoupled from {@code MEDIA_STATE_UPDATE}). */
+    private Button    watchPartyBtn;
     /** Tools-island toggle group and buttons (for shortcuts + programmatic selection). */
     private ToggleGroup canvasToolGroup;
     private ToggleButton canvasToolLine;
@@ -288,6 +290,13 @@ public class WhiteboardApp extends Application {
     private StackPane canvasSceneRoot;
     /** Canvas + floating HUD; blurred when {@link #onSessionRevoked} overlay is shown (sibling of kick overlay). */
     private StackPane workspaceContentLayer;
+    /** Transparent host for draggable spatial nodes (e.g. WebView media); sits above canvas, below HUD. */
+    private Pane spatialOverlayLayer;
+    private YoutubePlayerNode youtubePlayer;
+    /** Previous {@code MediaStatePayload#state} for PAUSED→PLAYING echo-guard detection. */
+    private String lastMediaState;
+    /** Last non-blank room video id from {@code MEDIA_STATE_UPDATE}; drives watch-party toolbar visibility. */
+    private String lastActiveRoomVideoId = "";
     /** Full-screen Task View–style board picker; added/removed from {@link #canvasSceneRoot} when toggled. */
     private StackPane switcherOverlay;
     private FlowPane  switcherBoardGrid;
@@ -351,6 +360,9 @@ public class WhiteboardApp extends Application {
 
     @Override
     public void start(Stage stage) {
+        if (java.net.CookieHandler.getDefault() == null) {
+            java.net.CookieHandler.setDefault(new java.net.CookieManager());
+        }
         primaryStage = stage;
         Rectangle2D visual = Screen.getPrimary().getVisualBounds();
         enforceMinimumStageBounds(stage);
@@ -416,6 +428,9 @@ public class WhiteboardApp extends Application {
         canvasContainer.setId(WORKSPACE_CANVAS_LAYER_ID);
         canvasContainer.prefWidthProperty().bind(workspaceContentLayer.widthProperty());
         canvasContainer.prefHeightProperty().bind(workspaceContentLayer.heightProperty());
+
+        spatialOverlayLayer = new Pane();
+        spatialOverlayLayer.setPickOnBounds(false);
 
         buildBoardSwitcherOverlay();
 
@@ -535,6 +550,7 @@ public class WhiteboardApp extends Application {
 
         workspaceContentLayer.getChildren().addAll(canvasContainer, boardsLayer, dockLayer, propertiesBarLayer,
                 topRightLayer, rosterLayer, micLayer, telemetryLayer);
+        workspaceContentLayer.getChildren().add(1, spatialOverlayLayer);
         canvasSceneRoot.getChildren().add(workspaceContentLayer);
 
         Platform.runLater(this::updateToolsDrawerClipAndHostWidth);
@@ -1282,8 +1298,17 @@ public class WhiteboardApp extends Application {
         }
     }
 
-    /** Top-right floating island: leave room + connection status (initialises {@link #statusLabel}). */
+    /** Top-right floating island: watch party + leave room + connection status (initialises {@link #statusLabel}). */
     private HBox buildTopRightHud() {
+        watchPartyBtn = new Button("▶ Start Watch Party");
+        watchPartyBtn.setStyle(
+                "-fx-background-color: #6366F1; -fx-text-fill: white; -fx-font-weight: bold; "
+                        + "-fx-padding: 8px 16px; -fx-background-radius: 6px; -fx-cursor: hand;");
+        watchPartyBtn.setFocusTraversable(false);
+        watchPartyBtn.setMnemonicParsing(false);
+        watchPartyBtn.setOnAction(e -> toggleWatchPartyUI());
+        Tooltip.install(watchPartyBtn, createTooltip("Watch party / YouTube", ""));
+
         Button leaveRoomBtn = new Button("Leave Room");
         leaveRoomBtn.setId(LEAVE_ROOM_BUTTON_ID);
         leaveRoomBtn.getStyleClass().add("leave-room-button");
@@ -1308,7 +1333,8 @@ public class WhiteboardApp extends Application {
         statusLabel.setWrapText(true);
         statusLabel.setMaxWidth(200);
 
-        HBox row = new HBox(10, leaveRoomBtn, btnDeleteRoom, statusLabel);
+        HBox row = new HBox(10);
+        row.getChildren().addAll(watchPartyBtn, leaveRoomBtn, btnDeleteRoom, statusLabel);
         row.setAlignment(Pos.CENTER_LEFT);
         row.getStyleClass().add("hud-panel");
         row.setPickOnBounds(false);
@@ -1643,6 +1669,137 @@ public class WhiteboardApp extends Application {
     }
 
     /**
+     * Mutes local mic when room media resumes to prevent YouTube ↔ VoIP feedback loops.
+     */
+    private void enforcePlaybackEchoGuard() {
+        if (networkClient == null) {
+            return;
+        }
+        AudioEngine audio = networkClient.getAudioEngine();
+        audio.setMicMuted(true);
+        networkClient.sendVoiceState(true);
+        Participant local = networkClient.getParticipantManager().get(networkClient.getClientId());
+        if (local != null) {
+            local.setMuted(true);
+        }
+        if (canvasSceneRoot != null) {
+            ToastNotification.show(canvasSceneRoot,
+                    "Mic muted to prevent audio feedback during playback.");
+        }
+    }
+
+    private void handleMediaStateUpdate(MessageCodec.MediaStatePayload state) {
+        if (state == null) {
+            return;
+        }
+        String newState = state.state() != null ? state.state().strip().toUpperCase() : "";
+        if ("STOP".equals(newState)) {
+            teardownYoutubePlayer();
+            if (canvasSceneRoot != null) {
+                ToastNotification.show(canvasSceneRoot, "Watch Party ended by Admin.");
+            }
+            bindPermissionsToUI();
+            return;
+        }
+        if ("PAUSED".equals(lastMediaState) && "PLAYING".equals(newState)) {
+            enforcePlaybackEchoGuard();
+        }
+        lastMediaState = newState;
+
+        String videoId = state.videoId() != null ? state.videoId() : "";
+        boolean videoIdChanged = false;
+        if (videoId.isBlank()) {
+            if (!lastActiveRoomVideoId.isBlank()) {
+                lastActiveRoomVideoId = "";
+                videoIdChanged = true;
+            }
+            if (videoIdChanged) {
+                bindPermissionsToUI();
+            }
+            return;
+        }
+        boolean newActiveVideo = !videoId.equals(lastActiveRoomVideoId);
+        ensureYoutubePlayer();
+        if (youtubePlayer != null) {
+            if (newActiveVideo) {
+                lastActiveRoomVideoId = videoId;
+                youtubePlayer.setVisible(true);
+                youtubePlayer.toFront();
+                bindPermissionsToUI();
+            }
+            youtubePlayer.applyServerState(state);
+        }
+    }
+
+    private void toggleWatchPartyUI() {
+        ensureYoutubePlayer();
+        if (youtubePlayer == null) {
+            return;
+        }
+        boolean wasVisible = youtubePlayer.isVisible();
+        youtubePlayer.setVisible(!wasVisible);
+        if (wasVisible) {
+            youtubePlayer.pauseLocalPlayback();
+        }
+    }
+
+    private void ensureYoutubePlayer() {
+        if (spatialOverlayLayer == null) {
+            return;
+        }
+        if (youtubePlayer == null) {
+            youtubePlayer = new YoutubePlayerNode(networkClient, networkClient.getParticipantManager());
+            youtubePlayer.setVisible(false);
+            spatialOverlayLayer.getChildren().add(youtubePlayer);
+            youtubePlayer.toFront();
+            centerYoutubePlayerOnce();
+        }
+    }
+
+    /**
+     * Centers the PiP once via translate (not layout bind) so later drags are preserved on resize.
+     */
+    private void centerYoutubePlayerOnce() {
+        if (youtubePlayer == null || spatialOverlayLayer == null) {
+            return;
+        }
+        double w = spatialOverlayLayer.getWidth();
+        double h = spatialOverlayLayer.getHeight();
+        if (w > 0 && h > 0) {
+            youtubePlayer.setTranslateX(Math.max(0, (w - youtubePlayer.getPrefWidth()) / 2.0));
+            youtubePlayer.setTranslateY(Math.max(0, (h - youtubePlayer.getPrefHeight()) / 2.0));
+            return;
+        }
+        javafx.beans.value.ChangeListener<Number> centerOnce = new javafx.beans.value.ChangeListener<>() {
+            @Override
+            public void changed(javafx.beans.value.ObservableValue<? extends Number> obs,
+                                Number oldVal, Number newVal) {
+                double width = spatialOverlayLayer.getWidth();
+                double height = spatialOverlayLayer.getHeight();
+                if (width <= 0 || height <= 0 || youtubePlayer == null) {
+                    return;
+                }
+                youtubePlayer.setTranslateX(Math.max(0, (width - youtubePlayer.getPrefWidth()) / 2.0));
+                youtubePlayer.setTranslateY(Math.max(0, (height - youtubePlayer.getPrefHeight()) / 2.0));
+                spatialOverlayLayer.widthProperty().removeListener(this);
+            }
+        };
+        spatialOverlayLayer.widthProperty().addListener(centerOnce);
+    }
+
+    private void teardownYoutubePlayer() {
+        lastMediaState = null;
+        lastActiveRoomVideoId = "";
+        if (youtubePlayer != null) {
+            youtubePlayer.dispose();
+        }
+        if (spatialOverlayLayer != null && youtubePlayer != null) {
+            spatialOverlayLayer.getChildren().remove(youtubePlayer);
+        }
+        youtubePlayer = null;
+    }
+
+    /**
      * Applies {@link ParticipantManager#getLocalPermissions()} to canvas chrome. FX thread only.
      */
     private void bindPermissionsToUI() {
@@ -1658,6 +1815,9 @@ public class WhiteboardApp extends Application {
         boolean canDelete = RoomPermissions.canDeleteRoom(perms);
         boolean canManage = RoomPermissions.canManageUsers(perms);
         boolean canManageRoom = RoomPermissions.canManageRoom(perms);
+        boolean canManageMedia = RoomPermissions.canManageMedia(perms);
+        boolean hasActiveRoomVideo = !lastActiveRoomVideoId.isBlank();
+        boolean showWatchParty = canManageMedia || hasActiveRoomVideo;
 
         if (drawingToolbar != null) {
             drawingToolbar.setDisable(!canDraw);
@@ -1666,7 +1826,14 @@ public class WhiteboardApp extends Application {
             workspacePropertiesBar.setDisable(!canDraw);
         }
         if (canvasToolDock != null) {
-            canvasToolDock.setDisable(!canDraw);
+            for (Node child : canvasToolDock.getChildren()) {
+                child.setDisable(!canDraw);
+            }
+        }
+        if (watchPartyBtn != null) {
+            watchPartyBtn.setVisible(showWatchParty);
+            watchPartyBtn.setManaged(showWatchParty);
+            watchPartyBtn.setDisable(false);
         }
         if (btnDeleteRoom != null) {
             btnDeleteRoom.setVisible(canDelete);
@@ -1795,6 +1962,7 @@ public class WhiteboardApp extends Application {
         if (!sessionRevokedOverlayShown.compareAndSet(false, true)) {
             return;
         }
+        teardownYoutubePlayer();
         if (remoteCursorManager != null) {
             remoteCursorManager.stop();
         }
@@ -2044,6 +2212,7 @@ public class WhiteboardApp extends Application {
         sessionRevokedOverlayShown.set(false);
         cancelLobbyJoinWatchdog();
         hideBoardSwitcher();
+        teardownYoutubePlayer();
         boardSnapshots.clear();
         unwireCanvasMouseEvents();
         if (remoteCursorManager != null) {
@@ -2938,6 +3107,8 @@ public class WhiteboardApp extends Application {
                 Platform.runLater(() -> onSessionRevoked(reason)));
         networkClient.addRoleUpdateListener(payload ->
                 Platform.runLater(() -> applyRoleUpdate(payload)));
+        networkClient.addMediaStateListener(state ->
+                Platform.runLater(() -> handleMediaStateUpdate(state)));
         networkClient.addRoomMembershipListener(new RoomMembershipListener() {
             @Override
             public void onPeerJoined(String clientId, String authorName) {

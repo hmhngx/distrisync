@@ -570,6 +570,85 @@ class MessageCodecTest {
     }
 
     @Test
+    void mediaControl_roundTrip() {
+        MessageCodec.MediaControlPayload original =
+                new MessageCodec.MediaControlPayload("PLAY", 12.5, "");
+        ByteBuffer frame = MessageCodec.encodeMediaControl(original);
+        Message decoded = MessageCodec.decode(frame);
+        assertThat(decoded.type()).isEqualTo(MessageType.MEDIA_CONTROL);
+        MessageCodec.MediaControlPayload p = MessageCodec.decodeMediaControl(decoded);
+        assertThat(p.action()).isEqualTo("PLAY");
+        assertThat(p.requestedTime()).isEqualTo(12.5);
+        assertThat(p.targetId()).isEqualTo("");
+    }
+
+    @Test
+    void mediaState_roundTrip() {
+        MessageCodec.MediaStatePayload original =
+                new MessageCodec.MediaStatePayload("PLAYING", 3.0, 1_700_000_000_000L, "vid-abc");
+        ByteBuffer frame = MessageCodec.encodeMediaState(original);
+        Message decoded = MessageCodec.decode(frame);
+        assertThat(decoded.type()).isEqualTo(MessageType.MEDIA_STATE_UPDATE);
+        MessageCodec.MediaStatePayload p = MessageCodec.decodeMediaState(decoded);
+        assertThat(p.state()).isEqualTo("PLAYING");
+        assertThat(p.mediaTimeSeconds()).isEqualTo(3.0);
+        assertThat(p.serverEpochMs()).isEqualTo(1_700_000_000_000L);
+        assertThat(p.videoId()).isEqualTo("vid-abc");
+    }
+
+    @Test
+    void deriveMediaState_playPauseSeekLoad() {
+        long epoch = 1_000L;
+        MessageCodec.MediaControlPayload play =
+                new MessageCodec.MediaControlPayload("PLAY", 10.0, "");
+        MessageCodec.MediaStatePayload playing = MessageCodec.deriveMediaState(play, null, epoch);
+        assertThat(playing.state()).isEqualTo("PLAYING");
+        assertThat(playing.mediaTimeSeconds()).isEqualTo(10.0);
+        assertThat(playing.serverEpochMs()).isEqualTo(epoch);
+        assertThat(playing.videoId()).isEqualTo("");
+
+        MessageCodec.MediaControlPayload pause =
+                new MessageCodec.MediaControlPayload("PAUSE", 15.5, "");
+        MessageCodec.MediaStatePayload paused = MessageCodec.deriveMediaState(pause, playing, epoch + 1);
+        assertThat(paused.state()).isEqualTo("PAUSED");
+        assertThat(paused.mediaTimeSeconds()).isEqualTo(15.5);
+        assertThat(paused.videoId()).isEqualTo("");
+
+        MessageCodec.MediaControlPayload seek =
+                new MessageCodec.MediaControlPayload("SEEK", 20.0, "");
+        MessageCodec.MediaStatePayload seeked = MessageCodec.deriveMediaState(seek, playing, epoch + 2);
+        assertThat(seeked.state()).isEqualTo("PLAYING");
+        assertThat(seeked.mediaTimeSeconds()).isEqualTo(20.0);
+
+        MessageCodec.MediaControlPayload load =
+                new MessageCodec.MediaControlPayload("LOAD", 0.0, "yt:abc");
+        MessageCodec.MediaStatePayload loaded = MessageCodec.deriveMediaState(load, playing, epoch + 3);
+        assertThat(loaded.state()).isEqualTo("PAUSED");
+        assertThat(loaded.mediaTimeSeconds()).isEqualTo(0.0);
+        assertThat(loaded.videoId()).isEqualTo("yt:abc");
+    }
+
+    @Test
+    void deriveMediaState_stop() {
+        long epoch = 5_000L;
+        MessageCodec.MediaControlPayload stop =
+                new MessageCodec.MediaControlPayload("STOP", 0, "");
+        MessageCodec.MediaStatePayload stopped = MessageCodec.deriveMediaState(
+                stop,
+                new MessageCodec.MediaStatePayload("PLAYING", 10.0, 1_000L, "vid"),
+                epoch);
+        assertThat(stopped.state()).isEqualTo("STOP");
+        assertThat(stopped.mediaTimeSeconds()).isEqualTo(0.0);
+        assertThat(stopped.serverEpochMs()).isEqualTo(epoch);
+        assertThat(stopped.videoId()).isEqualTo("");
+
+        ByteBuffer frame = MessageCodec.encodeMediaState(stopped);
+        Message decoded = MessageCodec.decode(frame);
+        MessageCodec.MediaStatePayload roundTrip = MessageCodec.decodeMediaState(decoded);
+        assertThat(roundTrip.state()).isEqualTo("STOP");
+    }
+
+    @Test
     void testBufferUnderflow_IncompletePayload() {
         final int declaredPayloadLength = 100;
         final int availablePayloadBytes = 50;

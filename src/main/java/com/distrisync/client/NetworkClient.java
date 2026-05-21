@@ -173,6 +173,9 @@ public final class NetworkClient implements AutoCloseable {
     private final CopyOnWriteArrayList<BoardDeletedListener> boardDeletedListeners =
             new CopyOnWriteArrayList<>();
 
+    private final CopyOnWriteArrayList<MediaStateListener> mediaStateListeners =
+            new CopyOnWriteArrayList<>();
+
     private final RoomState roomState = new RoomState();
 
     /**
@@ -766,6 +769,18 @@ public final class NetworkClient implements AutoCloseable {
         }
     }
 
+    public void addMediaStateListener(MediaStateListener listener) {
+        if (listener != null) {
+            mediaStateListeners.addIfAbsent(listener);
+        }
+    }
+
+    public void removeMediaStateListener(MediaStateListener listener) {
+        if (listener != null) {
+            mediaStateListeners.remove(listener);
+        }
+    }
+
     /**
      * Publishes this client's canvas cursor position to peers ({@link MessageType#CURSOR_SYNC}).
      * Rate-limited to ~15 Hz. Silently no-ops when not connected.
@@ -799,6 +814,20 @@ public final class NetworkClient implements AutoCloseable {
         }
         enqueueFrame(MessageCodec.encodeVoiceState(clientId, isMuted));
         log.debug("VOICE_STATE enqueued clientId={} muted={}", clientId, isMuted);
+    }
+
+    /**
+     * Enqueues a {@code MEDIA_CONTROL} frame (PLAY, PAUSE, SEEK, LOAD, STOP).
+     * Server enforces {@link com.distrisync.protocol.RoomPermissions#PERM_MANAGE_MEDIA}.
+     */
+    public void sendMediaControl(String action, double requestedTime, String targetId) {
+        if (!running.get()) {
+            return;
+        }
+        String tid = targetId != null ? targetId : "";
+        enqueueFrame(MessageCodec.encodeMediaControl(
+                new MessageCodec.MediaControlPayload(action, requestedTime, tid)));
+        log.debug("MEDIA_CONTROL enqueued action={} time={}", action, requestedTime);
     }
 
     /**
@@ -1626,6 +1655,21 @@ public final class NetworkClient implements AutoCloseable {
                     log.warn("Malformed TOGGLE_BOARD_LOCK ignored: {}", e.getMessage());
                 }
             }
+            case MEDIA_STATE_UPDATE -> {
+                try {
+                    MessageCodec.MediaStatePayload p = MessageCodec.decodeMediaState(msg);
+                    log.debug("MEDIA_STATE_UPDATE state={} videoId='{}'", p.state(), p.videoId());
+                    for (MediaStateListener listener : mediaStateListeners) {
+                        try {
+                            listener.onMediaStateUpdate(p);
+                        } catch (Exception e) {
+                            log.warn("mediaStateListener failed: {}", e.getMessage());
+                        }
+                    }
+                } catch (Exception e) {
+                    log.warn("Malformed MEDIA_STATE_UPDATE ignored: {}", e.getMessage());
+                }
+            }
             default -> log.warn("Ignoring unexpected inbound message type={} — check client/server versions",
                     msg.type());
         }
@@ -1671,6 +1715,21 @@ public final class NetworkClient implements AutoCloseable {
             dispatchMessage(msg);
         } catch (Exception e) {
             throw new IllegalStateException("ROLE_UPDATE test frame failed", e);
+        }
+    }
+
+    /**
+     * Feeds {@code MEDIA_STATE_UPDATE} through {@link #dispatchMessage} for unit tests.
+     */
+    void ingestMediaStateForStateTest(MessageCodec.MediaStatePayload payload) {
+        running.set(true);
+        protocolReady.set(true);
+        try {
+            ByteBuffer frame = MessageCodec.encodeMediaState(payload);
+            Message msg = MessageCodec.decode(frame);
+            dispatchMessage(msg);
+        } catch (Exception e) {
+            throw new IllegalStateException("MEDIA_STATE_UPDATE test frame failed", e);
         }
     }
 

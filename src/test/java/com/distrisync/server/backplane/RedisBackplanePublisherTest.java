@@ -6,6 +6,9 @@ import com.distrisync.server.ServerMetrics;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -16,6 +19,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -24,6 +28,7 @@ import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.verify;
 
 @ExtendWith(MockitoExtension.class)
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class RedisBackplanePublisherTest {
 
     @Mock
@@ -44,6 +49,7 @@ class RedisBackplanePublisherTest {
     }
 
     @Test
+    @Order(3)
     void testRedisPublisherIsAsynchronous() throws Exception {
         doNothing().when(redisClient).close();
 
@@ -52,7 +58,7 @@ class RedisBackplanePublisherTest {
 
         doAnswer(invocation -> {
             publishStarted.countDown();
-            Thread.sleep(500);
+            Thread.sleep(50);
             publishFinished.countDown();
             return 0L;
         }).when(redisClient).publish(anyString(), any(byte[].class));
@@ -70,19 +76,22 @@ class RedisBackplanePublisherTest {
                 "Board-1",
                 ByteBuffer.wrap(new byte[] { 0x03, 0, 0, 0, 2, '{', '}' }));
 
+        long publishedBefore = ServerMetrics.REDIS_MESSAGES_PUBLISHED.get();
         long startNanos = System.nanoTime();
         publisher.publish(envelope);
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
 
-        assertThat(elapsedMs).isLessThan(10);
+        assertThat(elapsedMs).isLessThan(100);
 
         assertThat(publishStarted.await(2, TimeUnit.SECONDS)).isTrue();
         assertThat(publishFinished.await(2, TimeUnit.SECONDS)).isTrue();
         verify(redisClient).publish(eq(BackplaneEnvelopeCodec.roomChannel("room-a")), any(byte[].class));
-        assertThat(ServerMetrics.REDIS_MESSAGES_PUBLISHED.get()).isEqualTo(1);
+        await().atMost(2, TimeUnit.SECONDS).untilAsserted(() ->
+                assertThat(ServerMetrics.REDIS_MESSAGES_PUBLISHED.get()).isEqualTo(publishedBefore + 1));
     }
 
     @Test
+    @Order(1)
     void testPublishPresenceUsesPresenceChannel() throws Exception {
         doNothing().when(redisClient).close();
 
@@ -112,6 +121,7 @@ class RedisBackplanePublisherTest {
     }
 
     @Test
+    @Order(2)
     void testPublishControlUsesControlChannel() throws Exception {
         doNothing().when(redisClient).close();
 

@@ -32,7 +32,8 @@
 22. [Moderation & SESSION_REVOKED](#22-moderation--session_revoked)
 23. [Collaboration Roster & Board Presence](#23-collaboration-roster--board-presence)
 24. [Workspace Board Deletion](#24-workspace-board-deletion)
-25. [Sequence Diagram — Two-Client Collaboration Flow](#25-sequence-diagram--two-client-collaboration-flow)
+25. [Room Watch Party & Media Sync](#25-room-watch-party--media-sync)
+26. [Sequence Diagram — Two-Client Collaboration Flow](#26-sequence-diagram--two-client-collaboration-flow)
 
 ---
 
@@ -102,6 +103,8 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x1F`    | `TOGGLE_BOARD_LOCK`| Client ↔ Server      | No               | `{ locked }`. Host sets `RoomContext.boardCreationLocked`; server broadcasts state to all room members. |
 | `0x20`    | `DELETE_BOARD`     | Client → Server      | No               | JSON string `boardId`. Requires `PERM_MANAGE_ROOM`. Cannot delete `Board-1` (default). Tombstones board + deletes WAL. |
 | `0x21`    | `BOARD_DELETED`    | Server → Room        | No               | JSON string `boardId`. Notifies all occupants to refresh board list / Task View UI. |
+| `0x22`    | `MEDIA_STATE_UPDATE` | Server → Room      | No               | `{ state, mediaTimeSeconds, serverEpochMs, videoId }` — authoritative room-global media snapshot. When `state` is `PLAYING`, position at client time `t` is `mediaTimeSeconds + (t - serverEpochMs) / 1000.0`; when `PAUSED`, use `mediaTimeSeconds` directly. Hydrated on join and via control channel on multi-node clusters. |
+| `0x23`    | `MEDIA_CONTROL`    | Client → Server      | No               | `{ action, requestedTime, targetId }` — `action`: `PLAY`, `PAUSE`, `SEEK`, `LOAD`, `STOP`. Requires `PERM_MANAGE_MEDIA`. Server derives `MEDIA_STATE_UPDATE`, stores `RoomContext.currentMediaState` (`null` after `STOP`), broadcasts locally, and publishes to Redis control channel. |
 
 #### Shape Envelope Format (MUTATION / SNAPSHOT)
 
@@ -302,6 +305,8 @@ RoomManager
       │
       └── RoomContext (one per room)
             ├── roomId: String
+            ├── hostClientId, isBoardCreationLocked
+            ├── currentMediaState: MediaStatePayload?  ← room-global watch party (§25)
             ├── boards: ConcurrentHashMap<String, CanvasStateManager>
             │     └── key: boardId → isolated board state
             └── activeKeys: Set<SelectionKey>       ← ConcurrentHashMap-backed
@@ -887,7 +892,7 @@ When `ServerEnvironment.resolveRedisUri()` returns a value, `WhiteboardServer` c
 |---|---|---|
 | Room mutations | `distrisync:room:{roomId}` | `BackplaneEnvelope` JSON: `{ eventId, originNodeId, roomId, boardId, serializedPayload }` where `serializedPayload` is Base64 of a full wire frame |
 | Presence (cursors) | `distrisync:room:{roomId}:presence` | Same envelope shape; carries `CURSOR_SYNC` frames only |
-| Control (moderation / presence metadata) | `distrisync:room:{roomId}:control` | `MODERATION_ACTION`, `BOARD_SWITCH`, `TOGGLE_BOARD_LOCK` — no WAL |
+| Control (moderation / room metadata) | `distrisync:room:{roomId}:control` | `MODERATION_ACTION`, `BOARD_SWITCH`, `TOGGLE_BOARD_LOCK`, `MEDIA_STATE_UPDATE` — no WAL |
 
 `RoomManager` calls `subscribeRoomChannels(roomId)` when a room is first created on a node so all three channels are active before any cross-node traffic arrives.
 
@@ -923,6 +928,8 @@ while (envelope = remoteMailbox.poll()) {
         applyRemoteModeration(envelope);    // control channel — KICK / speak toggles
     else if (envelope.type == BOARD_SWITCH || envelope.type == TOGGLE_BOARD_LOCK)
         applyRemoteRoomControl(envelope);   // control channel — roster / lock sync
+    else if (envelope.type == MEDIA_STATE_UPDATE)
+        applyRemoteRoomControl(envelope);   // control channel — watch-party snapshot
     else if (backplaneDedup.tryRecord(eventId))
         fanoutRemoteEnvelope(envelope);     // mutation channel — WAL + board fan-out
 }
@@ -1028,6 +1035,7 @@ These tools complement the Surefire suite (`server/backplane/*`, `NioServerRemot
 | `1 << 2` | `PERM_MANAGE_USERS` | `MODERATION_ACTION` |
 | `1 << 3` | `PERM_DELETE_ROOM` | `DELETE_ROOM` |
 | `1 << 4` | `PERM_MANAGE_ROOM` | `TOGGLE_BOARD_LOCK`, `DELETE_BOARD`, override board lock on join |
+| `1 << 5` | `PERM_MANAGE_MEDIA` | `MEDIA_CONTROL` (room-global playback sync) |
 
 | Preset | Value | Typical holder |
 |--------|-------|----------------|
@@ -1037,7 +1045,7 @@ These tools complement the Surefire suite (`server/backplane/*`, `NioServerRemot
 
 `ClientSession.permissions` resets to `SPECTATOR` on `HANDSHAKE` and `LEAVE_ROOM`. Join assigns `MEMBER` unless the client is the room creator (first joiner → `OWNER` + `hostClientId`).
 
-`NioServerRbacTest` and `RoomPermissionsTest` lock deny paths for draw, speak, moderation, board-lock, and board-delete commands.
+`NioServerRbacTest` and `RoomPermissionsTest` lock deny paths for draw, speak, moderation, board-lock, board-delete, and media-control commands.
 
 ---
 
@@ -1186,7 +1194,80 @@ Trash controls are hidden for `Board-1` and for members without `PERM_MANAGE_ROO
 
 ---
 
-## 25. Sequence Diagram — Two-Client Collaboration Flow
+## 25. Room Watch Party & Media Sync
+
+Watch Party is **room-scoped**, not board-scoped: one `MessageCodec.MediaStatePayload` per `RoomContext`, independent of which whiteboard a client is viewing. Media state is **not** written to the WAL — it is ephemeral room metadata relayed like moderation events.
+
+### 25.1 Authoritative State Model
+
+```java
+public record MediaStatePayload(
+    String state,              // PLAYING | PAUSED | STOP
+    double mediaTimeSeconds,   // anchor position at serverEpochMs
+    long serverEpochMs,        // wall clock when snapshot was issued
+    String videoId             // 11-char YouTube id; "" after STOP
+) {}
+```
+
+**Playback position contract** (client-side `YoutubePlayerNode.expectedPlaybackSeconds`):
+
+| `state` | Expected position at client time `t` |
+|---------|--------------------------------------|
+| `PLAYING` | `mediaTimeSeconds + (t - serverEpochMs) / 1000.0` |
+| `PAUSED` / after `LOAD` | `mediaTimeSeconds` (frozen) |
+| `STOP` | Room clears `currentMediaState`; clients tear down player |
+
+### 25.2 MEDIA_CONTROL → deriveMediaState → MEDIA_STATE_UPDATE
+
+```
+Client with PERM_MANAGE_MEDIA
+    └─► MEDIA_CONTROL { action, requestedTime, targetId }
+            └─► NioServer (selector thread)
+                    next = MessageCodec.deriveMediaState(control, room.currentMediaState, now)
+                    room.currentMediaState = (STOP ? null : next)
+                    broadcastToRoom(encodeMediaState(next))     // CRITICAL
+                    publishControlEnvelope(MEDIA_STATE_UPDATE) // cluster
+```
+
+| `action` | Effect on snapshot |
+|----------|-------------------|
+| `PLAY` | `state=PLAYING`, `mediaTimeSeconds=requestedTime`, new `serverEpochMs` |
+| `PAUSE` | `state=PAUSED`, freeze at `requestedTime` |
+| `SEEK` | Updates `mediaTimeSeconds`; preserves prior `state` (PLAYING or PAUSED) |
+| `LOAD` | `state=PAUSED`, `videoId=targetId`, position `requestedTime` |
+| `STOP` | `state=STOP`, clears `room.currentMediaState` |
+
+Join hydration: after `JOIN_ROOM`, if `room.currentMediaState != null`, the joiner receives an immediate `MEDIA_STATE_UPDATE` before board `SNAPSHOT` traffic continues.
+
+### 25.3 YoutubePlayerNode (JavaFX WebView)
+
+| Concern | Implementation |
+|---------|----------------|
+| Engine | `javafx-web` `WebView` + YouTube IFrame API (`controls: 0`, keyboard disabled in embed) |
+| Document load | Loopback `HttpServer` on `127.0.0.1:0` serves static HTML (works around `file://` + API restrictions) |
+| Bridge | `JavaBridge` JSObject callbacks (`onPlayerReady`, `log`, `error`) |
+| Controls | URL field + Load, play/pause, timeline seek, volume — egress `MEDIA_CONTROL` only when `canManageMedia` |
+| Drift sync | `AnimationTimer` compares local player time vs `expectedPlaybackSeconds`; coloured sync dot (OK / warm / correcting); seeks when drift > 1.5 s |
+| Chrome | Draggable header; minimize hides locally; close sends `STOP` for entire room |
+| Parsing | `parseYouTubeVideoId` accepts bare 11-char ids or standard YouTube URLs |
+
+Members without `PERM_MANAGE_MEDIA` still receive `MEDIA_STATE_UPDATE` and follow playback; transport controls are disabled and the admin URL row is hidden.
+
+### 25.4 WhiteboardApp Integration
+
+- **`watchPartyBtn`** — toggles visibility of `YoutubePlayerNode` on `spatialOverlayLayer` (decoupled from whether media is active).
+- **`MediaStateListener`** — `handleMediaStateUpdate` creates/updates player, handles `STOP`, PAUSED→PLAYING echo guard, and toolbar affordances.
+- **`styles.css`** — `.youtube-player-node`, header, controls, sync dot, window buttons.
+
+### 25.5 Cluster & Tests
+
+`MEDIA_STATE_UPDATE` uses the same Redis **control** channel as moderation (no `BackplaneEventDedup` on control frames — applied via `applyRemoteRoomControl`). `NioServerMediaStateTest` covers local `MEDIA_CONTROL` fan-out, `STOP` clearing state, and remote mailbox application. `YoutubePlayerNodeTest` locks drift math and URL parsing. `MessageCodecTest` covers `deriveMediaState` transitions.
+
+**Dependency:** `org.openjfx:javafx-web` in `pom.xml` (client module only; server JAR does not require WebView).
+
+---
+
+## 26. Sequence Diagram — Two-Client Collaboration Flow
 
 The diagram below shows the current lifecycle: handshake into lobby, explicit room join, board snapshot hydration (with lazy WAL replay on first board open), live draw relay, durable mutation, and distributed undo.
 

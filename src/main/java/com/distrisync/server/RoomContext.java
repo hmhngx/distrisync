@@ -39,6 +39,9 @@ final class RoomContext {
     /** When true, only clients with {@link com.distrisync.protocol.RoomPermissions#PERM_MANAGE_ROOM} may create boards. */
     volatile boolean isBoardCreationLocked = true;
 
+    /** Authoritative room-global media snapshot; {@code null} until first {@link com.distrisync.protocol.MessageType#MEDIA_CONTROL}. */
+    volatile MessageCodec.MediaStatePayload currentMediaState;
+
     private final WalManager wal;
 
     private final ConcurrentHashMap<String, CanvasStateManager> boards = new ConcurrentHashMap<>();
