@@ -622,6 +622,13 @@ public final class NioServer implements Runnable {
                             != EnqueueResult.OVERFLOW_DISCONNECT) {
                         flushWriteQueue(session, senderKey);
                     }
+                    if (room.currentMediaState != null) {
+                        ByteBuffer mediaFrame = MessageCodec.encodeMediaState(room.currentMediaState);
+                        if (safeEnqueue(session, senderKey, mediaFrame, OutboundClass.CRITICAL)
+                                != EnqueueResult.OVERFLOW_DISCONNECT) {
+                            flushWriteQueue(session, senderKey);
+                        }
+                    }
                     log.info("[TCP] Client {} joined Room '{}'. Active users: {}.",
                             clientLogLabel(session), rid, room.getActiveClientCount());
                 } catch (IllegalArgumentException e) {
@@ -1088,6 +1095,41 @@ public final class NioServer implements Runnable {
                 publishPresenceEnvelope(session.roomId, msg);
             }
 
+            case MEDIA_CONTROL -> {
+                if (!RoomPermissions.canManageMedia(session.permissions)) {
+                    return;
+                }
+                if (!session.handshakeComplete) {
+                    log.warn("MEDIA_CONTROL before HANDSHAKE session={}", session.sessionId);
+                    break;
+                }
+                RoomContext mediaRoom = resolveRoom(session, senderKey);
+                if (mediaRoom == null) {
+                    return;
+                }
+                MessageCodec.MediaControlPayload mediaControl;
+                try {
+                    mediaControl = MessageCodec.decodeMediaControl(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed MEDIA_CONTROL session={}: {}", session.sessionId, e.getMessage());
+                    break;
+                }
+                long epoch = System.currentTimeMillis();
+                MessageCodec.MediaStatePayload next = MessageCodec.deriveMediaState(
+                        mediaControl, mediaRoom.currentMediaState, epoch);
+                if ("STOP".equals(mediaControl.action().strip().toUpperCase())) {
+                    mediaRoom.currentMediaState = null;
+                } else {
+                    mediaRoom.currentMediaState = next;
+                }
+                ByteBuffer mediaFrame = MessageCodec.encodeMediaState(next);
+                broadcastToRoom(session.roomId, mediaFrame, null, OutboundClass.CRITICAL);
+                publishControlEnvelope(session.roomId,
+                        new Message(MessageType.MEDIA_STATE_UPDATE, MessageCodec.gson().toJson(next)));
+                log.info("MEDIA_CONTROL applied  room='{}' action='{}' state='{}' by={}",
+                        session.roomId, mediaControl.action(), next.state(), clientLogLabel(session));
+            }
+
             case MODERATION_ACTION -> {
                 if (!RoomPermissions.canManageUsers(session.permissions)) {
                     return;
@@ -1395,7 +1437,8 @@ public final class NioServer implements Runnable {
             } else if (peek.type() == MessageType.MODERATION_ACTION) {
                 applyRemoteModerationAction(envelope);
             } else if (peek.type() == MessageType.BOARD_SWITCH
-                    || peek.type() == MessageType.TOGGLE_BOARD_LOCK) {
+                    || peek.type() == MessageType.TOGGLE_BOARD_LOCK
+                    || peek.type() == MessageType.MEDIA_STATE_UPDATE) {
                 applyRemoteControlEnvelope(envelope);
             } else {
                 fanoutRemoteEnvelope(envelope);
@@ -2112,6 +2155,12 @@ public final class NioServer implements Runnable {
                 }
             }
         }
+        if (room.currentMediaState != null) {
+            if (safeEnqueue(joiner, joinerKey, MessageCodec.encodeMediaState(room.currentMediaState),
+                    OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
+                return;
+            }
+        }
         flushWriteQueue(joiner, joinerKey);
     }
 
@@ -2147,6 +2196,22 @@ public final class NioServer implements Runnable {
 
         RoomContext room = roomManager.getRoom(envelope.roomId());
         if (room == null) {
+            return;
+        }
+
+        if (msg.type() == MessageType.MEDIA_STATE_UPDATE) {
+            try {
+                MessageCodec.MediaStatePayload mediaPayload = MessageCodec.decodeMediaState(msg);
+                if ("STOP".equals(mediaPayload.state())) {
+                    room.currentMediaState = null;
+                } else {
+                    room.currentMediaState = mediaPayload;
+                }
+                ByteBuffer frame = MessageCodec.encodeMediaState(mediaPayload);
+                broadcastToRoom(room.roomId, frame, null, OutboundClass.CRITICAL);
+            } catch (Exception e) {
+                log.warn("Remote MEDIA_STATE_UPDATE malformed  room='{}': {}", room.roomId, e.getMessage());
+            }
             return;
         }
 
