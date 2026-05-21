@@ -19,7 +19,9 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 **Horizontal scaling:** Multiple `NioServer` JVMs can share room state through an optional **Redis Pub/Sub backplane** (Lettuce). After a local WAL commit, mutations are published as `BackplaneEnvelope` records on `distrisync:room:{roomId}`; peer nodes apply them idempotently via `BackplaneEventDedup` and fan out to local TCP clients. Ephemeral cursor positions use `CURSOR_SYNC` on TCP and a dedicated Redis presence channel (`distrisync:room:{roomId}:presence`) for cross-node relay. Room-level moderation and board-presence events use a third **control** channel (`distrisync:room:{roomId}:control`). Cold nodes request hydration with `STATE_REQUEST` / `STATE_SNAPSHOT` backplane events. Configure via `REDIS_HOST` + `REDIS_PORT` or `DISTRISYNC_REDIS_URI`, and `NODE_ID` / `DISTRISYNC_NODE_ID`.
 
-**Room governance:** Each room has a **host** (`RoomContext.hostClientId`) with full `RoomPermissions.OWNER` capabilities. Permissions are a zero-allocation `int` bitmask (`PERM_DRAW`, `PERM_SPEAK`, `PERM_MANAGE_USERS`, `PERM_DELETE_ROOM`, `PERM_MANAGE_ROOM`). The server enforces RBAC on the NIO hot path (drawing, UDP audio relay, moderation, board-lock toggles, board deletion). When the host disconnects, `selectHostCandidate` elects the oldest connected session (lexicographic `clientId` tie-break) and broadcasts `ROLE_UPDATE` to all peers. Moderators with `PERM_MANAGE_USERS` can **KICK**, **REVOKE_SPEAK**, or **GRANT_SPEAK** via `MODERATION_ACTION`; kicked clients receive `SESSION_REVOKED` and return to the lobby.
+**Room governance:** Each room has a **host** (`RoomContext.hostClientId`) with full `RoomPermissions.OWNER` capabilities. Permissions are a zero-allocation `int` bitmask (`PERM_DRAW`, `PERM_SPEAK`, `PERM_MANAGE_USERS`, `PERM_DELETE_ROOM`, `PERM_MANAGE_ROOM`, `PERM_MANAGE_MEDIA`). The server enforces RBAC on the NIO hot path (drawing, UDP audio relay, moderation, board-lock toggles, board deletion, room-global media control). When the host disconnects, `selectHostCandidate` elects the oldest connected session (lexicographic `clientId` tie-break) and broadcasts `ROLE_UPDATE` to all peers. Moderators with `PERM_MANAGE_USERS` can **KICK**, **REVOKE_SPEAK**, or **GRANT_SPEAK** via `MODERATION_ACTION`; kicked clients receive `SESSION_REVOKED` and return to the lobby.
+
+**Watch Party (room-global YouTube sync):** Rooms can run a synchronized YouTube session independent of the active whiteboard. The server holds one authoritative `MediaStatePayload` per room (`RoomContext.currentMediaState`) and fans out `MEDIA_STATE_UPDATE` (`0x22`) after each `MEDIA_CONTROL` (`0x23`). Playback position uses a server-anchored clock: while `state` is `PLAYING`, expected time is `mediaTimeSeconds + (now - serverEpochMs) / 1000`. Clients with `PERM_MANAGE_MEDIA` drive **LOAD**, **PLAY**, **PAUSE**, **SEEK**, and **STOP**; everyone else follows the snapshot. `YoutubePlayerNode` (JavaFX `WebView` + IFrame API, `javafx-web`) renders video with drift correction; `WhiteboardApp` mounts it on a draggable spatial overlay with a **Start Watch Party** toolbar control.
 
 ---
 
@@ -71,7 +73,7 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Global Canvas Context & Shape Factory** — `GlobalCanvasContext` centralises active stroke colour (`ObjectProperty<Color>`), stroke width (`DoubleProperty`), and eraser brush geometry (`EraserType` circle vs square). `GlobalCanvasShapeFactory` commits `Line`, `Circle`, `RectangleNode`, `EllipseNode`, `ArrowNode`, and `TextNode` instances using the current context, keeping the properties bar and network payloads consistent.
 
-- **Room RBAC (`RoomPermissions`)** — bitmask permissions on `ClientSession` and `Participant`. `OWNER` grants draw, speak, manage users, delete room, and manage room settings; `MEMBER` grants draw + speak; `SPECTATOR` is lobby-only. Server rejects `MUTATION` / live strokes without `PERM_DRAW`, UDP audio without `PERM_SPEAK`, `MODERATION_ACTION` without `PERM_MANAGE_USERS`, and `TOGGLE_BOARD_LOCK` / `DELETE_BOARD` without `PERM_MANAGE_ROOM`.
+- **Room RBAC (`RoomPermissions`)** — bitmask permissions on `ClientSession` and `Participant`. `OWNER` grants draw, speak, manage users, delete room, manage room settings, and manage media; `MEMBER` grants draw + speak; `SPECTATOR` is lobby-only. Server rejects `MUTATION` / live strokes without `PERM_DRAW`, UDP audio without `PERM_SPEAK`, `MODERATION_ACTION` without `PERM_MANAGE_USERS`, `TOGGLE_BOARD_LOCK` / `DELETE_BOARD` without `PERM_MANAGE_ROOM`, and `MEDIA_CONTROL` without `PERM_MANAGE_MEDIA`.
 
 - **Host Election & `ROLE_UPDATE`** — first joiner becomes host with `OWNER` permissions. On host disconnect, `NioServer.selectHostCandidate` promotes the longest-connected peer and fans out `ROLE_UPDATE` (`0x1D`, `{ newHostClientId, newPermissions, roomHostClientId? }`) so every client updates crowns and local capability flags.
 
@@ -83,13 +85,15 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Shared UI Effects (`UiEffects`)** — `toolbarDropShadow()` centralises JavaFX `DropShadow` elevation for the tool dock, properties bar, and `CollaborationRoster` (replacing CSS box-shadow on those nodes for consistent depth).
 
+- **Watch Party & YouTube Sync (`YoutubePlayerNode` / `MEDIA_CONTROL`)** — room-global media state in `RoomContext.currentMediaState`. Hosts send `MEDIA_CONTROL` (`PLAY`, `PAUSE`, `SEEK`, `LOAD`, `STOP`); `MessageCodec.deriveMediaState` computes the next snapshot with `serverEpochMs`. `MEDIA_STATE_UPDATE` is broadcast room-wide (and on the Redis **control** channel in cluster mode); joiners receive the current snapshot after `JOIN_ROOM`. `YoutubePlayerNode` hosts the YouTube IFrame API in a local `HttpServer`-served page (avoids `file://` restrictions), applies server state with drift sync (green / amber / orange indicator), and gates the URL bar / play / seek UI to `PERM_MANAGE_MEDIA`. Members can hide the player locally without stopping the session; **STOP** clears room media for everyone. `MediaStateListener` bridges `NetworkClient` to `WhiteboardApp`.
+
 - **Bidirectional Room Membership (`JOIN_ROOM` / `LEAVE_ROOM`)** — client→server `JOIN_ROOM` carries `{ roomId, initialBoardId? }`; server→peer `JOIN_ROOM` notifies `{ clientId, authorName }`. Client→server `LEAVE_ROOM` is empty; server→peer `LEAVE_ROOM` carries the departing `clientId` string (including moderation kicks and disconnects).
 
 - **Canvas Viewport Resize Coalescing** — `CanvasViewportResizeHandler` listens to the canvas container's width/height properties and coalesces invalidations into a single `Platform.runLater` redraw, avoiding redundant full-canvas repaints when JavaFX resizes the `Canvas` surface (which would otherwise clear pixel buffers at 0×0 during layout).
 
 - **Properties Bar & Floating Tool Chrome** — `styles.css` defines a Tailwind-inspired properties bar (colour picker, stroke slider, eraser-type toggles), floating tool-dock layout, and board-switcher card/trash styles (`.board-switcher-trash-btn`). `UiEffects.toolbarDropShadow()` applies shared elevation in code. Extensive `WhiteboardApp*` TestFX/Mockito tests (`WhiteboardAppPropertiesBarTest`, `WhiteboardAppToolDockTest`, `WhiteboardAppFloatingLayoutTest`, etc.) lock layout IDs and interaction contracts without a manual QA pass.
 
-- **Redis Backplane (Multi-Node Fan-Out)** — when `ServerEnvironment.resolveRedisUri()` is set, `WhiteboardServer` starts `RedisBackplanePublisher` (async worker pool, never blocks the selector) and `RedisBackplaneSubscriber` (mailbox + `selector.wakeup()`). Each envelope carries `eventId`, `originNodeId`, `roomId`, `boardId`, and a full wire frame. Three channels per room: mutations (`distrisync:room:{roomId}`), presence (`:presence` for `CURSOR_SYNC`), and control (`:control` for `MODERATION_ACTION`, `BOARD_SWITCH`, `TOGGLE_BOARD_LOCK`). `BackplaneEventDedup` (10-minute TTL, 50k cap) prevents double-apply on the originating node and on redelivery. `RoomManager` subscribes all channels when a room is first created locally.
+- **Redis Backplane (Multi-Node Fan-Out)** — when `ServerEnvironment.resolveRedisUri()` is set, `WhiteboardServer` starts `RedisBackplanePublisher` (async worker pool, never blocks the selector) and `RedisBackplaneSubscriber` (mailbox + `selector.wakeup()`). Each envelope carries `eventId`, `originNodeId`, `roomId`, `boardId`, and a full wire frame. Three channels per room: mutations (`distrisync:room:{roomId}`), presence (`:presence` for `CURSOR_SYNC`), and control (`:control` for `MODERATION_ACTION`, `BOARD_SWITCH`, `TOGGLE_BOARD_LOCK`, `MEDIA_STATE_UPDATE`). `BackplaneEventDedup` (10-minute TTL, 50k cap) prevents double-apply on the originating node and on redelivery. `RoomManager` subscribes all channels when a room is first created locally.
 
 - **TCP Multiplayer Cursors (`CURSOR_SYNC` / `RemoteCursorManager`)** — clients publish cursor position over TCP at ~15 Hz (`CURSOR_SYNC_MIN_INTERVAL_MS = 66`). `RemoteCursorManager` renders peer cursors on the FX thread with LERP (`LERP_FACTOR = 0.3`), 2 s stale timeout, and 250 ms fade-out. `CursorSyncListener` bridges `NetworkClient` to the manager; cross-node peers receive the same frames via the Redis presence channel.
 
@@ -108,7 +112,7 @@ distrisync/
 ├── src/
 │   ├── main/
 │   │   ├── java/com/distrisync/
-│   │   │   ├── client/              # JavaFX UI, TCP client, audio, roster, moderation
+│   │   │   ├── client/              # JavaFX UI, TCP client, audio, roster, watch party
 │   │   │   │   ├── WhiteboardApp.java
 │   │   │   │   ├── NetworkClient.java
 │   │   │   │   ├── WhiteboardClient.java
@@ -132,6 +136,8 @@ distrisync/
 │   │   │   │   ├── SessionRevokedListener.java
 │   │   │   │   ├── BoardPresenceListener.java
 │   │   │   │   ├── BoardDeletedListener.java
+│   │   │   │   ├── MediaStateListener.java
+│   │   │   │   ├── YoutubePlayerNode.java
 │   │   │   │   ├── UiEffects.java
 │   │   │   │   ├── GlobalCanvasContext.java
 │   │   │   │   ├── GlobalCanvasShapeFactory.java
@@ -197,6 +203,7 @@ distrisync/
 │           │   ├── CollaborationRosterModerationTest.java
 │           │   ├── PointerStateTrackerTest.java
 │           │   ├── RemoteCursorManagerTest.java
+│           │   ├── YoutubePlayerNodeTest.java
 │           │   ├── ShapeMathUtilsTest.java
 │           │   ├── ToolsDrawerToggleModelTest.java
 │           │   ├── WhiteboardAppTestFxSupport.java
@@ -226,6 +233,7 @@ distrisync/
 │               ├── NioServerRoomMembershipBroadcastTest.java
 │               ├── NioServerBoardPresenceTest.java
 │               ├── NioServerBoardLockTest.java
+│               ├── NioServerMediaStateTest.java
 │               ├── HostElectionTest.java
 │               ├── RoomContextClientIndexTest.java
 │               ├── NioServerTest.java
@@ -285,6 +293,8 @@ distrisync/
 | `TOGGLE_BOARD_LOCK` | `0x1F` | C ↔ S | No | **C→S:** `{ locked }` (host). **S→room:** broadcast current lock; gates new board creation for members |
 | `DELETE_BOARD` | `0x20` | C → S | No | JSON string `boardId` — remove workspace board (requires `PERM_MANAGE_ROOM`; `Board-1` cannot be deleted) |
 | `BOARD_DELETED` | `0x21` | S → room | No | JSON string `boardId` — board was removed; clients update switcher and drop cached thumbnails |
+| `MEDIA_STATE_UPDATE` | `0x22` | S → room | No | `{ state, mediaTimeSeconds, serverEpochMs, videoId }` — authoritative room-global media snapshot (server-anchored clock) |
+| `MEDIA_CONTROL` | `0x23` | C → S | No | `{ action, requestedTime, targetId }` — `PLAY` / `PAUSE` / `SEEK` / `LOAD` / `STOP`; requires `PERM_MANAGE_MEDIA` |
 
 ---
 
@@ -293,7 +303,9 @@ distrisync/
 | Requirement | Minimum Version |
 |---|---|
 | JDK | 21 (for local builds and the JavaFX client; not required on the host to *run* the server in Docker) |
+| JavaFX | 21.0.4 — includes **`javafx-web`** for the YouTube `WebView` player |
 | Apache Maven | 3.8+ (or use the repository `mvnw` / `mvnw.cmd` wrapper) |
+| Network (client) | Outbound HTTPS to `www.youtube.com` / `www.googleapis.com` for IFrame API and video streams when using Watch Party |
 | Docker Desktop (optional) | Recent **Docker Compose** v2 for containerised server |
 | Redis (optional) | **7+** when running multi-node cluster (`docker-compose.cluster.yml`) |
 | Network | Server and clients on the same subnet (UDP multicast for pointer presence) |
