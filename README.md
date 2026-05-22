@@ -1,6 +1,6 @@
 # DistriSync — Distributed Collaborative Whiteboard
 
-**Authors:** Harrison Nguyen & Son Nguyen
+**Architectured by:** Harrison Nguyen
 
 ![Java](https://img.shields.io/badge/Java-21-007396?logo=openjdk&logoColor=white)
 ![JavaFX](https://img.shields.io/badge/JavaFX-21.0.4-blue?logo=java&logoColor=white)
@@ -85,7 +85,7 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Shared UI Effects (`UiEffects`)** — `toolbarDropShadow()` centralises JavaFX `DropShadow` elevation for the tool dock, properties bar, and `CollaborationRoster` (replacing CSS box-shadow on those nodes for consistent depth).
 
-- **Watch Party & YouTube Sync (`YoutubePlayerNode` / `MEDIA_CONTROL`)** — room-global media state in `RoomContext.currentMediaState`. Hosts send `MEDIA_CONTROL` (`PLAY`, `PAUSE`, `SEEK`, `LOAD`, `STOP`); `MessageCodec.deriveMediaState` computes the next snapshot with `serverEpochMs`. `MEDIA_STATE_UPDATE` is broadcast room-wide (and on the Redis **control** channel in cluster mode); joiners receive the current snapshot after `JOIN_ROOM`. `YoutubePlayerNode` hosts the YouTube IFrame API in a local `HttpServer`-served page (avoids `file://` restrictions), applies server state with drift sync (green / amber / orange indicator), and gates the URL bar / play / seek UI to `PERM_MANAGE_MEDIA`. Members can hide the player locally without stopping the session; **STOP** clears room media for everyone. `MediaStateListener` bridges `NetworkClient` to `WhiteboardApp`.
+- **Watch Party & YouTube Sync (`YoutubePlayerNode` / `MEDIA_CONTROL`)** — room-global media state in `RoomContext.currentMediaState`. Hosts send `MEDIA_CONTROL` (`PLAY`, `PAUSE`, `SEEK`, `LOAD`, `STOP`); `MessageCodec.deriveMediaState` computes the next snapshot with `serverEpochMs`. `MEDIA_STATE_UPDATE` is broadcast room-wide (and on the Redis **control** channel in cluster mode); joiners receive the current snapshot after `JOIN_ROOM`. `YoutubePlayerNode` hosts the YouTube IFrame API in a local `HttpServer`-served page (avoids `file://` restrictions), buffers early `MEDIA_STATE_UPDATE` frames until the `WebView` load succeeds, then applies server state with drift sync (green / amber / orange indicator). Transport UI is gated to `PERM_MANAGE_MEDIA`; `dispose()` stops local playback, loads `about:blank`, and clears pending state before overlay removal. Members can hide the player locally without stopping the session; **STOP** clears room media for everyone. `MediaStateListener` bridges `NetworkClient` to `WhiteboardApp`.
 
 - **Bidirectional Room Membership (`JOIN_ROOM` / `LEAVE_ROOM`)** — client→server `JOIN_ROOM` carries `{ roomId, initialBoardId? }`; server→peer `JOIN_ROOM` notifies `{ clientId, authorName }`. Client→server `LEAVE_ROOM` is empty; server→peer `LEAVE_ROOM` carries the departing `clientId` string (including moderation kicks and disconnects).
 

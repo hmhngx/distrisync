@@ -1248,6 +1248,8 @@ Join hydration: after `JOIN_ROOM`, if `room.currentMediaState != null`, the join
 | Bridge | `JavaBridge` JSObject callbacks (`onPlayerReady`, `log`, `error`) |
 | Controls | URL field + Load, play/pause, timeline seek, volume — egress `MEDIA_CONTROL` only when `canManageMedia` |
 | Drift sync | `AnimationTimer` compares local player time vs `expectedPlaybackSeconds`; coloured sync dot (OK / warm / correcting); seeks when drift > 1.5 s |
+| Load ordering | `applyServerState` queues into `pendingServerState` while `WebEngine` load is not `SUCCEEDED`; applied on `Worker.State.SUCCEEDED` after `javaBridge` is wired (avoids lost snapshots on fast join) |
+| Teardown | `dispose()` calls `player.stopVideo()`, loads `about:blank`, resets `playerReady` / `playerInitialized`, and clears pending/applied state before scene removal |
 | Chrome | Draggable header; minimize hides locally; close sends `STOP` for entire room |
 | Parsing | `parseYouTubeVideoId` accepts bare 11-char ids or standard YouTube URLs |
 
@@ -1281,76 +1283,68 @@ sequenceDiagram
     participant WAL as WalManager
     participant C2 as Client 2
 
-    %% ── Client 1 connects ──────────────────────────────────────────────
-    C1->>SRV: TCP SYN / connect()
-    SRV-->>C1: TCP SYN-ACK (OP_ACCEPT fires)
-    Note over SRV: ClientSession₁ created<br/>OP_READ registered
-    C1->>SRV: HANDSHAKE (0x01)<br/>{ authorName:"Alice", clientId:"alice-uuid" }
-    Note over SRV: session₁ metadata stored,<br/>session enters lobby set
-    SRV-->>C1: LOBBY_STATE (0x0C)
-    C1->>SRV: JOIN_ROOM (0x0D)<br/>{ roomId:"default", initialBoardId:"Board-1" }
-    SRV->>RM: assignClientToRoom(key₁, "default")
-    SRV->>WAL: recover("default","Board-1") (lazy, first board open)
-    SRV-->>C1: SNAPSHOT (0x02) — board state
-    SRV-->>C1: UDP_ADMISSION (0x11)
+    C1->>SRV: TCP connect
+    SRV-->>C1: TCP accepted
+    Note over SRV: ClientSession created, OP_READ registered
+    C1->>SRV: HANDSHAKE 0x01
+    Note over SRV: session metadata, enter lobby
+    SRV-->>C1: LOBBY_STATE 0x0C
+    C1->>SRV: JOIN_ROOM 0x0D
+    SRV->>RM: assignClientToRoom
+    SRV->>WAL: recover Board-1 lazy
+    SRV-->>C1: SNAPSHOT 0x02
+    SRV-->>C1: UDP_ADMISSION 0x11
 
-    %% ── Client 2 connects ──────────────────────────────────────────────
-    C2->>SRV: TCP SYN / connect()
-    SRV-->>C2: TCP SYN-ACK (OP_ACCEPT fires)
-    Note over SRV: ClientSession₂ created<br/>OP_READ registered
-    C2->>SRV: HANDSHAKE (0x01)<br/>{ authorName:"Bob", clientId:"bob-uuid" }
-    SRV-->>C2: LOBBY_STATE (0x0C)
-    C2->>SRV: JOIN_ROOM (0x0D)<br/>{ roomId:"default", initialBoardId:"Board-1" }
-    SRV->>RM: assignClientToRoom(key₂, "default")
-    SRV-->>C2: SNAPSHOT (0x02) — board state
+    C2->>SRV: TCP connect
+    SRV-->>C2: TCP accepted
+    Note over SRV: ClientSession created, OP_READ registered
+    C2->>SRV: HANDSHAKE 0x01
+    SRV-->>C2: LOBBY_STATE 0x0C
+    C2->>SRV: JOIN_ROOM 0x0D
+    SRV->>RM: assignClientToRoom
+    SRV-->>C2: SNAPSHOT 0x02
 
-    %% ── PING/PONG RTT heartbeat ─────────────────────────────────────
     rect rgb(245, 245, 245)
-        Note over C1,SRV: PING/PONG telemetry — runs every 2 000 ms post-handshake
-        C1->>SRV: PING (0x12)<br/>{ "t": 1712080800000 }
-        SRV-->>C1: PONG (0x13)<br/>{ "t": 1712080800000 }
-        Note over C1: rtt = now − t → ping.set(rtt)<br/>HUD: "Ping: 12ms"
+        Note over C1,SRV: PING/PONG every 2s post-handshake
+        C1->>SRV: PING 0x12
+        SRV-->>C1: PONG 0x13
+        Note over C1: RTT to HUD ping property
     end
 
-    %% ── Client 1 streams a live draw gesture ───────────────────────────
     rect rgb(230, 245, 255)
-        Note over C1,C2: Live draw gesture — ephemeral, not persisted to WAL
-        C1->>SRV: SHAPE_START (0x05)<br/>{ tool:"pen", color:"#FF0000", x:10, y:20 }
-        SRV-->>C2: SHAPE_START (0x05) — relayed
-
-        loop N coordinate updates
-            C1->>SRV: SHAPE_UPDATE (0x06)<br/>{ objectId:"shape-uuid", points:[…] }
-            SRV-->>C2: SHAPE_UPDATE (0x06) — relayed
+        Note over C1,C2: Live draw not persisted to WAL
+        C1->>SRV: SHAPE_START 0x05
+        SRV-->>C2: SHAPE_START relayed
+        loop coordinate stream
+            C1->>SRV: SHAPE_UPDATE 0x06
+            SRV-->>C2: SHAPE_UPDATE relayed
         end
-
-        C1->>SRV: SHAPE_COMMIT (0x07)<br/>{ objectId:"shape-uuid" }
-        SRV-->>C2: SHAPE_COMMIT (0x07) — relayed
-        Note over C2: Flush transient preview layer
+        C1->>SRV: SHAPE_COMMIT 0x07
+        SRV-->>C2: SHAPE_COMMIT relayed
+        Note over C2: Flush transient layer
     end
 
-    %% ── Client 1 commits the shape to persistent state ─────────────────
     rect rgb(220, 255, 220)
-        Note over C1,C2: Durable MUTATION — persisted in CanvasStateManager + WAL
-        C1->>SRV: MUTATION (0x03)<br/>{ _type:"Line", objectId:"shape-uuid",<br/>  timestamp:1712080800001, clientId:"alice-uuid", … }
-        SRV->>CSM: applyMutation(shape)
-        Note over CSM: compute(uuid): incoming.ts > existing.ts<br/>→ stored; applied = true
-        CSM-->>SRV: true (accepted)
-        SRV->>WAL: append("default", MUTATION frame)
-        Note over WAL: FileChannel.write() — OS-buffered
-        SRV-->>C2: MUTATION (0x03) — broadcast (exact same frame)
-        Note over C2: Render committed shape on canvas
+        Note over C1,C2: MUTATION persisted to CSM and WAL
+        C1->>SRV: MUTATION 0x03
+        SRV->>CSM: applyMutation
+        Note over CSM: LWW CAS accepts mutation
+        CSM-->>SRV: applied true
+        SRV->>WAL: append MUTATION
+        Note over WAL: FileChannel append
+        SRV-->>C2: MUTATION broadcast
+        Note over C2: Render committed shape
     end
 
-    %% ── Client 1 undoes the shape ───────────────────────────────────────
     rect rgb(255, 240, 220)
-        Note over C1,C2: Distributed Undo — persisted to WAL
-        C1->>SRV: UNDO_REQUEST (0x09)<br/>{ shapeId:"shape-uuid" }
-        SRV->>CSM: deleteShape("shape-uuid")
-        CSM-->>SRV: true (removed from shapeMap)
-        SRV->>WAL: append("default", SHAPE_DELETE frame)
-        SRV-->>C2: SHAPE_DELETE (0x0A)<br/>{ shapeId:"shape-uuid" }
-        Note over C1: Removes shape optimistically (no echo)
-        Note over C2: Removes shape on receipt of SHAPE_DELETE
+        Note over C1,C2: Undo persisted to WAL
+        C1->>SRV: UNDO_REQUEST 0x09
+        SRV->>CSM: deleteShape
+        CSM-->>SRV: deleted true
+        SRV->>WAL: append SHAPE_DELETE
+        SRV-->>C2: SHAPE_DELETE 0x0A
+        Note over C1: Optimistic local remove
+        Note over C2: Remove on SHAPE_DELETE
     end
 ```
 
