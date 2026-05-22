@@ -162,6 +162,7 @@ public final class YoutubePlayerNode extends VBox {
     private String loadedVideoId = "";
     private String currentMediaState = "";
     private MessageCodec.MediaStatePayload pendingState;
+    private MessageCodec.MediaStatePayload pendingServerState;
     private MessageCodec.MediaStatePayload lastAppliedState;
     private boolean sliderDragging;
 
@@ -314,6 +315,11 @@ public final class YoutubePlayerNode extends VBox {
             if (state == Worker.State.SUCCEEDED) {
                 JSObject window = (JSObject) webEngine.executeScript("window");
                 window.setMember("javaBridge", javaBridge);
+                if (pendingServerState != null) {
+                    pendingState = pendingServerState;
+                    applyServerStateNow(pendingServerState);
+                    pendingServerState = null;
+                }
             }
         });
 
@@ -354,7 +360,8 @@ public final class YoutubePlayerNode extends VBox {
     }
 
     /**
-     * Stops UI refresh timers; call before removing this node from the scene graph.
+     * Stops UI refresh timers, halts YouTube playback, and tears down the {@link WebEngine}
+     * document (via {@code about:blank}) before removing this node from the scene graph.
      */
     public void dispose() {
         if (!Platform.isFxApplicationThread()) {
@@ -363,6 +370,20 @@ public final class YoutubePlayerNode extends VBox {
         }
         controlsTimer.stop();
         controlsTimerRunning = false;
+        try {
+            webEngine.executeScript(
+                    "if(typeof player !== 'undefined' && player.stopVideo) player.stopVideo();");
+        } catch (Exception ignored) {
+            // Page may be unloading or bridge unavailable during teardown
+        }
+        webEngine.load("about:blank");
+        playerReady.set(false);
+        playerInitialized = false;
+        pendingState = null;
+        pendingServerState = null;
+        lastAppliedState = null;
+        loadedVideoId = "";
+        currentMediaState = "";
     }
 
     /**
@@ -374,6 +395,10 @@ public final class YoutubePlayerNode extends VBox {
         }
         if (!Platform.isFxApplicationThread()) {
             Platform.runLater(() -> applyServerState(state));
+            return;
+        }
+        if (webEngine.getLoadWorker().getState() != Worker.State.SUCCEEDED) {
+            this.pendingServerState = state;
             return;
         }
         pendingState = state;
