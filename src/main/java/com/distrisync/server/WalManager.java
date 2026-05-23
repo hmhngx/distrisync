@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
@@ -34,8 +35,12 @@ import java.util.stream.Stream;
  * {@code dataDir}.  The binary frame format matches {@link MessageCodec}.
  *
  * <h2>Compaction</h2>
- * {@link #compactWal} rewrites the WAL to minimal {@code MUTATION} frames via a
+ * {@link #compactWal} rewrites the WAL to minimal chunked {@code MUTATION_BATCH} frames via a
  * {@code .wal.tmp} side-file and atomic rename.
+ *
+ * <h2>Recovery</h2>
+ * {@link #replay} streams frames from disk through a {@link FileChannel} without loading the
+ * entire file into heap. {@link #recover} collects frames into a list for tests.
  *
  * <h2>Thread safety</h2>
  * Concurrent use is safe; each composite WAL file has a lazily opened {@link FileChannel}
@@ -44,6 +49,8 @@ import java.util.stream.Stream;
 final class WalManager implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(WalManager.class);
+
+    private static final int REPLAY_BUFFER_INITIAL_BYTES = 8 * 1024;
 
     private final Path dataDir;
     /** Key: {@code sanitize(roomId) + '_' + sanitize(boardId)} — matches {@code *.wal} basename (no suffix). */
@@ -77,36 +84,77 @@ final class WalManager implements Closeable {
     }
 
     /**
-     * Reads all complete frames from the WAL for {@code roomId} and {@code boardId}.
+     * Streams all complete frames from the WAL for {@code roomId} and {@code boardId} to
+     * {@code frameHandler} without loading the entire file into memory.
      */
-    List<Message> recover(String roomId, String boardId) throws IOException {
+    void replay(String roomId, String boardId, Consumer<Message> frameHandler) throws IOException {
         validateNonBlank(roomId, "roomId");
         validateNonBlank(boardId, "boardId");
+        if (frameHandler == null) throw new IllegalArgumentException("frameHandler must not be null");
 
         Path path = walPath(roomId, boardId);
         if (!Files.exists(path) || Files.size(path) == 0) {
-            return new ArrayList<>();
+            return;
         }
 
-        byte[] bytes = Files.readAllBytes(path);
-        ByteBuffer buf = ByteBuffer.wrap(bytes);
-        List<Message> messages = new ArrayList<>();
+        int frameCount = 0;
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            ByteBuffer buf = ByteBuffer.allocate(REPLAY_BUFFER_INITIAL_BYTES);
 
-        while (buf.hasRemaining()) {
-            int frameStart = buf.position();
-            try {
-                messages.add(MessageCodec.decode(buf));
-            } catch (PartialMessageException e) {
-                log.warn("WAL truncated tail  room='{}' board='{}' offset={} — discarding {} partial byte(s)",
-                        roomId, boardId, frameStart, buf.remaining());
-                break;
-            } catch (IllegalArgumentException e) {
-                log.warn("WAL corrupt frame  room='{}' board='{}' offset={} cause='{}' — discarding tail",
-                        roomId, boardId, frameStart, e.getMessage());
-                break;
+            while (true) {
+                int read = channel.read(buf);
+                boolean eof = (read == -1);
+
+                buf.flip();
+
+                boolean needMoreData = false;
+                while (buf.hasRemaining()) {
+                    int frameStart = buf.position();
+                    try {
+                        frameHandler.accept(MessageCodec.decode(buf));
+                        frameCount++;
+                    } catch (PartialMessageException e) {
+                        buf.position(frameStart);
+                        if (eof) {
+                            log.warn("WAL truncated tail  room='{}' board='{}' offset={} — discarding {} partial byte(s)",
+                                    roomId, boardId, frameStart, buf.remaining());
+                            log.debug("WAL replayed  room='{}' board='{}' messages={}", roomId, boardId, frameCount);
+                            return;
+                        }
+                        needMoreData = true;
+                        break;
+                    } catch (IllegalArgumentException e) {
+                        log.warn("WAL corrupt frame  room='{}' board='{}' offset={} cause='{}' — discarding tail",
+                                roomId, boardId, frameStart, e.getMessage());
+                        log.debug("WAL replayed  room='{}' board='{}' messages={}", roomId, boardId, frameCount);
+                        return;
+                    }
+                }
+
+                if (needMoreData) {
+                    buf.compact();
+                    if (buf.remaining() == buf.capacity()) {
+                        buf = growBuffer(buf);
+                    }
+                    continue;
+                }
+
+                buf.clear();
+                if (eof) {
+                    break;
+                }
             }
         }
 
+        log.debug("WAL replayed  room='{}' board='{}' messages={}", roomId, boardId, frameCount);
+    }
+
+    /**
+     * Reads all complete frames from the WAL for {@code roomId} and {@code boardId}.
+     */
+    List<Message> recover(String roomId, String boardId) throws IOException {
+        List<Message> messages = new ArrayList<>();
+        replay(roomId, boardId, messages::add);
         log.debug("WAL recovered  room='{}' board='{}' messages={}", roomId, boardId, messages.size());
         return messages;
     }
@@ -157,14 +205,15 @@ final class WalManager implements Closeable {
         Path   walFile = dataDir.resolve(baseName + ".wal");
         Path   tmpFile = dataDir.resolve(baseName + ".wal.tmp");
 
+        List<String> batchPayloads = ShapeCodec.chunkMutationBatchPayloads(snapshot);
+
         try (FileChannel tmp = FileChannel.open(tmpFile,
                 StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE,
                 StandardOpenOption.TRUNCATE_EXISTING)) {
 
-            for (Shape shape : snapshot) {
-                String  payload = ShapeCodec.encodeMutation(shape);
-                Message msg     = new Message(MessageType.MUTATION, payload);
+            for (String payload : batchPayloads) {
+                Message msg = new Message(MessageType.MUTATION_BATCH, payload);
                 ByteBuffer frame = MessageCodec.encode(msg);
                 while (frame.hasRemaining()) {
                     tmp.write(frame);
@@ -188,7 +237,8 @@ final class WalManager implements Closeable {
             Files.move(tmpFile, walFile, StandardCopyOption.REPLACE_EXISTING);
         }
 
-        log.info("WAL compacted  room='{}' board='{}' shapes={}", roomId, boardId, snapshot.size());
+        log.info("WAL compacted  room='{}' board='{}' shapes={} batches={}",
+                roomId, boardId, snapshot.size(), batchPayloads.size());
     }
 
     long walFileSize(String roomId, String boardId) throws IOException {
@@ -332,6 +382,15 @@ final class WalManager implements Closeable {
         if (value == null || value.isBlank()) {
             throw new IllegalArgumentException(label + " must not be null or blank");
         }
+    }
+
+    private static ByteBuffer growBuffer(ByteBuffer buf) {
+        int newCapacity = Math.max(buf.capacity() * 2,
+                MessageCodec.MAX_PAYLOAD_BYTES + MessageCodec.HEADER_BYTES);
+        ByteBuffer grown = ByteBuffer.allocate(newCapacity);
+        buf.flip();
+        grown.put(buf);
+        return grown;
     }
 
     private FileChannel openAppendChannel(String fileName) {

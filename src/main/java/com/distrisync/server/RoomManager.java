@@ -435,6 +435,10 @@ public final class RoomManager {
         if (walManager == null) return;
         try {
             walManager.append(roomId, boardId, msg);
+            RoomContext room = rooms.get(roomId);
+            if (room != null) {
+                room.onWalAppended(boardId);
+            }
         } catch (IOException e) {
             log.error("WAL append failed  room='{}' board='{}': {}", roomId, boardId, e.getMessage(), e);
         }
