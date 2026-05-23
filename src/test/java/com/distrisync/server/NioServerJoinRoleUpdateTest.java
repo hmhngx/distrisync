@@ -20,7 +20,8 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Join path must deliver authoritative {@link MessageType#ROLE_UPDATE} before {@link MessageType#SNAPSHOT},
+ * Join path must deliver authoritative {@link MessageType#ROLE_UPDATE} before chunked
+ * {@link MessageType#SNAPSHOT} / {@link MessageType#SNAPSHOT_END} hydration,
  * broadcast joiner roles to the room, and hydrate peer permission masks for late joiners.
  */
 class NioServerJoinRoleUpdateTest {
@@ -67,9 +68,13 @@ class NioServerJoinRoleUpdateTest {
 
             int roleIdx = indexOfType(afterJoin, MessageType.ROLE_UPDATE);
             int snapIdx = indexOfType(afterJoin, MessageType.SNAPSHOT);
+            int snapEndIdx = indexOfType(afterJoin, MessageType.SNAPSHOT_END);
             assertThat(roleIdx).as("ROLE_UPDATE must be present after join").isGreaterThanOrEqualTo(0);
             assertThat(snapIdx).as("SNAPSHOT must be present after join").isGreaterThanOrEqualTo(0);
+            assertThat(snapEndIdx).as("SNAPSHOT_END must be present after join").isGreaterThanOrEqualTo(0);
             assertThat(roleIdx).as("ROLE_UPDATE must precede SNAPSHOT on join").isLessThan(snapIdx);
+            assertThat(snapIdx).as("SNAPSHOT must precede SNAPSHOT_END on join").isLessThan(snapEndIdx);
+            assertThat(afterJoin.get(snapIdx).payload()).isEqualTo("[]");
 
             MessageCodec.RoleUpdatePayload role = MessageCodec.decodeRoleUpdate(afterJoin.get(roleIdx));
             assertThat(role.newHostClientId()).isEqualTo("owner-client");
@@ -107,9 +112,13 @@ class NioServerJoinRoleUpdateTest {
 
             int roleIdx = indexOfType(afterJoin, MessageType.ROLE_UPDATE);
             int snapIdx = indexOfType(afterJoin, MessageType.SNAPSHOT);
+            int snapEndIdx = indexOfType(afterJoin, MessageType.SNAPSHOT_END);
             assertThat(roleIdx).isGreaterThanOrEqualTo(0);
             assertThat(snapIdx).isGreaterThanOrEqualTo(0);
+            assertThat(snapEndIdx).isGreaterThanOrEqualTo(0);
             assertThat(roleIdx).isLessThan(snapIdx);
+            assertThat(snapIdx).isLessThan(snapEndIdx);
+            assertThat(afterJoin.get(snapIdx).payload()).isEqualTo("[]");
 
             MessageCodec.RoleUpdatePayload role = MessageCodec.decodeRoleUpdate(afterJoin.get(roleIdx));
             assertThat(role.newHostClientId()).isEqualTo("member-client");

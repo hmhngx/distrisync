@@ -34,6 +34,12 @@ final class ClientSession {
     /** Maximum outbound frames queued per TCP session before load shedding. */
     static final int WRITE_QUEUE_CAPACITY = 1024;
 
+    /** Max burst of UDP audio relay packets per session. */
+    static final int UDP_MAX_TOKENS = 50;
+
+    /** Milliseconds per refilled UDP relay token (50 tokens/sec sustained). */
+    static final int UDP_REFILL_RATE_MS = 20;
+
     /** Stable server-assigned identity used in logs. */
     final UUID sessionId = UUID.randomUUID();
 
@@ -96,6 +102,9 @@ final class ClientSession {
      */
     volatile InetSocketAddress udpEndpoint = null;
 
+    private int udpTokens = UDP_MAX_TOKENS;
+    private long lastUdpTokenRefill = System.currentTimeMillis();
+
     /**
      * Accumulation buffer for inbound bytes.
      * 64 KiB covers any realistic single MUTATION frame; the server never
@@ -122,6 +131,29 @@ final class ClientSession {
      * @return {@link EnqueueResult#ENQUEUED}, {@link EnqueueResult#DROPPED}, or
      *         {@link EnqueueResult#OVERFLOW_DISCONNECT}
      */
+    /**
+     * Attempts to consume one UDP audio relay token after refilling based on elapsed time.
+     * Called from the selector thread before room fan-out in {@link NioServer}.
+     *
+     * @return {@code true} if a token was available and consumed; {@code false} to drop the packet
+     */
+    boolean consumeUdpToken() {
+        long now = System.currentTimeMillis();
+        long elapsed = now - lastUdpTokenRefill;
+        if (elapsed > 0) {
+            int refill = (int) (elapsed / UDP_REFILL_RATE_MS);
+            if (refill > 0) {
+                udpTokens = Math.min(UDP_MAX_TOKENS, udpTokens + refill);
+                lastUdpTokenRefill += (long) refill * UDP_REFILL_RATE_MS;
+            }
+        }
+        if (udpTokens > 0) {
+            udpTokens--;
+            return true;
+        }
+        return false;
+    }
+
     EnqueueResult enqueue(ByteBuffer frame, OutboundClass cls) {
         if (writeQueue.size() >= WRITE_QUEUE_CAPACITY) {
             if (cls == OutboundClass.EPHEMERAL) {
