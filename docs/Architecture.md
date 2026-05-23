@@ -71,7 +71,7 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | Wire Code | Enum Name          | Direction            | Persisted to WAL | Description                                                                 |
 |-----------|--------------------|----------------------|------------------|-----------------------------------------------------------------------------|
 | `0x01`    | `HANDSHAKE`        | Client → Server      | No               | Initial greeting. Payload: `{ authorName, clientId }`. Populates `ClientSession` metadata. |
-| `0x02`    | `SNAPSHOT`         | Server → Client      | No               | Full board state delivered on room join. Payload: JSON array of shape envelopes. |
+| `0x02`    | `SNAPSHOT`         | Server → Client      | No               | Chunked join header: empty JSON array `[]`, or legacy full board payload. Starts hydration; shapes follow as `MUTATION_BATCH` frames until `SNAPSHOT_END`. |
 | `0x03`    | `MUTATION`         | Client ↔ Server      | **Yes**          | Committed shape add/update. Payload: single shape envelope with `_type` discriminator, `objectId` (UUID), `timestamp` (Lamport). |
 | `0x04`    | `UDP_POINTER`      | Client → Server (UDP)| No               | Ephemeral cursor-position broadcast. Fire-and-forget; loss is acceptable.  |
 | `0x05`    | `SHAPE_START`      | Client → All peers   | No               | Peer begins drawing; carries tool, color, and origin coordinates.           |
@@ -105,6 +105,8 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x21`    | `BOARD_DELETED`    | Server → Room        | No               | JSON string `boardId`. Notifies all occupants to refresh board list / Task View UI. |
 | `0x22`    | `MEDIA_STATE_UPDATE` | Server → Room      | No               | `{ state, mediaTimeSeconds, serverEpochMs, videoId }` — authoritative room-global media snapshot. When `state` is `PLAYING`, position at client time `t` is `mediaTimeSeconds + (t - serverEpochMs) / 1000.0`; when `PAUSED`, use `mediaTimeSeconds` directly. Hydrated on join and via control channel on multi-node clusters. |
 | `0x23`    | `MEDIA_CONTROL`    | Client → Server      | No               | `{ action, requestedTime, targetId }` — `action`: `PLAY`, `PAUSE`, `SEEK`, `LOAD`, `STOP`. Requires `PERM_MANAGE_MEDIA`. Server derives `MEDIA_STATE_UPDATE`, stores `RoomContext.currentMediaState` (`null` after `STOP`), broadcasts locally, and publishes to Redis control channel. |
+| `0x24`    | `MUTATION_BATCH`     | Client ↔ Server      | **Yes**          | Batched committed shapes (freehand stroke segments). Payload: JSON array of shape envelopes (same format as `SNAPSHOT`). Server applies each shape via LWW `applyMutation`, then one WAL append and one board broadcast per frame. On join, server streams board state as chunked `MUTATION_BATCH` frames between `SNAPSHOT` `[]` and `SNAPSHOT_END`. |
+| `0x25`    | `SNAPSHOT_END`       | Server → Client      | No               | Marks end of chunked snapshot hydration. Empty payload; client applies buffered shapes from preceding batches. |
 
 #### Shape Envelope Format (MUTATION / SNAPSHOT)
 
@@ -319,7 +321,7 @@ RoomManager
 | Phase | What happens |
 |---|---|
 | **First join** | `RoomManager.getOrCreateRoom(roomId)` calls `rooms.computeIfAbsent`, which atomically creates a `RoomContext`. Boards are lazily created with `boards.computeIfAbsent(boardId, ...)`, so unused boards incur zero allocation cost. |
-| **Active** | Every `MUTATION`, `SHAPE_DELETE`, and `CLEAR_USER_SHAPES` is applied only to the active board's `CanvasStateManager`, appended to that board's WAL partition, then broadcast to all `SelectionKey`s in `RoomContext.activeKeys` except the sender. |
+| **Active** | Every `MUTATION`, `MUTATION_BATCH`, `SHAPE_DELETE`, and `CLEAR_USER_SHAPES` is applied only to the active board's `CanvasStateManager`, appended to that board's WAL partition, then broadcast to all `SelectionKey`s in `RoomContext.activeKeys` except the sender. |
 | **Quiescent** | In the explicit `LEAVE_ROOM` path, `RoomManager.returnClientToLobby` removes the room when `activeKeys` reaches zero. In other paths (for example direct room deletion / lifecycle sweeps), empty rooms may exist transiently. |
 | **Restart** | `RoomContext` is re-created on first join. Board state is recovered independently on demand through board-scoped WAL replay (`recover(roomId, boardId)`). |
 
@@ -362,6 +364,31 @@ Room deletion is a first-class lifecycle event:
 - `RoomManager` removes the room from routing, enqueues `ROOM_DELETED` to each room member, clears each member's active room/board fields, and reclassifies those sessions into the lobby set.
 - `NioServer.broadcastLobbyState()` emits a fresh merged `LOBBY_STATE` snapshot after deletion completes.
 
+### 5.6 Chunked Board Hydration (Join / SWITCH_BOARD)
+
+Large boards are no longer shipped as a single monolithic `SNAPSHOT` JSON array. `NioServer.sendSnapshot` streams hydration as **CRITICAL** frames:
+
+```
+SNAPSHOT  payload "[]"           ← hydration header (starts client buffer)
+MUTATION_BATCH × N               ← ShapeCodec.chunkMutationBatchPayloads (20 shapes / 48 KiB max)
+SNAPSHOT_END  payload ""         ← client applies buffered shapes once
+```
+
+The server may call `flushWriteQueue` when the outbound queue approaches capacity (`WRITE_QUEUE_CAPACITY - 8`) so chunked joins do not trip slow-consumer disconnect during burst enqueue.
+
+**Client (`NetworkClient`):**
+
+| Phase | Behaviour |
+|---|---|
+| `SNAPSHOT` `[]` | Sets `snapshotHydrating`; clears `snapshotHydrationBuffer` |
+| `MUTATION_BATCH` while hydrating | Appends decoded shapes to buffer only (no live `onMutationReceived`) |
+| `SNAPSHOT_END` | Delivers `List.copyOf(snapshotHydrationBuffer)` via `deliverSnapshot` |
+| `MUTATION_BATCH` after hydration | Fan-out each shape to `onMutationReceived` (live peer batch) |
+
+Legacy servers may still send a full JSON array in one `SNAPSHOT`; the client detects non-empty payloads and calls `deliverSnapshot` immediately without buffering.
+
+`NioServerChunkedSnapshotTest` and `ShapeCodecMutationBatchTest` lock server chunking and codec round-trips.
+
 ---
 
 ## 6. Write-Ahead Log — WalManager
@@ -396,10 +423,13 @@ NioServer.processMessage()
     │
     ├─ RoomManager.appendToWal(roomId, boardId, msg)   ← persist to FileChannel (APPEND mode)
     │       │
-    │       └─ WalManager.append()
-    │               └─ MessageCodec.encode() → ByteBuffer
-    │                  FileChannel.write(buf)  [loop until remaining == 0]
-    │                  (no fsync — OS page cache flush within seconds)
+    │       ├─ WalManager.append()
+    │       │       └─ MessageCodec.encode() → ByteBuffer
+    │       │          FileChannel.write(buf)  [loop until remaining == 0]
+    │       │          (no fsync — OS page cache flush within seconds)
+    │       │
+    │       └─ RoomContext.onWalAppended(boardId)
+    │               └─ when operation count > 1000: WalManager.compactWal(snapshot)
     │
     └─ broadcastRoom(senderKey, frame)         ← fan-out to room peers
 ```
@@ -416,15 +446,16 @@ Client joins or switches to board B
     └─ RoomContext.getBoard(B)  (boards.computeIfAbsent)
             └─ replayWalForBoard(B)
                     │
-                    ├─ WalManager.recover(roomId, B)
-                    │       ├─ Files.readAllBytes(walPath)
-                    │       └─ decode loop:
+                    ├─ WalManager.replay(roomId, B, frameHandler)
+                    │       ├─ FileChannel.open(walPath, READ) + sliding ByteBuffer
+                    │       └─ decode loop (one frame at a time):
                     │               ┌─ MessageCodec.decode(buf)
-                    │               ├─ on PartialMessageException → stop (truncated tail)
+                    │               ├─ on PartialMessageException → read more or stop at EOF (truncated tail)
                     │               └─ on IllegalArgumentException → stop (corrupt record)
                     │
-                    └─ for each Message:
+                    └─ per frame (no whole-file List<Message>):
                             MUTATION           → stateManager.applyMutation(shape)
+                            MUTATION_BATCH     → applyMutation for each shape in batch
                             SHAPE_DELETE       → stateManager.deleteShape(uuid)
                             CLEAR_USER_SHAPES  → stateManager.clearUserShapes(clientId)
                             other              → skip
@@ -432,11 +463,25 @@ Client joins or switches to board B
 
 **Crash tolerance:** a hard crash mid-write leaves a truncated final frame in the file. `MessageCodec.decode` throws `PartialMessageException` when the buffer does not contain a complete frame; recovery stops at that offset and returns the clean prefix. This is the standard "truncated tail" pattern used by databases such as SQLite and PostgreSQL WAL.
 
-### 6.5 Thread Safety
+**Memory:** replay streams from disk; peak heap is bounded by the largest single frame payload (plus an 8 KiB read buffer), not the full `.wal` file size.
+
+### 6.5 WAL Compaction
+
+After each successful `appendToWal`, `RoomContext` increments a per-board operation counter. When the count exceeds **1000**, compaction runs synchronously on the NIO thread:
+
+1. Snapshot authoritative shapes from `CanvasStateManager.snapshot()`.
+2. Serialize into one or more `MUTATION_BATCH` frames (chunked at 20 shapes / 48 KiB UTF-8 payload, matching the client).
+3. Write frames to `{roomId}_{boardId}.wal.tmp`, `force(true)`, close the live append `FileChannel`.
+4. Atomically rename `.wal.tmp` → `.wal` (`ATOMIC_MOVE` with non-atomic fallback).
+5. Reset the operation counter to zero.
+
+Compaction replaces append-only history with a minimal state snapshot so WAL files do not grow without bound during long-lived boards.
+
+### 6.6 Thread Safety
 
 `WalManager.channels` is a `ConcurrentHashMap<String, FileChannel>` keyed by room-board partition path. Channel creation is protected by `computeIfAbsent`. Individual `FileChannel.write` calls from the single-threaded NIO event loop are inherently serialised per file, so no additional lock is needed around write operations.
 
-### 6.6 Room Deletion Barrier (`deleteRoomFiles`)
+### 6.7 Room Deletion Barrier (`deleteRoomFiles`)
 
 `WalManager.deleteRoomFiles(roomId)` provides a synchronous delete barrier for durable room teardown:
 
@@ -585,9 +630,24 @@ sequenceDiagram
     loop Push-to-talk
         C->>S: [udpToken][160B PCM] (UDP)
         Note over S: Validate token + sender endpoint
-        S-->>P: [speakerClientId(36B)][160B PCM] (UDP relay)
+        alt consumeUdpToken
+            S-->>P: [speakerClientId(36B)][160B PCM] (UDP relay)
+        else bucket empty
+            Note over S: Silent drop (no fan-out)
+        end
     end
 ```
+
+### 8.4 UDP Relay Rate Limiting
+
+Each `ClientSession` owns a token bucket for **audio relay only** (not 36-byte registration datagrams):
+
+| Parameter | Value | Effect |
+|-----------|-------|--------|
+| Burst cap | 50 tokens | Max packets relayed in a zero-refill window |
+| Refill | 1 token / 20 ms | ~50 packets/sec sustained per speaker |
+
+`NioServer.handleUdpRead` calls `speaker.consumeUdpToken()` after token, endpoint, and room checks succeed and **before** the O(N) peer fan-out loop. Excess packets are dropped silently (no broadcast, no log spam). This bounds amplification when a client floods the UDP socket.
 
 ---
 
@@ -598,7 +658,7 @@ sequenceDiagram
 After the `HANDSHAKE` exchange completes, `NetworkClient` starts a permanent daemon thread (`distrisync-ping`) that executes `heartbeatPingLoop()`:
 
 ```
-every HEARTBEAT_PING_INTERVAL_MS (2 000 ms):
+every HEARTBEAT_PING_INTERVAL_MS (5 000 ms):
     enqueueFrame( MessageCodec.encodePing(System.currentTimeMillis()) )
     ─────────────────────────────────────────────────────────
     Wire frame: PING (0x12) | payload: { "t": <originMillis> }
@@ -624,10 +684,11 @@ On the client, the inbound dispatch invokes `applyPingRtt(originTimestamp)`:
 
 ```java
 long rtt = Math.max(0L, System.currentTimeMillis() - originTimestamp);
-runOnFxThreadIfPossible(() -> ping.set(rtt));
+// ring buffer of last PING_ROLLING_WINDOW (10) samples → rolling average
+runOnFxThreadIfPossible(() -> ping.set(averageRtt));
 ```
 
-`pingProperty()` is a `SimpleLongProperty` initialised to `-1` (meaning "no measurement yet"). `WhiteboardApp.wireTelemetryHud` binds a label to this property, displaying `"Ping: —"` while the value is negative and `"Ping: Nms"` thereafter.
+`pingProperty()` is a `SimpleLongProperty` initialised to `-1` (meaning "no measurement yet"). Each PONG updates a ring buffer of the last **10** RTT samples; the property holds the arithmetic mean. `WhiteboardApp.wireTelemetryHud` binds a label to this property, displaying `"Ping: —"` while the value is negative and `"Ping: Nms"` thereafter.
 
 ```
 Client                     NioServer
@@ -762,9 +823,20 @@ GC eviction removes in-memory room routing only. It does not delete WAL files. D
 
 ### 11.2 Tool → Factory → MUTATION
 
-`WhiteboardApp.Tool` enumerates `LINE`, `CIRCLE`, `RECTANGLE`, `ELLIPSE`, `ARROW`, `FREEHAND`, `ERASER`, and `TEXT`. Drag gestures on the base canvas call `GlobalCanvasShapeFactory` methods, which read colour and stroke width from `GlobalCanvasContext` and stamp `authorName` / `clientId` before `addAndSend(shape)` enqueues a `MUTATION`.
+`WhiteboardApp.Tool` enumerates `LINE`, `CIRCLE`, `RECTANGLE`, `ELLIPSE`, `ARROW`, `FREEHAND`, `ERASER`, and `TEXT`. Drag gestures on the base canvas call `GlobalCanvasShapeFactory` methods, which read colour and stroke width from `GlobalCanvasContext` and stamp `authorName` / `clientId`. Single-shape tools call `addAndSend(shape)` → one `MUTATION`. **FREEHAND** commits all stroke segments via `addAndSendBatch` → one or few `MUTATION_BATCH` frames (chunked to stay under the server's 64 KiB read buffer), replacing the previous per-segment `MUTATION` storm.
 
 Live preview for vector tools still uses the ephemeral `SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT` relay path; only the final geometry is persisted.
+
+### 11.3 Incremental Base-Canvas Rendering
+
+`WhiteboardApp` maintains two paint strategies for committed shapes:
+
+| Trigger | Method | Cost |
+|---|---|---|
+| Join / `SNAPSHOT_END`, `CLEAR_USER_SHAPES`, `SHAPE_DELETE`, board switch | `redrawBaseCanvas` | O(N) clear + sort-by-timestamp + draw all |
+| Local commit, peer `MUTATION`, peer `MUTATION_BATCH` (post-hydration) | `paintShapeOnBaseCanvas` | O(1) append one shape |
+
+Incremental painting avoids wiping the `baseCanvas` pixel buffer on every freehand segment arrival, which matters when boards contain thousands of `Line` segments from `MUTATION_BATCH` traffic.
 
 ---
 
@@ -782,14 +854,16 @@ performEraserAt(x, y)
     │
     └─ EraserSpatialIntersection.eraseAt(x, y, eraserSize, eraserType)
             │
-            ├─ shapesView: local ConcurrentHashMap values (committed shapes)
+            ├─ SpatialHashGrid.query(x, y)   ← 200 px uniform cells; single cell only
             ├─ filter: exclude EraserPath instances
-            ├─ ShapeSpatialQuery.intersectsEraser(...)  — AABB reject, then geometry
+            ├─ ShapeSpatialQuery.intersectsEraser(...)  — precise brush intersection
             └─ max(Shape::timestamp)  — topmost shape wins
                     │
                     └─ NetworkClient.sendUndoRequest(shapeId)
                            └─ server deleteShape → SHAPE_DELETE broadcast
 ```
+
+`WhiteboardApp` owns one `SpatialHashGrid` shared with `EraserSpatialIntersection`. Shapes are `insert` / `remove` on mutation and delete; `rebuildSpatialGrid` runs on full snapshot delivery. `SpatialHashGridTest` locks cell indexing and query isolation.
 
 `ShapeSpatialQuery` implements per-type bounds (`boundsOf`) and brush intersection tests for lines, circles (filled-aware), rectangles, ellipses, arrows, and text bounding boxes. `ShapeMathUtils` supplies shared segment/ellipse helpers used by the query layer.
 
@@ -1003,7 +1077,7 @@ Each `ClientSession` maintains a bounded `ArrayDeque<ByteBuffer>` write queue ca
 | `OutboundClass` | Examples |
 |---|---|
 | `EPHEMERAL` | `PONG`, `SHAPE_UPDATE`, live stroke relays, `CURSOR_SYNC`, some lobby fan-out paths |
-| `CRITICAL` | `SNAPSHOT`, `MUTATION`, `SHAPE_DELETE`, `UDP_ADMISSION`, `ROOM_DELETED`, `HANDSHAKE` responses |
+| `CRITICAL` | `SNAPSHOT`, `SNAPSHOT_END`, `MUTATION`, `MUTATION_BATCH`, `SHAPE_DELETE`, `UDP_ADMISSION`, `ROOM_DELETED`, `HANDSHAKE` responses |
 
 `OVERFLOW_DISCONNECT` causes `NioServer` to close the `SelectionKey`, protecting heap from a slow consumer that cannot drain TCP writes. `ClientSessionBackpressureTest` asserts drop vs disconnect semantics; `SlowConsumerChaosTest` (§19) exercises this against a live server.
 
@@ -1030,7 +1104,7 @@ These tools complement the Surefire suite (`server/backplane/*`, `NioServerRemot
 
 | Bit | Constant | Capability |
 |-----|----------|------------|
-| `1 << 0` | `PERM_DRAW` | `MUTATION`, live strokes, eraser undo |
+| `1 << 0` | `PERM_DRAW` | `MUTATION`, `MUTATION_BATCH`, live strokes, eraser undo |
 | `1 << 1` | `PERM_SPEAK` | UDP audio relay |
 | `1 << 2` | `PERM_MANAGE_USERS` | `MODERATION_ACTION` |
 | `1 << 3` | `PERM_DELETE_ROOM` | `DELETE_ROOM` |
@@ -1305,10 +1379,10 @@ sequenceDiagram
     SRV-->>C2: SNAPSHOT 0x02
 
     rect rgb(245, 245, 245)
-        Note over C1,SRV: PING/PONG every 2s post-handshake
+        Note over C1,SRV: PING/PONG every 5s post-handshake
         C1->>SRV: PING 0x12
         SRV-->>C1: PONG 0x13
-        Note over C1: RTT to HUD ping property
+        Note over C1: rolling avg RTT to HUD ping property
     end
 
     rect rgb(230, 245, 255)
@@ -1353,8 +1427,8 @@ sequenceDiagram
 | Step | What is happening |
 |------|-------------------|
 | 1–10 | Client connects, sends `HANDSHAKE`, enters lobby, and then sends `JOIN_ROOM`. `SNAPSHOT` is sent only after join processing. First joiner receives `OWNER` permissions and becomes `hostClientId`. Peers receive server→client `JOIN_ROOM` membership notifications. |
-| 11–16 | Board hydration happens lazily: opening a board triggers `WalManager.recover(roomId, boardId)` replay for that board only. |
-| 17–19 | `PING`/`PONG` runs continuously after handshake; client computes RTT from echoed origin timestamp. |
+| 11–16 | Board hydration: WAL replay on first `getBoard`, then chunked `SNAPSHOT []` → `MUTATION_BATCH`* → `SNAPSHOT_END` (§5.6). |
+| 17–19 | `PING`/`PONG` every 5 s after handshake; client maintains a rolling average of the last 10 RTT samples. |
 | 20–27 | Live draw (`SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT`) is relayed only, not persisted. |
 | 28–34 | `MUTATION` applies LWW CAS in memory, appends to board WAL, then broadcasts to same room + same board peers. |
 | 35–40 | `UNDO_REQUEST` deletes in memory, persists `SHAPE_DELETE`, then broadcasts deletion to peers except originator. |
