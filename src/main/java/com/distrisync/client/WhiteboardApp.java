@@ -11,15 +11,21 @@ import com.distrisync.model.RectangleNode;
 import com.distrisync.model.Shape;
 import com.distrisync.model.TextNode;
 import javafx.animation.Animation;
+import javafx.animation.AnimationTimer;
 import javafx.animation.FadeTransition;
+import javafx.animation.KeyFrame;
 import javafx.animation.PauseTransition;
 import javafx.animation.ScaleTransition;
 import javafx.animation.SequentialTransition;
+import javafx.animation.Timeline;
 import javafx.animation.TranslateTransition;
+import javafx.util.Duration;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.beans.binding.Bindings;
 import javafx.beans.binding.BooleanBinding;
+import javafx.beans.value.ChangeListener;
+import javafx.beans.value.WeakChangeListener;
 import javafx.geometry.Insets;
 import javafx.geometry.Orientation;
 import javafx.geometry.Pos;
@@ -149,6 +155,8 @@ public class WhiteboardApp extends Application {
     // ── drawing constants ─────────────────────────────────────────────────────
     private static final double MIN_DRAG_DIST     = 2.0;
     private static final double MIN_FREEHAND_STEP = 4.0;
+    /** Min interval between eraser-driven full base-canvas repaints (~30 FPS). */
+    private static final long ERASER_REDRAW_INTERVAL_NS = 33_000_000L;
     private static final double ERASER_BASE_WIDTH = 14.0;
     private static final double MIN_STAGE_WIDTH   = 800;
     private static final double MIN_STAGE_HEIGHT  = 600;
@@ -203,9 +211,46 @@ public class WhiteboardApp extends Application {
     private final GlobalCanvasContext globalCanvasContext = new GlobalCanvasContext();
     private final GlobalCanvasShapeFactory shapeFactory =
             new GlobalCanvasShapeFactory(globalCanvasContext);
+    private final SpatialHashGrid shapeSpatialGrid = new SpatialHashGrid();
     private EraserSpatialIntersection eraserIntersection;
     /** Shape ids removed during the current eraser press/drag (FX thread only). */
     private final Set<UUID> erasedInGesture = new HashSet<>();
+    /** Set when eraser deletes shapes; consumed by {@link #eraserRedrawTimer}. */
+    private boolean needsBaseRedraw;
+    private boolean eraserRedrawTimerActive;
+    private long eraserRedrawLastNanos;
+    /** Latest eraser pointer during drag; consumed at ~30 Hz by {@link #eraserRedrawTimer}. */
+    private volatile double lastEraserX = -1;
+    private volatile double lastEraserY = -1;
+    private final AnimationTimer eraserRedrawTimer = new AnimationTimer() {
+        @Override
+        public void handle(long now) {
+            if (eraserRedrawLastNanos != 0
+                    && now - eraserRedrawLastNanos < ERASER_REDRAW_INTERVAL_NS) {
+                return;
+            }
+            eraserRedrawLastNanos = now;
+
+            if (lastEraserX != -1) {
+                double x = lastEraserX;
+                double y = lastEraserY;
+                lastEraserX = -1;
+                lastEraserY = -1;
+                performEraserAt(x, y);
+            }
+
+            if (!needsBaseRedraw) {
+                if (lastEraserX == -1 && !(isDragging && activeTool == Tool.ERASER)) {
+                    stop();
+                    eraserRedrawTimerActive = false;
+                    eraserRedrawLastNanos = 0;
+                }
+                return;
+            }
+            needsBaseRedraw = false;
+            redrawBaseCanvas(shapes.values());
+        }
+    };
 
     // ── toolbar controls ──────────────────────────────────────────────────────
     private ColorPicker colorPicker;
@@ -249,11 +294,14 @@ public class WhiteboardApp extends Application {
     /** Fires if we stay on the lobby after requesting a room join (no SNAPSHOT). */
     private PauseTransition   lobbyJoinWatchdog;
 
-    /** Bottom-right TCP / UDP / ping telemetry strip (canvas scene). */
+    /** Bottom-right performance overlay (canvas scene): ping RTT + UI FPS. */
     private HBox   telemetryHudRoot;
-    private Label  telemetryTcpLabel;
-    private Label  telemetryUdpLabel;
-    private Label  telemetryPingLabel;
+    private Label  performanceHud;
+    private AnimationTimer performanceFpsTimer;
+    private Timeline performanceHudTimeline;
+    private int performanceFps;
+    private int performanceFrameCount;
+    private long performanceFpsLastSecondNanos;
     private volatile boolean telemetryHudWired;
 
     /** Subtle hover scale on the telemetry HUD strip. */
@@ -293,6 +341,8 @@ public class WhiteboardApp extends Application {
     /** Transparent host for draggable spatial nodes (e.g. WebView media); sits above canvas, below HUD. */
     private Pane spatialOverlayLayer;
     private YoutubePlayerNode youtubePlayer;
+    private ChangeListener<Number> youtubeCenterWidthListener;
+    private WeakChangeListener<Number> youtubeCenterWidthWeakListener;
     /** Previous {@code MediaStatePayload#state} for PAUSED→PLAYING echo-guard detection. */
     private String lastMediaState;
     /** Last non-blank room video id from {@code MEDIA_STATE_UPDATE}; drives watch-party toolbar visibility. */
@@ -501,17 +551,9 @@ public class WhiteboardApp extends Application {
         StackPane rosterLayer = wrapFloatingNode(collaborationRoster, Pos.CENTER_RIGHT, new Insets(16, 0, 16, 0),
                 "whiteboard-workspace-roster-layer");
 
-        telemetryTcpLabel = new Label("TCP: …");
-        telemetryUdpLabel = new Label("UDP: …");
-        telemetryPingLabel = new Label("Ping: …");
-        telemetryTcpLabel.getStyleClass().add("telemetry-hud-line");
-        telemetryUdpLabel.getStyleClass().add("telemetry-hud-line");
-        telemetryPingLabel.getStyleClass().add("telemetry-hud-line");
-        Label telSep1 = new Label("|");
-        Label telSep2 = new Label("|");
-        telSep1.getStyleClass().add("telemetry-hud-sep");
-        telSep2.getStyleClass().add("telemetry-hud-sep");
-        telemetryHudRoot = new HBox(6, telemetryTcpLabel, telSep1, telemetryUdpLabel, telSep2, telemetryPingLabel);
+        performanceHud = new Label("Ping: — | FPS: —");
+        performanceHud.getStyleClass().add("telemetry-hud-line");
+        telemetryHudRoot = new HBox(performanceHud);
         telemetryHudRoot.getStyleClass().addAll("telemetry-hud", "telemetry-pill", "floating-panel");
         telemetryHudRoot.setPickOnBounds(true);
         telemetryHudRoot.setMouseTransparent(false);
@@ -675,7 +717,7 @@ public class WhiteboardApp extends Application {
         // controlPane must sit above cursorPane; toFront() reaffirms StackPane z-order.
         controlPane.toFront();
 
-        eraserIntersection = new EraserSpatialIntersection(() -> shapes.values());
+        eraserIntersection = new EraserSpatialIntersection(shapeSpatialGrid);
         setupEraserTool();
 
         // Wire all mouse events to the StackPane (always hit-testable)
@@ -1763,6 +1805,11 @@ public class WhiteboardApp extends Application {
         if (youtubePlayer == null || spatialOverlayLayer == null) {
             return;
         }
+        if (youtubeCenterWidthWeakListener != null) {
+            spatialOverlayLayer.widthProperty().removeListener(youtubeCenterWidthWeakListener);
+            youtubeCenterWidthListener = null;
+            youtubeCenterWidthWeakListener = null;
+        }
         double w = spatialOverlayLayer.getWidth();
         double h = spatialOverlayLayer.getHeight();
         if (w > 0 && h > 0) {
@@ -1770,26 +1817,30 @@ public class WhiteboardApp extends Application {
             youtubePlayer.setTranslateY(Math.max(0, (h - youtubePlayer.getPrefHeight()) / 2.0));
             return;
         }
-        javafx.beans.value.ChangeListener<Number> centerOnce = new javafx.beans.value.ChangeListener<>() {
-            @Override
-            public void changed(javafx.beans.value.ObservableValue<? extends Number> obs,
-                                Number oldVal, Number newVal) {
-                double width = spatialOverlayLayer.getWidth();
-                double height = spatialOverlayLayer.getHeight();
-                if (width <= 0 || height <= 0 || youtubePlayer == null) {
-                    return;
-                }
-                youtubePlayer.setTranslateX(Math.max(0, (width - youtubePlayer.getPrefWidth()) / 2.0));
-                youtubePlayer.setTranslateY(Math.max(0, (height - youtubePlayer.getPrefHeight()) / 2.0));
-                spatialOverlayLayer.widthProperty().removeListener(this);
+        youtubeCenterWidthListener = (obs, oldVal, newVal) -> {
+            double width = spatialOverlayLayer.getWidth();
+            double height = spatialOverlayLayer.getHeight();
+            if (width <= 0 || height <= 0 || youtubePlayer == null) {
+                return;
+            }
+            youtubePlayer.setTranslateX(Math.max(0, (width - youtubePlayer.getPrefWidth()) / 2.0));
+            youtubePlayer.setTranslateY(Math.max(0, (height - youtubePlayer.getPrefHeight()) / 2.0));
+            if (youtubeCenterWidthWeakListener != null) {
+                spatialOverlayLayer.widthProperty().removeListener(youtubeCenterWidthWeakListener);
             }
         };
-        spatialOverlayLayer.widthProperty().addListener(centerOnce);
+        youtubeCenterWidthWeakListener = new WeakChangeListener<>(youtubeCenterWidthListener);
+        spatialOverlayLayer.widthProperty().addListener(youtubeCenterWidthWeakListener);
     }
 
     private void teardownYoutubePlayer() {
         lastMediaState = null;
         lastActiveRoomVideoId = "";
+        if (spatialOverlayLayer != null && youtubeCenterWidthWeakListener != null) {
+            spatialOverlayLayer.widthProperty().removeListener(youtubeCenterWidthWeakListener);
+        }
+        youtubeCenterWidthListener = null;
+        youtubeCenterWidthWeakListener = null;
         if (youtubePlayer != null) {
             youtubePlayer.dispose();
         }
@@ -2188,6 +2239,7 @@ public class WhiteboardApp extends Application {
     private void clearLocalCanvasState() {
         dismissActiveTextField();
         shapes.clear();
+        shapeSpatialGrid.clear();
         undoHistory.clear();
         transientShapes.clear();
         for (VBox ghost : ghostTextNodes.values()) {
@@ -2208,6 +2260,8 @@ public class WhiteboardApp extends Application {
     }
 
     private void leaveCanvasRoom(boolean sendLeaveRoomToServer) {
+        flushEraserBaseRedraw();
+        stopPerformanceHud();
         removeSessionRevokedOverlay();
         sessionRevokedOverlayShown.set(false);
         cancelLobbyJoinWatchdog();
@@ -2588,7 +2642,11 @@ public class WhiteboardApp extends Application {
                         lastFreehandY = e.getY();
                     }
                 }
-                case ERASER -> performEraserAt(e.getX(), e.getY());
+                case ERASER -> {
+                    lastEraserX = e.getX();
+                    lastEraserY = e.getY();
+                    ensureEraserTimerRunning();
+                }
             }
 
             // Throttled SHAPE_UPDATE: send at most once every 40 ms to keep bandwidth low.
@@ -2611,6 +2669,9 @@ public class WhiteboardApp extends Application {
             isDragging = false;
 
             if (activeTool == Tool.ERASER) {
+                lastEraserX = -1;
+                lastEraserY = -1;
+                flushEraserBaseRedraw();
                 erasedInGesture.clear();
                 return;
             }
@@ -2842,12 +2903,14 @@ public class WhiteboardApp extends Application {
             }
             case FREEHAND -> {
                 if (freehandPoints.size() < 2) return;
+                List<Shape> segments = new ArrayList<>(freehandPoints.size());
                 for (int i = 1; i < freehandPoints.size(); i++) {
                     double[] p0 = freehandPoints.get(i - 1);
                     double[] p1 = freehandPoints.get(i);
-                    addAndSend(shapeFactory.line(p0[0], p0[1], p1[0], p1[1], authorName, clientId));
+                    segments.add(shapeFactory.line(p0[0], p0[1], p1[0], p1[1], authorName, clientId));
                 }
                 freehandPoints.clear();
+                addAndSendBatch(segments);
             }
             case ERASER -> { /* object eraser — deletions handled in performEraserAt */ }
         }
@@ -2857,6 +2920,19 @@ public class WhiteboardApp extends Application {
      * Eraser pass: spatial hit-test against committed shapes; queue and apply
      * {@code SHAPE_DELETE} (via {@link NetworkClient#sendUndoRequest(UUID)}).
      */
+    private void indexShape(Shape shape) {
+        shapeSpatialGrid.insert(shape);
+    }
+
+    private void unindexShape(Shape shape) {
+        shapeSpatialGrid.remove(shape);
+    }
+
+    private void reindexAllShapes() {
+        shapeSpatialGrid.clear();
+        shapes.values().forEach(shapeSpatialGrid::insert);
+    }
+
     private void performEraserAt(double x, double y) {
         if (eraserIntersection == null) {
             return;
@@ -2867,7 +2943,10 @@ public class WhiteboardApp extends Application {
             if (!erasedInGesture.add(shapeId)) {
                 return;
             }
-            shapes.remove(shapeId);
+            Shape removed = shapes.remove(shapeId);
+            if (removed != null) {
+                unindexShape(removed);
+            }
             undoHistory.remove(shapeId);
             if (networkClient != null) {
                 try {
@@ -2876,21 +2955,79 @@ public class WhiteboardApp extends Application {
                     log.warn("sendUndoRequest (eraser) failed: {}", ex.getMessage());
                 }
             }
-            redrawBaseCanvas(shapes.values());
+            scheduleEraserBaseRedraw();
         });
+    }
+
+    /**
+     * Keeps {@link #eraserRedrawTimer} running so drag samples are hit-tested at ~30 Hz.
+     * Must be called on the FX Application Thread.
+     */
+    private void ensureEraserTimerRunning() {
+        if (!eraserRedrawTimerActive) {
+            eraserRedrawLastNanos = 0;
+            eraserRedrawTimerActive = true;
+            eraserRedrawTimer.start();
+        }
+    }
+
+    /**
+     * Schedules a throttled full repaint of the base canvas after eraser deletions.
+     * Must be called on the FX Application Thread.
+     */
+    private void scheduleEraserBaseRedraw() {
+        needsBaseRedraw = true;
+        ensureEraserTimerRunning();
+    }
+
+    /**
+     * Stops the eraser repaint timer and paints immediately if a redraw was pending.
+     * Must be called on the FX Application Thread.
+     */
+    private void flushEraserBaseRedraw() {
+        eraserRedrawTimer.stop();
+        eraserRedrawTimerActive = false;
+        eraserRedrawLastNanos = 0;
+        if (needsBaseRedraw) {
+            needsBaseRedraw = false;
+            redrawBaseCanvas(shapes.values());
+        }
     }
 
     private void addAndSend(Shape shape) {
         shapes.put(shape.objectId(), shape);
+        indexShape(shape);
         undoHistory.addLast(shape.objectId());
-        // Server excludes the sender from MUTATION broadcast; repaint locally immediately
-        // (replaces the removed AnimationTimer render loop).
-        redrawBaseCanvas(shapes.values());
+        // Server excludes the sender from MUTATION broadcast; paint locally in O(1).
+        paintShapeOnBaseCanvas(shape);
         if (networkClient != null) {
             try {
                 networkClient.sendMutation(shape);
             } catch (Exception ex) {
                 log.warn("sendMutation failed: {}", ex.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Commits multiple shapes locally (incremental paint) and sends them as one or
+     * few {@code MUTATION_BATCH} frames (freehand stroke segments).
+     */
+    private void addAndSendBatch(List<Shape> batch) {
+        if (batch == null || batch.isEmpty()) {
+            return;
+        }
+        for (Shape shape : batch) {
+            shapes.put(shape.objectId(), shape);
+            indexShape(shape);
+            undoHistory.addLast(shape.objectId());
+            paintShapeOnBaseCanvas(shape);
+        }
+        if (networkClient != null) {
+            try {
+                networkClient.sendMutationBatch(batch);
+            } catch (Exception ex) {
+                log.warn("sendMutationBatch failed: {}", ex.getMessage());
             }
         }
     }
@@ -2928,7 +3065,10 @@ public class WhiteboardApp extends Application {
             log.debug("Nothing to undo");
             return;
         }
-        shapes.remove(lastId);
+        Shape removed = shapes.remove(lastId);
+        if (removed != null) {
+            unindexShape(removed);
+        }
         redrawBaseCanvas(shapes.values());
         if (networkClient != null) {
             try {
@@ -3079,7 +3219,7 @@ public class WhiteboardApp extends Application {
         networkClient.getParticipantManager().putParticipant(
                 networkClient.getClientId(),
                 networkClient.getAuthorName());
-        wireTelemetryHud(networkClient);
+        wirePerformanceHud(networkClient);
         wireMicToggleHud(networkClient.getAudioEngine());
         wireParticipantHud(networkClient.getParticipantManager());
         networkClient.addLobbyListener(rooms ->
@@ -3155,6 +3295,7 @@ public class WhiteboardApp extends Application {
                         primaryStage.setTitle("DistriSync – " + authorName + "  [" + roomId + "]");
                         controlPane.toFront();
                         setStatus("⬤ Connected", GREEN);
+                        startPerformanceHud();
                         Platform.runLater(WhiteboardApp.this::updateToolsDrawerClipAndHostWidth);
                     }
 
@@ -3165,6 +3306,7 @@ public class WhiteboardApp extends Application {
                                 shapes.put(s.objectId(), s);
                             }
                         }
+                        reindexAllShapes();
                         try {
                             redrawBaseCanvas(shapes.values());
                         } catch (RuntimeException ex) {
@@ -3189,6 +3331,7 @@ public class WhiteboardApp extends Application {
                                 shapes.put(s.objectId(), s);
                             }
                         }
+                        reindexAllShapes();
                         try {
                             redrawBaseCanvas(shapes.values());
                         } catch (RuntimeException ex) {
@@ -3217,8 +3360,17 @@ public class WhiteboardApp extends Application {
             @Override
             public void onMutationReceived(Shape shape) {
                 Platform.runLater(() -> {
-                    shapes.put(shape.objectId(), shape);
-                    redrawBaseCanvas(shapes.values());
+                    boolean isAddition = !shapes.containsKey(shape.objectId());
+                    Shape previous = shapes.put(shape.objectId(), shape);
+                    if (previous != null) {
+                        unindexShape(previous);
+                    }
+                    indexShape(shape);
+                    if (isAddition) {
+                        paintShapeOnBaseCanvas(shape);
+                    } else {
+                        redrawBaseCanvas(shapes.values());
+                    }
                 });
             }
 
@@ -3272,9 +3424,7 @@ public class WhiteboardApp extends Application {
                     }
 
                     renderTransient();
-                    // Committed shapes will arrive via onMutationReceived shortly;
-                    // force an immediate redraw so the base layer is not stale.
-                    redrawBaseCanvas(shapes.values());
+                    // Committed segments arrive via onMutationReceived and paint incrementally.
                 });
             }
 
@@ -3282,6 +3432,7 @@ public class WhiteboardApp extends Application {
             public void onUserShapesCleared(String targetClientId) {
                 Platform.runLater(() -> {
                     shapes.values().removeIf(s -> s.clientId().equals(targetClientId));
+                    reindexAllShapes();
                     // Only discard this client's undo history when the clear is for us.
                     if (targetClientId.equals(clientId)) {
                         undoHistory.clear();
@@ -3297,7 +3448,10 @@ public class WhiteboardApp extends Application {
             @Override
             public void onShapeDeleted(UUID shapeId) {
                 Platform.runLater(() -> {
-                    shapes.remove(shapeId);
+                    Shape removed = shapes.remove(shapeId);
+                    if (removed != null) {
+                        unindexShape(removed);
+                    }
                     redrawBaseCanvas(shapes.values());
                     log.debug("Shape deleted by remote peer shapeId={}", shapeId);
                 });
@@ -3353,41 +3507,63 @@ public class WhiteboardApp extends Application {
         statusLabel.setTextFill(Color.web(colorHex));
     }
 
-    private void wireTelemetryHud(NetworkClient client) {
-        if (telemetryHudWired || client == null || telemetryTcpLabel == null) {
+    private void wirePerformanceHud(NetworkClient client) {
+        if (telemetryHudWired || performanceHud == null) {
             return;
         }
         telemetryHudWired = true;
-        telemetryTcpLabel.textProperty().bind(
-                Bindings.when(client.tcpConnectedProperty())
-                        .then("TCP: Connected")
-                        .otherwise("TCP: Disconnected"));
-        telemetryTcpLabel.styleProperty().bind(
-                Bindings.when(client.tcpConnectedProperty())
-                        .then("-fx-text-fill: #34d399;")
-                        .otherwise("-fx-text-fill: #94a3b8;"));
-        telemetryUdpLabel.textProperty().bind(
-                Bindings.when(client.udpActiveProperty())
-                        .then("UDP: Ready")
-                        .otherwise("UDP: Waiting"));
-        telemetryUdpLabel.styleProperty().bind(
-                Bindings.when(client.udpActiveProperty())
-                        .then("-fx-text-fill: #34d399;")
-                        .otherwise("-fx-text-fill: #94a3b8;"));
-        telemetryPingLabel.textProperty().bind(
-                Bindings.createStringBinding(
-                        () -> {
-                            long ms = client.pingProperty().get();
-                            if (ms < 0L) {
-                                return "Ping: —";
-                            }
-                            return "Ping: " + ms + "ms";
-                        },
-                        client.pingProperty()));
-        telemetryPingLabel.styleProperty().bind(
-                Bindings.createStringBinding(
-                        () -> "-fx-text-fill: #94a3b8;",
-                        client.pingProperty()));
+    }
+
+    private void startPerformanceHud() {
+        stopPerformanceHud();
+        performanceFps = 0;
+        performanceFrameCount = 0;
+        performanceFpsLastSecondNanos = 0;
+
+        performanceFpsTimer = new AnimationTimer() {
+            @Override
+            public void handle(long now) {
+                performanceFrameCount++;
+                if (performanceFpsLastSecondNanos == 0) {
+                    performanceFpsLastSecondNanos = now;
+                    return;
+                }
+                long elapsed = now - performanceFpsLastSecondNanos;
+                if (elapsed >= 1_000_000_000L) {
+                    performanceFps = (int) Math.round(
+                            performanceFrameCount * 1_000_000_000.0 / elapsed);
+                    performanceFrameCount = 0;
+                    performanceFpsLastSecondNanos = now;
+                }
+            }
+        };
+        performanceFpsTimer.start();
+
+        performanceHudTimeline = new Timeline(
+                new KeyFrame(Duration.seconds(1), e -> updatePerformanceHudText()));
+        performanceHudTimeline.setCycleCount(Timeline.INDEFINITE);
+        performanceHudTimeline.play();
+        updatePerformanceHudText();
+    }
+
+    private void stopPerformanceHud() {
+        if (performanceFpsTimer != null) {
+            performanceFpsTimer.stop();
+            performanceFpsTimer = null;
+        }
+        if (performanceHudTimeline != null) {
+            performanceHudTimeline.stop();
+            performanceHudTimeline = null;
+        }
+    }
+
+    private void updatePerformanceHudText() {
+        if (performanceHud == null) {
+            return;
+        }
+        long ms = networkClient != null ? networkClient.pingProperty().get() : -1L;
+        String pingText = ms < 0L ? "—" : String.valueOf(ms);
+        performanceHud.setText("Ping: " + pingText + "ms | FPS: " + performanceFps);
     }
 
     private boolean isViewportDrawable() {
@@ -3409,9 +3585,10 @@ public class WhiteboardApp extends Application {
      *
      * <p>Must be called on the FX Application Thread.  Invoke via
      * {@link Platform#runLater} from any background callback — e.g. inside
-     * {@code onSnapshotReceived}, {@code onMutationReceived},
+     * {@code onSnapshotReceived}, LWW {@code onMutationReceived} updates,
      * {@code onShapeDeleted}, and {@code onUserShapesCleared} — to guarantee the
-     * canvas reflects the latest committed state immediately.
+     * canvas reflects the latest committed state immediately.  New-shape
+     * {@code onMutationReceived} additions use {@link #paintShapeOnBaseCanvas} instead.
      *
      * @param shapesToDraw the committed shapes to render; must not be {@code null}
      */
@@ -3428,6 +3605,17 @@ public class WhiteboardApp extends Application {
         shapesToDraw.stream()
                     .sorted(Comparator.comparingLong(Shape::timestamp))
                     .forEach(s -> drawShape(baseGc, s));
+    }
+
+    /**
+     * Appends one committed shape onto {@code baseCanvas} without clearing the
+     * layer.  Must be called on the FX Application Thread.
+     */
+    private void paintShapeOnBaseCanvas(Shape shape) {
+        if (!isViewportDrawable()) {
+            return;
+        }
+        drawShape(baseGc, shape);
     }
 
     /**
