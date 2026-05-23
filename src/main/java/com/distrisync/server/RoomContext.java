@@ -1,5 +1,6 @@
 package com.distrisync.server;
 
+import com.distrisync.model.Shape;
 import com.distrisync.protocol.Message;
 import com.distrisync.protocol.MessageCodec;
 import com.google.gson.JsonObject;
@@ -10,16 +11,16 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.channels.SelectionKey;
 import java.util.Collections;
-import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Per-room runtime context: workspace boards (each with authoritative canvas state) + active-key table.
  *
  * <p>Board state is created lazily via {@link #getBoard(String)}; each new board replays
- * {@link WalManager#recover(String, String)} for that room/board pair when a {@link WalManager} is configured.
+ * {@link WalManager#replay(String, String, java.util.function.Consumer)} for that room/board pair when a {@link WalManager} is configured.
  * Boards that were removed via {@link #deleteBoard(String, WalManager)} stay tombstoned: {@code getBoard}
  * returns {@code null} for those ids so late packets cannot resurrect state.
  *
@@ -28,6 +29,8 @@ import java.util.concurrent.ConcurrentHashMap;
 final class RoomContext {
 
     private static final Logger log = LoggerFactory.getLogger(RoomContext.class);
+
+    private static final int WAL_COMPACTION_THRESHOLD = 1000;
 
     final String roomId;
 
@@ -53,6 +56,10 @@ final class RoomContext {
     /** Reverse index: {@link ClientSession#clientId} → local TCP {@link SelectionKey}. */
     private final ConcurrentHashMap<String, SelectionKey> clientIndex = new ConcurrentHashMap<>();
 
+    private final ConcurrentHashMap<String, AtomicInteger> walOperationCounts = new ConcurrentHashMap<>();
+
+    private final ConcurrentHashMap<String, Object> walCompactionLocks = new ConcurrentHashMap<>();
+
     private volatile long lastActivityTimestamp = System.currentTimeMillis();
 
     RoomContext(String roomId, WalManager wal) {
@@ -74,6 +81,8 @@ final class RoomContext {
         }
         deletedBoardIds.add(boardId);
         boards.remove(boardId);
+        walOperationCounts.remove(boardId);
+        walCompactionLocks.remove(boardId);
         if (walManager != null) {
             try {
                 walManager.deleteBoardFiles(roomId, boardId);
@@ -177,57 +186,116 @@ final class RoomContext {
         return lastActivityTimestamp;
     }
 
+    /**
+     * Called after each successful WAL append for {@code boardId}. Triggers compaction when the
+     * per-board operation count exceeds {@link #WAL_COMPACTION_THRESHOLD}.
+     */
+    void onWalAppended(String boardId) {
+        if (wal == null || boardId == null || boardId.isBlank()) {
+            return;
+        }
+
+        int count = walOperationCounts
+                .computeIfAbsent(boardId, k -> new AtomicInteger(0))
+                .incrementAndGet();
+        if (count <= WAL_COMPACTION_THRESHOLD) {
+            return;
+        }
+
+        Object lock = walCompactionLocks.computeIfAbsent(boardId, k -> new Object());
+        synchronized (lock) {
+            AtomicInteger counter = walOperationCounts.get(boardId);
+            if (counter == null || counter.get() <= WAL_COMPACTION_THRESHOLD) {
+                return;
+            }
+
+            if (isBoardDeleted(boardId)) {
+                return;
+            }
+
+            CanvasStateManager board = boards.get(boardId);
+            if (board == null) {
+                return;
+            }
+
+            try {
+                wal.compactWal(roomId, boardId, board.snapshot());
+                counter.set(0);
+            } catch (IOException e) {
+                log.error("WAL compaction failed  room='{}' board='{}': {}", roomId, boardId, e.getMessage(), e);
+            }
+        }
+    }
+
     private void replayWalForBoard(String boardId, CanvasStateManager stateManager) {
         if (wal == null) return;
 
         long t0 = System.nanoTime();
-        List<Message> frames;
+        int[] frameCount = {0};
+        int[] applied = {0};
+
         try {
-            frames = wal.recover(roomId, boardId);
+            wal.replay(roomId, boardId, msg -> {
+                frameCount[0]++;
+                applyWalFrame(boardId, stateManager, msg, applied);
+            });
         } catch (IOException e) {
             log.error("WAL replay failed  room='{}' board='{}': {}", roomId, boardId, e.getMessage(), e);
             return;
         }
 
-        int applied = 0;
-        for (Message msg : frames) {
-            switch (msg.type()) {
-                case MUTATION -> {
-                    try {
-                        if (stateManager.applyMutation(ShapeCodec.decodeMutation(msg.payload()))) {
-                            applied++;
-                        }
-                    } catch (Exception e) {
-                        log.warn("WAL replay: skipping malformed MUTATION  room='{}' board='{}': {}",
-                                roomId, boardId, e.getMessage());
-                    }
-                }
-                case SHAPE_DELETE -> {
-                    try {
-                        JsonObject p = JsonParser.parseString(msg.payload()).getAsJsonObject();
-                        UUID shapeId = UUID.fromString(p.get("shapeId").getAsString());
-                        if (stateManager.deleteShape(shapeId)) applied++;
-                    } catch (Exception e) {
-                        log.warn("WAL replay: skipping malformed SHAPE_DELETE  room='{}' board='{}': {}",
-                                roomId, boardId, e.getMessage());
-                    }
-                }
-                case CLEAR_USER_SHAPES -> {
-                    try {
-                        String clientId = MessageCodec.decodeClearUserShapes(msg);
-                        stateManager.clearUserShapes(clientId);
-                        applied++;
-                    } catch (Exception e) {
-                        log.warn("WAL replay: skipping malformed CLEAR_USER_SHAPES  room='{}' board='{}': {}",
-                                roomId, boardId, e.getMessage());
-                    }
-                }
-                default -> { /* non-durable */ }
-            }
-        }
-
         long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
         log.info("[WAL] Replayed {} frames for {}_{} in {}ms. Canvas restored.",
-                frames.size(), roomId, boardId, elapsedMs);
+                frameCount[0], roomId, boardId, elapsedMs);
+    }
+
+    private void applyWalFrame(String boardId, CanvasStateManager stateManager, Message msg, int[] applied) {
+        switch (msg.type()) {
+            case MUTATION -> {
+                try {
+                    if (stateManager.applyMutation(ShapeCodec.decodeMutation(msg.payload()))) {
+                        applied[0]++;
+                    }
+                } catch (Exception e) {
+                    log.warn("WAL replay: skipping malformed MUTATION  room='{}' board='{}': {}",
+                            roomId, boardId, e.getMessage());
+                }
+            }
+            case MUTATION_BATCH -> {
+                try {
+                    for (Shape shape : ShapeCodec.decodeMutationBatch(msg.payload())) {
+                        if (stateManager.applyMutation(shape)) {
+                            applied[0]++;
+                        }
+                    }
+                } catch (Exception e) {
+                    log.warn("WAL replay: skipping malformed MUTATION_BATCH  room='{}' board='{}': {}",
+                            roomId, boardId, e.getMessage());
+                }
+            }
+            case SHAPE_DELETE -> {
+                try {
+                    JsonObject p = JsonParser.parseString(msg.payload()).getAsJsonObject();
+                    UUID shapeId = UUID.fromString(p.get("shapeId").getAsString());
+                    if (stateManager.deleteShape(shapeId)) {
+                        applied[0]++;
+                    }
+                } catch (Exception e) {
+                    log.warn("WAL replay: skipping malformed SHAPE_DELETE  room='{}' board='{}': {}",
+                            roomId, boardId, e.getMessage());
+                }
+            }
+            case CLEAR_USER_SHAPES -> {
+                try {
+                    String clientId = MessageCodec.decodeClearUserShapes(msg);
+                    stateManager.clearUserShapes(clientId);
+                    applied[0]++;
+                } catch (Exception e) {
+                    log.warn("WAL replay: skipping malformed CLEAR_USER_SHAPES  room='{}' board='{}': {}",
+                            roomId, boardId, e.getMessage());
+                }
+            }
+            default -> { /* non-durable */ }
+        }
     }
 }

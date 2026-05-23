@@ -48,4 +48,24 @@ class NetworkClientTelemetryTest {
                 .as("pingProperty = wallAtApply - origin; wallAtApply is between ingest and read-back")
                 .isBetween(minExpected, maxExpected);
     }
+
+    @Test
+    void pongReceipt_rollingAverageOfLastThreeSamples() {
+        NetworkClient client = new NetworkClient("127.0.0.1", 1, "author", "client-id");
+        long wall = System.currentTimeMillis();
+
+        client.ingestPongForTelemetryTest(
+                new Message(MessageType.PONG, "{\"t\":" + (wall - 50) + "}"));
+        client.ingestPongForTelemetryTest(
+                new Message(MessageType.PONG, "{\"t\":" + (wall - 100) + "}"));
+        client.ingestPongForTelemetryTest(
+                new Message(MessageType.PONG, "{\"t\":" + (wall - 150) + "}"));
+
+        await().atMost(3, TimeUnit.SECONDS).until(() -> client.pingProperty().get() >= 0L);
+
+        long avg = client.pingProperty().get();
+        assertThat(avg)
+                .as("rolling average of ~50, ~100, ~150 ms samples")
+                .isBetween(80L, 120L);
+    }
 }

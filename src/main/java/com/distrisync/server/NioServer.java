@@ -46,6 +46,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -85,13 +86,29 @@ import java.util.concurrent.atomic.AtomicLong;
  * </ol>
  *
  * <h2>Thread safety</h2>
- * {@code NioServer} itself is single-threaded.  {@link CanvasStateManager}
- * and {@link RoomManager} use {@link java.util.concurrent.ConcurrentHashMap}
- * and may safely be called from other threads without coordination.
+ * The selector event loop is single-threaded for {@link SelectionKey} I/O and
+ * {@link #broadcastToBoard} fan-out.  Durable {@code MUTATION} / {@code MUTATION_BATCH}
+ * side-effects (WAL append, Redis publish) run on the static {@link #ioWorkerPool};
+ * encoded frames are offered to {@link #pendingBoardBroadcasts} and drained on the
+ * selector thread after {@link Selector#wakeup()}.  {@link CanvasStateManager} and
+ * {@link RoomManager} use {@link java.util.concurrent.ConcurrentHashMap} and may
+ * safely be called from worker threads without extra coordination.
  */
 public final class NioServer implements Runnable {
 
     private static final Logger log = LoggerFactory.getLogger(NioServer.class);
+
+    /**
+     * Offloads blocking WAL I/O and backplane publish for accepted mutations so the
+     * selector thread returns to {@code OP_READ} immediately.
+     */
+    static final ExecutorService ioWorkerPool = Executors.newFixedThreadPool(
+            Runtime.getRuntime().availableProcessors() * 2,
+            r -> {
+                Thread t = new Thread(r, "distrisync-io-worker");
+                t.setDaemon(true);
+                return t;
+            });
 
     /** Selector attachment marking the shared UDP {@link DatagramChannel} key (not a {@link ClientSession}). */
     private static final Object UDP_CHANNEL_ATTACHMENT = new Object();
@@ -195,6 +212,20 @@ public final class NioServer implements Runnable {
      * the storage lifecycle thread; frames are drained on the selector thread.
      */
     private final ConcurrentLinkedQueue<ByteBuffer> pendingLobbyFrames = new ConcurrentLinkedQueue<>();
+
+    /**
+     * Cross-thread board broadcasts: {@link #ioWorkerPool} offers frames after WAL/backplane work;
+     * {@link #drainPendingBoardBroadcasts()} delivers on the selector thread.
+     */
+    private final ConcurrentLinkedQueue<PendingBoardBroadcast> pendingBoardBroadcasts =
+            new ConcurrentLinkedQueue<>();
+
+    private record PendingBoardBroadcast(
+            String roomId,
+            String boardId,
+            ByteBuffer frame,
+            SelectionKey senderKey,
+            OutboundClass cls) {}
 
     /**
      * @param port        TCP port to bind; must be in the range [0, 65535]
@@ -322,6 +353,7 @@ public final class NioServer implements Runnable {
                 while (!stopped && !Thread.currentThread().isInterrupted()) {
                     selector.select();
                     drainPendingLobbyBroadcasts();
+                    drainPendingBoardBroadcasts();
                     processRemoteMailbox();
 
                     Set<SelectionKey> selected = selector.selectedKeys();
@@ -788,25 +820,57 @@ public final class NioServer implements Runnable {
                             shape.timestamp(), shape.authorName(), session.roomId, session.currentBoardId,
                             session.sessionId);
 
-                    // Persist to WAL before broadcasting so the record survives a crash
-                    // between the apply and the broadcast.
-                    roomManager.appendToWal(session.roomId, session.currentBoardId, msg);
-
-                    if (backplanePublisher != null) {
-                        String eventId = UUID.randomUUID().toString();
-                        backplaneEventDedup.tryRecord(eventId);
-                        backplanePublisher.publish(new BackplaneEnvelope(
-                                eventId,
-                                backplanePublisher.originNodeId(),
-                                session.roomId,
-                                session.currentBoardId,
-                                MessageCodec.encode(msg)));
-                    }
-
-                    ByteBuffer frame = MessageCodec.encode(msg);
-                    broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey, OutboundClass.CRITICAL);
+                    final String roomId = session.roomId;
+                    final String boardId = session.currentBoardId;
+                    submitMutationSideEffects(roomId, boardId, msg, senderKey);
                 } else {
                     log.debug("MUTATION rejected (stale)  id={} from={}", shape.objectId(), session.sessionId);
+                }
+            }
+
+            case MUTATION_BATCH -> {
+                if (!RoomPermissions.canDraw(session.permissions)) {
+                    return;
+                }
+                RoomContext room = resolveRoom(session, senderKey);
+                if (room == null) return;
+                if (session.currentBoardId.isBlank()) {
+                    log.warn("MUTATION_BATCH with no active board session={} — ignoring", session.sessionId);
+                    return;
+                }
+
+                List<Shape> batch;
+                try {
+                    batch = ShapeCodec.decodeMutationBatch(msg.payload());
+                } catch (Exception e) {
+                    log.warn("Malformed MUTATION_BATCH payload from session={}: {}",
+                            session.sessionId, e.getMessage());
+                    closeKey(senderKey);
+                    return;
+                }
+
+                CanvasStateManager board = room.getBoard(session.currentBoardId);
+                if (board == null) {
+                    return;
+                }
+
+                boolean anyApplied = false;
+                for (Shape shape : batch) {
+                    if (board.applyMutation(shape)) {
+                        anyApplied = true;
+                    }
+                }
+
+                if (anyApplied) {
+                    log.debug("MUTATION_BATCH accepted  count={} room='{}' board='{}' from={}",
+                            batch.size(), session.roomId, session.currentBoardId, session.sessionId);
+
+                    final String roomId = session.roomId;
+                    final String boardId = session.currentBoardId;
+                    submitMutationSideEffects(roomId, boardId, msg, senderKey);
+                } else {
+                    log.debug("MUTATION_BATCH rejected (all stale)  count={} from={}",
+                            batch.size(), session.sessionId);
                 }
             }
 
@@ -1278,6 +1342,9 @@ public final class NioServer implements Runnable {
         if (room == null) {
             return;
         }
+        if (!speaker.consumeUdpToken()) {
+            return;
+        }
 
         udpBuffer.position(0);
         writeClientIdPrefix36(udpBuffer, speaker.clientId);
@@ -1367,6 +1434,9 @@ public final class NioServer implements Runnable {
         return requested;
     }
 
+    /** Empty JSON array payload that starts chunked join/board-switch hydration. */
+    private static final String SNAPSHOT_HYDRATION_HEADER = "[]";
+
     private void sendSnapshot(ClientSession session, SelectionKey key, RoomContext room) {
         CanvasStateManager boardState = room.getBoard(session.currentBoardId);
         if (boardState == null) {
@@ -1375,16 +1445,42 @@ public final class NioServer implements Runnable {
             return;
         }
         List<Shape> shapes = boardState.snapshot();
-        String payload = ShapeCodec.encodeSnapshot(shapes);
-        Message snapshotMsg = new Message(MessageType.SNAPSHOT, payload);
-        ByteBuffer frame = MessageCodec.encode(snapshotMsg);
+        List<String> batches = ShapeCodec.chunkMutationBatchPayloads(shapes);
+        int queuePeak = session.writeQueue.size();
 
-        log.debug("Sending SNAPSHOT  room='{}' shapes={} bytes={} to={}",
-                room.roomId, shapes.size(), frame.remaining(), session.sessionId);
-
-        if (safeEnqueue(session, key, frame, OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
+        if (safeEnqueue(session, key,
+                MessageCodec.encode(new Message(MessageType.SNAPSHOT, SNAPSHOT_HYDRATION_HEADER)),
+                OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
             return;
         }
+        queuePeak = Math.max(queuePeak, session.writeQueue.size());
+
+        for (String payload : batches) {
+            if (safeEnqueue(session, key,
+                    MessageCodec.encode(new Message(MessageType.MUTATION_BATCH, payload)),
+                    OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
+                return;
+            }
+            queuePeak = Math.max(queuePeak, session.writeQueue.size());
+            if (session.writeQueue.size() >= ClientSession.WRITE_QUEUE_CAPACITY - 8) {
+                if (!flushWriteQueue(session, key)) {
+                    log.error("chunked SNAPSHOT flush failed for session={} — closing connection",
+                            session.sessionId);
+                    closeKey(key);
+                    return;
+                }
+            }
+        }
+
+        if (safeEnqueue(session, key,
+                MessageCodec.encode(new Message(MessageType.SNAPSHOT_END, "")),
+                OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
+            return;
+        }
+
+        log.debug("Sending chunked snapshot  room='{}' shapes={} batches={} queuePeak={} to={}",
+                room.roomId, shapes.size(), batches.size(), queuePeak, session.sessionId);
+
         if (!flushWriteQueue(session, key)) {
             log.error("SNAPSHOT flush failed for session={} — closing connection", session.sessionId);
             closeKey(key);
@@ -1410,6 +1506,41 @@ public final class NioServer implements Runnable {
         while ((frame = pendingLobbyFrames.poll()) != null) {
             deliverLobbyStateFrame(frame);
         }
+    }
+
+    private void drainPendingBoardBroadcasts() {
+        PendingBoardBroadcast job;
+        while ((job = pendingBoardBroadcasts.poll()) != null) {
+            broadcastToBoard(job.roomId(), job.boardId(), job.frame(), job.senderKey(), job.cls());
+        }
+    }
+
+    /**
+     * WAL append, optional backplane publish, and deferred board fan-out for an accepted mutation.
+     * Runs on {@link #ioWorkerPool}; TCP delivery is marshalled back via {@link #pendingBoardBroadcasts}.
+     */
+    private void submitMutationSideEffects(
+            String roomId, String boardId, Message msg, SelectionKey senderKey) {
+        ioWorkerPool.submit(() -> {
+            roomManager.appendToWal(roomId, boardId, msg);
+            if (backplanePublisher != null) {
+                String eventId = UUID.randomUUID().toString();
+                backplaneEventDedup.tryRecord(eventId);
+                backplanePublisher.publish(new BackplaneEnvelope(
+                        eventId,
+                        backplanePublisher.originNodeId(),
+                        roomId,
+                        boardId,
+                        MessageCodec.encode(msg)));
+            }
+            ByteBuffer frame = MessageCodec.encode(msg);
+            pendingBoardBroadcasts.offer(
+                    new PendingBoardBroadcast(roomId, boardId, frame, senderKey, OutboundClass.CRITICAL));
+            Selector sel = selector;
+            if (sel != null && sel.isOpen()) {
+                sel.wakeup();
+            }
+        });
     }
 
     /**
@@ -1773,6 +1904,7 @@ public final class NioServer implements Runnable {
         ByteBuffer fanoutFrame = envelope.serializedPayload().duplicate();
         boolean fanout = switch (msg.type()) {
             case MUTATION -> applyRemoteMutation(room, roomId, boardId, msg, fanoutFrame);
+            case MUTATION_BATCH -> applyRemoteMutationBatch(room, roomId, boardId, msg, fanoutFrame);
             case SHAPE_DELETE -> applyRemoteShapeDelete(room, roomId, boardId, msg, fanoutFrame);
             case CLEAR_USER_SHAPES -> applyRemoteClearUserShapes(room, roomId, boardId, msg, fanoutFrame);
             case STATE_REQUEST -> {
@@ -1814,6 +1946,39 @@ public final class NioServer implements Runnable {
         if (!board.applyMutation(shape)) {
             log.debug("Remote MUTATION rejected (stale)  id={} room='{}' board='{}'",
                     shape.objectId(), roomId, boardId);
+            return false;
+        }
+
+        roomManager.appendToWal(roomId, boardId, msg);
+        fanoutFrame.rewind();
+        return true;
+    }
+
+    private boolean applyRemoteMutationBatch(
+            RoomContext room, String roomId, String boardId, Message msg, ByteBuffer fanoutFrame) {
+        List<Shape> batch;
+        try {
+            batch = ShapeCodec.decodeMutationBatch(msg.payload());
+        } catch (Exception e) {
+            log.warn("Remote MUTATION_BATCH malformed  room='{}' board='{}': {}",
+                    roomId, boardId, e.getMessage());
+            return false;
+        }
+
+        CanvasStateManager board = room.getBoard(boardId);
+        if (board == null) {
+            return false;
+        }
+
+        boolean anyApplied = false;
+        for (Shape shape : batch) {
+            if (board.applyMutation(shape)) {
+                anyApplied = true;
+            }
+        }
+        if (!anyApplied) {
+            log.debug("Remote MUTATION_BATCH rejected (all stale)  count={} room='{}' board='{}'",
+                    batch.size(), roomId, boardId);
             return false;
         }
 

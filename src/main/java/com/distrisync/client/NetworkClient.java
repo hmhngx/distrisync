@@ -37,6 +37,7 @@ import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -89,6 +90,15 @@ public final class NetworkClient implements AutoCloseable {
     private static final int MAX_RECONNECT_ATTEMPTS = 5;
 
     /**
+     * Max shapes per {@link MessageType#MUTATION_BATCH} frame so payloads stay
+     * within the server's 64 KiB read accumulator.
+     */
+    private static final int MUTATION_BATCH_MAX_SHAPES = 20;
+
+    /** Max UTF-8 payload bytes per {@code MUTATION_BATCH} frame (below 64 KiB). */
+    private static final int MUTATION_BATCH_MAX_PAYLOAD_BYTES = 48_000;
+
+    /**
      * Read accumulation buffer capacity per channel.
      *
      * Must be able to hold the largest single frame in one contiguous buffer.
@@ -139,6 +149,15 @@ public final class NetworkClient implements AutoCloseable {
      * {@code JOIN_ROOM} / {@code SWITCH_BOARD} and applied when the snapshot is decoded.
      */
     private volatile String lastSnapshotBoardId = "";
+
+    /**
+     * True between an empty hydration {@code SNAPSHOT} {@code []} and {@code SNAPSHOT_END};
+     * {@code MUTATION_BATCH} frames are buffered instead of applied as live peer mutations.
+     */
+    private boolean snapshotHydrating;
+
+    /** Shapes accumulated during chunked snapshot hydration (read thread only). */
+    private final List<Shape> snapshotHydrationBuffer = new ArrayList<>();
 
     /** Thread-safe listener registry; copy-on-write for lock-free iteration. */
     private final CopyOnWriteArrayList<CanvasUpdateListener> listeners =
@@ -206,13 +225,18 @@ public final class NetworkClient implements AutoCloseable {
     /** Guards against double-connect and allows graceful shutdown signalling. */
     private final AtomicBoolean running = new AtomicBoolean(false);
 
-    /** Milliseconds since epoch embedded in the last PING; echoed in PONG for RTT. */
-    private static final int HEARTBEAT_PING_INTERVAL_MS = 2_000;
+    /** Interval between {@code PING} heartbeats on the control channel. */
+    private static final int HEARTBEAT_PING_INTERVAL_MS = 5_000;
+
+    private static final int PING_ROLLING_WINDOW = 10;
 
     private final SimpleBooleanProperty tcpConnected = new SimpleBooleanProperty(false);
     private final SimpleBooleanProperty udpActive = new SimpleBooleanProperty(false);
-    /** Round-trip time in ms from last PONG, or {@code -1} until the first PONG. */
+    /** Rolling average RTT in ms (last up to {@value #PING_ROLLING_WINDOW} PONGs), or {@code -1} before first PONG. */
     private final SimpleLongProperty ping = new SimpleLongProperty(-1L);
+    private final long[] pingSamples = new long[PING_ROLLING_WINDOW];
+    private int pingSampleCount;
+    private int pingSampleWriteIndex;
 
     private volatile Thread pingThread;
 
@@ -356,6 +380,45 @@ public final class NetworkClient implements AutoCloseable {
 
         enqueueFrame(MessageCodec.encode(
                 new Message(MessageType.MUTATION, ClientShapeCodec.encodeMutation(shape))));
+    }
+
+    /**
+     * Enqueues one or more {@code MUTATION_BATCH} frames for the given shapes.
+     * Large freehand strokes are split into chunks that respect
+     * {@link #MUTATION_BATCH_MAX_SHAPES} and {@link #MUTATION_BATCH_MAX_PAYLOAD_BYTES}.
+     *
+     * @param shapes committed shapes to broadcast; must not be {@code null} or empty
+     * @throws IllegalStateException if the client has not been connected
+     */
+    public void sendMutationBatch(List<Shape> shapes) {
+        if (shapes == null || shapes.isEmpty()) {
+            return;
+        }
+        if (!running.get()) {
+            throw new IllegalStateException("NetworkClient is not running");
+        }
+
+        int index = 0;
+        while (index < shapes.size()) {
+            int chunkEnd = index + 1;
+            String payload = ClientShapeCodec.encodeMutationBatch(shapes.subList(index, chunkEnd));
+
+            while (chunkEnd < shapes.size()
+                    && chunkEnd - index < MUTATION_BATCH_MAX_SHAPES) {
+                String candidate = ClientShapeCodec.encodeMutationBatch(
+                        shapes.subList(index, chunkEnd + 1));
+                if (candidate.getBytes(StandardCharsets.UTF_8).length
+                        > MUTATION_BATCH_MAX_PAYLOAD_BYTES) {
+                    break;
+                }
+                payload = candidate;
+                chunkEnd++;
+            }
+
+            enqueueFrame(MessageCodec.encode(
+                    new Message(MessageType.MUTATION_BATCH, payload)));
+            index = chunkEnd;
+        }
     }
 
     /**
@@ -581,7 +644,8 @@ public final class NetworkClient implements AutoCloseable {
     }
 
     /**
-     * Last measured TCP RTT in milliseconds from {@code PONG}, or {@code -1} before the first
+     * Rolling average TCP RTT in milliseconds over the last up to
+     * {@value #PING_ROLLING_WINDOW} {@code PONG} samples, or {@code -1} before the first
      * successful measurement.
      */
     public SimpleLongProperty pingProperty() {
@@ -1302,6 +1366,18 @@ public final class NetworkClient implements AutoCloseable {
      * First server message after handshake proves the session is live; flush any
      * deferred {@code JOIN_ROOM} queued from the UI before this point.
      */
+    private void deliverSnapshot(List<Shape> shapes) {
+        noteProtocolReady();
+        if (!lastSnapshotBoardId.isBlank()) {
+            currentBoardId = lastSnapshotBoardId;
+            ensureBoardKnown(currentBoardId);
+        }
+        log.info("SNAPSHOT received: {} shape(s)", shapes.size());
+        for (CanvasUpdateListener listener : listeners) {
+            listener.onSnapshotReceived(shapes);
+        }
+    }
+
     private void noteProtocolReady() {
         if (!protocolReady.compareAndSet(false, true)) {
             return;
@@ -1329,15 +1405,25 @@ public final class NetworkClient implements AutoCloseable {
                     log.error("SNAPSHOT decode failed — ignoring frame: {}", e.getMessage(), e);
                     break;
                 }
-                noteProtocolReady();
-                if (!lastSnapshotBoardId.isBlank()) {
-                    currentBoardId = lastSnapshotBoardId;
-                    ensureBoardKnown(currentBoardId);
+                if (shapes.isEmpty()) {
+                    snapshotHydrating = true;
+                    snapshotHydrationBuffer.clear();
+                    if (!lastSnapshotBoardId.isBlank()) {
+                        currentBoardId = lastSnapshotBoardId;
+                        ensureBoardKnown(currentBoardId);
+                    }
+                    log.debug("SNAPSHOT hydration started");
+                    break;
                 }
-                log.info("SNAPSHOT received: {} shape(s)", shapes.size());
-                for (CanvasUpdateListener listener : listeners) {
-                    listener.onSnapshotReceived(shapes);
-                }
+                snapshotHydrating = false;
+                snapshotHydrationBuffer.clear();
+                deliverSnapshot(shapes);
+            }
+            case SNAPSHOT_END -> {
+                snapshotHydrating = false;
+                List<Shape> shapes = List.copyOf(snapshotHydrationBuffer);
+                snapshotHydrationBuffer.clear();
+                deliverSnapshot(shapes);
             }
             case MUTATION -> {
                 Shape shape;
@@ -1350,6 +1436,27 @@ public final class NetworkClient implements AutoCloseable {
                 log.debug("MUTATION received: objectId={}", shape.objectId());
                 for (CanvasUpdateListener listener : listeners) {
                     listener.onMutationReceived(shape);
+                }
+            }
+            case MUTATION_BATCH -> {
+                List<Shape> batch;
+                try {
+                    batch = ClientShapeCodec.decodeMutationBatch(msg.payload());
+                } catch (Exception e) {
+                    log.warn("MUTATION_BATCH decode failed — ignoring: {}", e.getMessage());
+                    break;
+                }
+                if (snapshotHydrating) {
+                    snapshotHydrationBuffer.addAll(batch);
+                    log.debug("SNAPSHOT batch buffered: {} shape(s), total {}",
+                            batch.size(), snapshotHydrationBuffer.size());
+                    break;
+                }
+                log.debug("MUTATION_BATCH received: {} shape(s)", batch.size());
+                for (Shape shape : batch) {
+                    for (CanvasUpdateListener listener : listeners) {
+                        listener.onMutationReceived(shape);
+                    }
                 }
             }
             case SHAPE_START -> {
@@ -1771,7 +1878,20 @@ public final class NetworkClient implements AutoCloseable {
 
     private void applyPingRtt(long originTimestamp) {
         long rtt = Math.max(0L, System.currentTimeMillis() - originTimestamp);
-        runOnFxThreadIfPossible(() -> ping.set(rtt));
+        runOnFxThreadIfPossible(() -> recordPingSample(rtt));
+    }
+
+    private void recordPingSample(long rtt) {
+        pingSamples[pingSampleWriteIndex] = rtt;
+        pingSampleWriteIndex = (pingSampleWriteIndex + 1) % PING_ROLLING_WINDOW;
+        if (pingSampleCount < PING_ROLLING_WINDOW) {
+            pingSampleCount++;
+        }
+        long sum = 0L;
+        for (int i = 0; i < pingSampleCount; i++) {
+            sum += pingSamples[i];
+        }
+        ping.set(sum / pingSampleCount);
     }
 
     /**
@@ -1976,6 +2096,17 @@ public final class NetworkClient implements AutoCloseable {
             return GSON.toJson(envelope);
         }
 
+        /** Serialises shapes to a JSON array (for outgoing MUTATION_BATCH frames). */
+        static String encodeMutationBatch(List<Shape> shapes) {
+            JsonArray array = new JsonArray(shapes.size());
+            for (Shape shape : shapes) {
+                JsonObject envelope = GSON.toJsonTree(shape).getAsJsonObject();
+                envelope.addProperty(TYPE_FIELD, shape.getClass().getSimpleName());
+                array.add(envelope);
+            }
+            return GSON.toJson(array);
+        }
+
         /** Deserialises all shapes from a SNAPSHOT payload. */
         static List<Shape> decodeSnapshot(String payload) {
             JsonArray array = JsonParser.parseString(payload).getAsJsonArray();
@@ -1989,6 +2120,11 @@ public final class NetworkClient implements AutoCloseable {
         /** Deserialises a single shape from a MUTATION payload. */
         static Shape decodeMutation(String payload) {
             return fromEnvelope(JsonParser.parseString(payload).getAsJsonObject());
+        }
+
+        /** Deserialises all shapes from a MUTATION_BATCH payload. */
+        static List<Shape> decodeMutationBatch(String payload) {
+            return decodeSnapshot(payload);
         }
 
         private static Shape fromEnvelope(JsonObject envelope) {

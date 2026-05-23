@@ -11,6 +11,7 @@ import com.distrisync.model.TextNode;
 import com.google.gson.*;
 
 import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -34,8 +35,17 @@ import java.util.UUID;
  *
  * <h2>MUTATION payload</h2>
  * A single envelope JSON object.
+ *
+ * <h2>MUTATION_BATCH payload</h2>
+ * A JSON array of envelopes — same wire format as {@code SNAPSHOT}.
  */
 final class ShapeCodec {
+
+    /** Max shapes per {@code MUTATION_BATCH} frame (matches client). */
+    static final int MUTATION_BATCH_MAX_SHAPES = 20;
+
+    /** Max UTF-8 payload bytes per {@code MUTATION_BATCH} frame (matches client). */
+    static final int MUTATION_BATCH_MAX_PAYLOAD_BYTES = 48_000;
 
     /** Discriminator field name injected into every envelope. */
     private static final String TYPE_FIELD = "_type";
@@ -89,6 +99,48 @@ final class ShapeCodec {
         return GSON.toJson(toEnvelope(shape));
     }
 
+    /**
+     * Serialises a collection of shapes to a JSON array of envelopes.
+     * Used as the payload of a {@code MUTATION_BATCH} message.
+     */
+    static String encodeMutationBatch(Collection<Shape> shapes) {
+        return encodeSnapshot(shapes);
+    }
+
+    /**
+     * Splits {@code shapes} into {@code MUTATION_BATCH} payload strings that respect
+     * {@link #MUTATION_BATCH_MAX_SHAPES} and {@link #MUTATION_BATCH_MAX_PAYLOAD_BYTES}.
+     */
+    static List<String> chunkMutationBatchPayloads(List<Shape> shapes) {
+        if (shapes == null) {
+            throw new IllegalArgumentException("shapes must not be null");
+        }
+        if (shapes.isEmpty()) {
+            return List.of();
+        }
+
+        List<String> payloads = new ArrayList<>();
+        int index = 0;
+        while (index < shapes.size()) {
+            int chunkEnd = index + 1;
+            String payload = encodeMutationBatch(shapes.subList(index, chunkEnd));
+
+            while (chunkEnd < shapes.size()
+                    && chunkEnd - index < MUTATION_BATCH_MAX_SHAPES) {
+                String candidate = encodeMutationBatch(shapes.subList(index, chunkEnd + 1));
+                if (candidate.getBytes(StandardCharsets.UTF_8).length > MUTATION_BATCH_MAX_PAYLOAD_BYTES) {
+                    break;
+                }
+                payload = candidate;
+                chunkEnd++;
+            }
+
+            payloads.add(payload);
+            index = chunkEnd;
+        }
+        return payloads;
+    }
+
     // -------------------------------------------------------------------------
     // Decoding
     // -------------------------------------------------------------------------
@@ -114,6 +166,13 @@ final class ShapeCodec {
             shapes.add(fromEnvelope(el.getAsJsonObject()));
         }
         return shapes;
+    }
+
+    /**
+     * Deserialises all shapes from a {@code MUTATION_BATCH} payload string.
+     */
+    static List<Shape> decodeMutationBatch(String payload) {
+        return decodeSnapshot(payload);
     }
 
     // -------------------------------------------------------------------------

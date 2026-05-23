@@ -1,6 +1,6 @@
 # DistriSync — Distributed Collaborative Whiteboard
 
-**Architectured by:** Harrison Nguyen
+**Engineered by:** Harrison Nguyen
 
 ![Java](https://img.shields.io/badge/Java-21-007396?logo=openjdk&logoColor=white)
 ![JavaFX](https://img.shields.io/badge/JavaFX-21.0.4-blue?logo=java&logoColor=white)
@@ -37,7 +37,13 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **MS Paint–Style Text Tool** — clicking the canvas in `TEXT` mode opens a floating `TextField` directly on the control pane. Keystrokes are throttled and transmitted as `TEXT_UPDATE` frames (~50 ms interval); peers render a ghost `VBox` with a live caret (`▏`) on their cursor pane. Pressing Enter commits a `TextNode` via `MUTATION` + `SHAPE_COMMIT`, which dismisses all ghost previews.
 
-- **Object Eraser with Spatial Hit-Testing** — the **ERASER** tool deletes committed shapes by geometry, not white-stroke masking. `EraserSpatialIntersection` hit-tests the canvas at `(x, y)` using `ShapeSpatialQuery` (AABB rejection, then precise intersection for `CIRCLE` or `SQUARE` brush geometry from `EraserType`). The topmost non-`EraserPath` shape by Lamport `timestamp` is removed locally and propagated via `UNDO_REQUEST` → server `SHAPE_DELETE`. `EraserCursorFactory` supplies a brush-sized custom cursor; circle/square mode is toggled through `GlobalCanvasContext.activeEraserTypeProperty()`.
+- **Object Eraser with Spatial Hit-Testing** — the **ERASER** tool deletes committed shapes by geometry, not white-stroke masking. `EraserSpatialIntersection` queries a client-side `SpatialHashGrid` (200 px uniform cells, keyed from each shape's AABB) so only shapes in the brush cell are considered; `ShapeSpatialQuery` then applies precise intersection for `CIRCLE` or `SQUARE` brush geometry from `EraserType`. The topmost non-`EraserPath` shape by Lamport `timestamp` wins and is removed locally via `UNDO_REQUEST` → server `SHAPE_DELETE`. The grid is kept in sync on snapshot, mutation, and delete paths in `WhiteboardApp`. `EraserCursorFactory` supplies a brush-sized custom cursor; circle/square mode is toggled through `GlobalCanvasContext.activeEraserTypeProperty()`.
+
+- **Freehand `MUTATION_BATCH` & Chunked Snapshots** — **FREEHAND** commits stroke segments as one or few `MUTATION_BATCH` (`0x24`) frames (max 20 shapes / 48 KiB UTF-8 payload per frame) instead of per-segment `MUTATION` storms. On join and board switch, the server sends `SNAPSHOT` `[]`, streams board state as `MUTATION_BATCH` frames, then `SNAPSHOT_END` (`0x25`); `NetworkClient` buffers batches until `SNAPSHOT_END` before delivering a single snapshot to the UI. WAL replay, compaction, and Redis backplane fan-out use the same batch format.
+
+- **Incremental Base-Canvas Painting** — after hydration, committed shapes are appended with `paintShapeOnBaseCanvas` (per-shape draw) instead of full-layer clears on every `MUTATION` / `MUTATION_BATCH`, keeping large boards responsive. Full `redrawBaseCanvas` still runs on scoped clears, deletes, and board switches.
+
+- **UDP Audio Relay Rate Limiting** — each `ClientSession` owns a token bucket (burst 50, refill 1 token / 20 ms ≈ 50 pkt/s) checked in `NioServer.handleUdpRead` before room fan-out; excess push-to-talk packets are dropped silently to bound amplification.
 
 - **Scoped `CLEAR_USER_SHAPES`** — the "Clear Board" button sends a `CLEAR_USER_SHAPES` frame carrying only the issuing client's `clientId`. The server calls `CanvasStateManager.clearUserShapes(clientId)` and broadcasts the scoped clear to peers, who purge only that owner's shapes. No other client's work is affected.
 
@@ -51,7 +57,7 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Session Multiplexing (Rooms & Boards)** — `RoomManager` maintains a `ConcurrentHashMap<String, RoomContext>` of isolated rooms; each `RoomContext` hosts a `ConcurrentHashMap<String, CanvasStateManager>` of independent boards (created lazily per board ID on first access). Rooms are created on first client join and persist even when empty, allowing clients to rejoin and find their original canvas state. Within each room, clients switch boards via `SWITCH_BOARD`, triggering a fresh `SNAPSHOT` and optional `BOARD_LIST_UPDATE`. `NioServer` routes all mutations, live strokes, and relayed frames to peers on the same board (not just the room), providing true board-level isolation.
 
-- **Write-Ahead Log (WAL) with Crash Recovery** — `WalManager` appends every accepted state-mutating frame (`MUTATION`, `SHAPE_DELETE`, `CLEAR_USER_SHAPES`) to a per-room, per-board `{roomId}_{boardId}.wal` file under `distrisync-data/` using `FileChannel` in `APPEND` mode. Boards are replayed lazily when first opened via `RoomContext.getBoard(boardId)`: frames are decoded sequentially from a heap `ByteBuffer`; a truncated tail frame — the typical artefact of a mid-write crash — is silently tolerated and recovery stops at the corrupt offset, returning the clean prefix. Room and board identifiers are sanitised (`[^a-zA-Z0-9_\-]` → `_`) before use as filenames to prevent path traversal.
+- **Write-Ahead Log (WAL) with Crash Recovery** — `WalManager` appends every accepted state-mutating frame (`MUTATION`, `MUTATION_BATCH`, `SHAPE_DELETE`, `CLEAR_USER_SHAPES`) to a per-room, per-board `{roomId}_{boardId}.wal` file under `distrisync-data/` using `FileChannel` in `APPEND` mode. Boards are replayed lazily when first opened via `RoomContext.getBoard(boardId)`: frames are decoded sequentially from a heap `ByteBuffer`; a truncated tail frame — the typical artefact of a mid-write crash — is silently tolerated and recovery stops at the corrupt offset, returning the clean prefix. Room and board identifiers are sanitised (`[^a-zA-Z0-9_\-]` → `_`) before use as filenames to prevent path traversal.
 
 - **Last-Writer-Wins Convergence** — `CanvasStateManager` uses `ConcurrentHashMap.compute` with a strictly-greater-timestamp guard, so concurrent mutations from multiple peers converge without server-side locking or operational transforms.
 
@@ -61,11 +67,11 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Push-to-Talk Voice Chat (`AudioEngine` / `UDP_ADMISSION`)** — `AudioEngine` implements a UDP audio data plane using `javax.sound.sampled` at 8 kHz / 16-bit signed PCM / mono / big-endian (`AUDIO_FORMAT`). Each 10 ms capture frame produces 160 bytes of PCM (`PAYLOAD_SIZE`). Wire datagrams are 196 bytes: a 36-byte null-padded UTF-8 identity token followed by the 160-byte PCM payload. Before audio can flow, the server sends a `UDP_ADMISSION` frame on the TCP channel carrying a `udpToken`; `AudioEngine.onUdpAdmission()` opens a connected `DatagramSocket`, sends a 36-byte registration punch packet, and starts the receive daemon. A dedicated capture thread (`distrisync-audio-capture`) runs at `MAX_PRIORITY`; a permanent receive daemon (`distrisync-audio-recv`) plays back incoming PCM via a lazily opened `SourceDataLine` with a 1 600-byte hardware buffer. The `UserSpeakingListener` functional interface fires on each received packet so the UI can highlight the active speaker.
 
-- **PING/PONG RTT Telemetry** — after `HANDSHAKE` completion, `NetworkClient` starts a daemon thread (`distrisync-ping`) that fires a `PING` frame every 2 000 ms (`HEARTBEAT_PING_INTERVAL_MS`). Each `PING` payload is `{ "t": <originMillis> }` encoded via `MessageCodec.PingPongPayload`. The server echoes the origin timestamp unchanged in a `PONG` response. On receipt, `applyPingRtt(originTimestamp)` computes `RTT = max(0, System.currentTimeMillis() - originTimestamp)` and updates `SimpleLongProperty ping` on the JavaFX Application Thread. `pingProperty()` exposes the last measured RTT in ms (initial value `-1` before first measurement). `ingestPongForTelemetryTest(Message)` is a package-private test hook that drives the full RTT path without a live TCP connection.
+- **PING/PONG RTT Telemetry** — after `HANDSHAKE` completion, `NetworkClient` starts a daemon thread (`distrisync-ping`) that fires a `PING` frame every 5 000 ms (`HEARTBEAT_PING_INTERVAL_MS`). Each `PING` payload is `{ "t": <originMillis> }` encoded via `MessageCodec.PingPongPayload`. The server echoes the origin timestamp unchanged in a `PONG` response. On receipt, `applyPingRtt(originTimestamp)` records each sample and updates `SimpleLongProperty ping` on the JavaFX Application Thread with the rolling average of the last 10 RTT measurements (initial value `-1` before first measurement). `ingestPongForTelemetryTest(Message)` is a package-private test hook that drives the full RTT path without a live TCP connection.
 
 - **Server-Side Traffic Metrics Heartbeat** — `NioServer` maintains two lock-free counters: `AtomicLong bytesRouted` accumulates the total octets delivered across all TCP board fan-out writes and UDP audio relay sends (one increment per recipient per frame); `AtomicInteger activeTcpSockets` is incremented on each `OP_ACCEPT` and decremented on each channel close, providing a live socket gauge. A `ScheduledExecutorService` on the `distrisync-traffic-metrics` thread emits a structured `[METRICS]` log line every 10 seconds via `emitTrafficHeartbeat()`, recording `bytesRouted`, `roomManager.getActiveRoomCount()`, and `activeTcpSockets`. No external metrics library is required; Logback with the Jansi ANSI console appender provides coloured, human-readable output.
 
-- **Telemetry HUD** — `WhiteboardApp.wireTelemetryHud(NetworkClient)` constructs a bottom-right overlay `HBox` (CSS classes `.telemetry-hud` + `.telemetry-pill`) with three monospace label segments styled `.telemetry-hud-line`, separated by `.telemetry-hud-sep` dividers. Labels are bound directly to `tcpConnectedProperty()`, `udpActiveProperty()`, and `pingProperty()` via JavaFX property bindings; the ping label displays `"Ping: —"` while the initial value is `< 0` and `"Ping: Nms"` once the first PONG is processed.
+- **Performance HUD** — bottom-right overlay (CSS `.telemetry-hud` + `.telemetry-pill`) shows `Ping: Nms | FPS: N`, refreshed every second. Ping uses `NetworkClient.pingProperty()` (rolling average of the last 10 PONGs). FPS is sampled by a JavaFX `AnimationTimer` on the canvas scene; timers start when the workspace is shown and stop on `leaveCanvasRoom`.
 
 - **Collapsible Tools Drawer (`ToolsDrawerToggleModel`)** — drawer open/close state is extracted from `WhiteboardApp` into a pure `ToolsDrawerToggleModel`, making animation geometry (slide target X, chevron labels, panel translate X) fully unit-testable without a JavaFX runtime. The `ToggleRestSnapshot` record captures the complete settled UI state after a toggle for deterministic assertions in `ToolsDrawerToggleModelTest`.
 
@@ -73,7 +79,7 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Global Canvas Context & Shape Factory** — `GlobalCanvasContext` centralises active stroke colour (`ObjectProperty<Color>`), stroke width (`DoubleProperty`), and eraser brush geometry (`EraserType` circle vs square). `GlobalCanvasShapeFactory` commits `Line`, `Circle`, `RectangleNode`, `EllipseNode`, `ArrowNode`, and `TextNode` instances using the current context, keeping the properties bar and network payloads consistent.
 
-- **Room RBAC (`RoomPermissions`)** — bitmask permissions on `ClientSession` and `Participant`. `OWNER` grants draw, speak, manage users, delete room, manage room settings, and manage media; `MEMBER` grants draw + speak; `SPECTATOR` is lobby-only. Server rejects `MUTATION` / live strokes without `PERM_DRAW`, UDP audio without `PERM_SPEAK`, `MODERATION_ACTION` without `PERM_MANAGE_USERS`, `TOGGLE_BOARD_LOCK` / `DELETE_BOARD` without `PERM_MANAGE_ROOM`, and `MEDIA_CONTROL` without `PERM_MANAGE_MEDIA`.
+- **Room RBAC (`RoomPermissions`)** — bitmask permissions on `ClientSession` and `Participant`. `OWNER` grants draw, speak, manage users, delete room, manage room settings, and manage media; `MEMBER` grants draw + speak; `SPECTATOR` is lobby-only. Server rejects `MUTATION` / `MUTATION_BATCH` / live strokes without `PERM_DRAW`, UDP audio without `PERM_SPEAK`, `MODERATION_ACTION` without `PERM_MANAGE_USERS`, `TOGGLE_BOARD_LOCK` / `DELETE_BOARD` without `PERM_MANAGE_ROOM`, and `MEDIA_CONTROL` without `PERM_MANAGE_MEDIA`.
 
 - **Host Election & `ROLE_UPDATE`** — first joiner becomes host with `OWNER` permissions. On host disconnect, `NioServer.selectHostCandidate` promotes the longest-connected peer and fans out `ROLE_UPDATE` (`0x1D`, `{ newHostClientId, newPermissions, roomHostClientId? }`) so every client updates crowns and local capability flags.
 
@@ -143,6 +149,7 @@ distrisync/
 │   │   │   │   ├── GlobalCanvasShapeFactory.java
 │   │   │   │   ├── EraserType.java
 │   │   │   │   ├── EraserSpatialIntersection.java
+│   │   │   │   ├── SpatialHashGrid.java
 │   │   │   │   ├── EraserCursorFactory.java
 │   │   │   │   ├── ShapeSpatialQuery.java
 │   │   │   │   ├── ShapeMathUtils.java
@@ -198,6 +205,7 @@ distrisync/
 │           │   ├── AudioEngineTest.java
 │           │   ├── CanvasViewportResizeHandlerTest.java
 │           │   ├── EraserSpatialIntersectionTest.java
+│           │   ├── SpatialHashGridTest.java
 │           │   ├── NetworkClientTelemetryTest.java
 │           │   ├── ParticipantManagerTest.java
 │           │   ├── CollaborationRosterModerationTest.java
@@ -220,7 +228,9 @@ distrisync/
 │               ├── backplane/          # Redis publisher/subscriber tests
 │               ├── CanvasStateManagerTest.java
 │               ├── ClientSessionBackpressureTest.java
+│               ├── ClientSessionUdpRateLimitTest.java
 │               ├── MetricsHttpServerTest.java
+│               ├── NioServerChunkedSnapshotTest.java
 │               ├── NioServerDistributedHydrationTest.java
 │               ├── NioServerRemoteAuthorityTest.java
 │               ├── NioServerRemoteMailboxTest.java
@@ -245,6 +255,7 @@ distrisync/
 │               ├── ServerMetricsFlushTest.java
 │               ├── ServerMetricsTest.java
 │               ├── ShapeCodecNewShapesTest.java
+│               ├── ShapeCodecMutationBatchTest.java
 │               └── WalManagerTest.java
 ├── docs/
 │   └── Architecture.md
@@ -261,7 +272,7 @@ distrisync/
 | `MessageType` | Byte | Direction | Persisted to WAL | Description |
 |---|---|---|---|---|
 | `HANDSHAKE` | `0x01` | C → S | No | Client identification (`clientId`, `authorName`) |
-| `SNAPSHOT` | `0x02` | S → C | No | Full canvas state on connect / reconnect / board switch |
+| `SNAPSHOT` | `0x02` | S → C | No | Join/board-switch hydration header (`[]`) or legacy full state; chunked joins stream shapes via `MUTATION_BATCH` until `SNAPSHOT_END` |
 | `MUTATION` | `0x03` | C ↔ S | **Yes** | Committed shape add/update; broadcast to board peers |
 | `UDP_POINTER` | `0x04` | UDP only | No | Ephemeral cursor position (multicast, not TCP) |
 | `SHAPE_START` | `0x05` | C ↔ S | No | Begin live stroke; relayed to board peers, not persisted |
@@ -277,7 +288,7 @@ distrisync/
 | `SWITCH_BOARD` | `0x0F` | C → S | No | JSON string target board id; server responds with `SNAPSHOT` |
 | `BOARD_LIST_UPDATE` | `0x10` | S → C | No | JSON array of board id strings actively in use within the room |
 | `UDP_ADMISSION` | `0x11` | S → C | No | JSON object `{ udpToken }` granting access to the UDP audio data plane; client calls `AudioEngine.onUdpAdmission()` on receipt |
-| `PING` | `0x12` | C → S | No | JSON object `{ "t": <originMillis> }` sent every 2 000 ms by `distrisync-ping` thread; server must be post-handshake |
+| `PING` | `0x12` | C → S | No | JSON object `{ "t": <originMillis> }` sent every 5 000 ms by `distrisync-ping` thread; server must be post-handshake |
 | `PONG` | `0x13` | S → C | No | JSON object `{ "t": <originMillis> }` — server echoes the origin timestamp unchanged; client computes `RTT = now - t` |
 | `DELETE_ROOM` | `0x14` | C → S | No | JSON object `{ roomId }` requesting durable room teardown; valid from lobby or the same active room |
 | `ROOM_DELETED` | `0x15` | S → C | No | Empty payload notifying occupants that their room was deleted; clients clear room/board state and return to lobby |
@@ -295,6 +306,8 @@ distrisync/
 | `BOARD_DELETED` | `0x21` | S → room | No | JSON string `boardId` — board was removed; clients update switcher and drop cached thumbnails |
 | `MEDIA_STATE_UPDATE` | `0x22` | S → room | No | `{ state, mediaTimeSeconds, serverEpochMs, videoId }` — authoritative room-global media snapshot (server-anchored clock) |
 | `MEDIA_CONTROL` | `0x23` | C → S | No | `{ action, requestedTime, targetId }` — `PLAY` / `PAUSE` / `SEEK` / `LOAD` / `STOP`; requires `PERM_MANAGE_MEDIA` |
+| `MUTATION_BATCH` | `0x24` | C ↔ S | **Yes** | Batched committed shapes (e.g. freehand segments). Payload: JSON array of shape envelopes (same as `SNAPSHOT`); one WAL entry and one peer broadcast per frame |
+| `SNAPSHOT_END` | `0x25` | S → C | No | End of chunked snapshot hydration (empty payload); client applies buffered join state |
 
 ---
 

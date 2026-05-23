@@ -10,7 +10,9 @@ import com.distrisync.protocol.MessageCodec;
 import com.distrisync.protocol.MessageCodec.LobbyRoomEntry;
 import com.distrisync.protocol.MessageType;
 import com.distrisync.protocol.PartialMessageException;
+import javafx.application.Platform;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -49,6 +51,15 @@ class NioServerTest {
     private NioServer server;
     private Thread serverThread;
     private int serverPort;
+
+    @BeforeAll
+    static void initJavaFxToolkit() {
+        try {
+            Platform.startup(() -> { });
+        } catch (IllegalStateException ignored) {
+            // Toolkit already started by another test class in the same JVM.
+        }
+    }
 
     @AfterEach
     void tearDown() throws InterruptedException {
@@ -454,6 +465,88 @@ class NioServerTest {
             clientA.close();
             clientB.close();
             clientC.close();
+        }
+    }
+
+    /**
+     * A client flooding UDP audio cannot relay more than the per-session token bucket allows
+     * (~50 burst + limited refill during the flood).
+     */
+    @Test
+    @DisplayName("UDP audio flood is rate-limited before room fan-out")
+    void testUdpAudioRelayRateLimited() throws Exception {
+        startServer();
+
+        String idA = "11111111-1111-1111-1111-111111111111";
+        String idB = "22222222-2222-2222-2222-222222222222";
+
+        NetworkClient clientA = new NetworkClient(HOST, serverPort, "UserA", idA);
+        NetworkClient clientB = new NetworkClient(HOST, serverPort, "UserB", idB);
+
+        try (DatagramChannel udpA = DatagramChannel.open();
+             DatagramChannel udpB = DatagramChannel.open()) {
+
+            udpA.configureBlocking(true);
+            udpB.configureBlocking(false);
+            udpA.bind(new InetSocketAddress(HOST, 0));
+            udpB.bind(new InetSocketAddress(HOST, 0));
+
+            clientA.connect();
+            clientB.connect();
+            clientA.sendJoinRoom("Room-1", "Board-1");
+            clientB.sendJoinRoom("Room-1", "Board-1");
+
+            await("sessions joined Room-1")
+                    .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
+                    .pollInterval(POLL_MS, TimeUnit.MILLISECONDS)
+                    .until(() -> findSession(roomManager, "Room-1", idA) != null
+                            && findSession(roomManager, "Room-1", idB) != null);
+
+            ClientSession sessionA = findSession(roomManager, "Room-1", idA);
+            ClientSession sessionB = findSession(roomManager, "Room-1", idB);
+            InetSocketAddress serverUdp = new InetSocketAddress(HOST, serverPort);
+
+            udpClientSendRegistration(udpA, serverUdp, sessionA.udpToken);
+            udpClientSendRegistration(udpB, serverUdp, sessionB.udpToken);
+
+            await("UDP endpoints registered")
+                    .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
+                    .pollInterval(POLL_MS, TimeUnit.MILLISECONDS)
+                    .until(() -> sessionA.udpEndpoint != null && sessionB.udpEndpoint != null);
+
+            byte[] pcmSuffix = new byte[160];
+            ByteBuffer audio = ByteBuffer.allocate(36 + pcmSuffix.length);
+            audio.put(sessionA.udpToken.getBytes(StandardCharsets.UTF_8));
+            audio.put(pcmSuffix);
+            audio.flip();
+
+            final int floodCount = 200;
+            for (int i = 0; i < floodCount; i++) {
+                audio.rewind();
+                udpA.send(audio, serverUdp);
+            }
+
+            int relayedToB = 0;
+            long collectUntil = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(500);
+            ByteBuffer inbound = ByteBuffer.allocate(2048);
+            while (System.nanoTime() < collectUntil) {
+                inbound.clear();
+                if (udpB.receive(inbound) != null) {
+                    relayedToB++;
+                } else {
+                    Thread.sleep(2);
+                }
+            }
+
+            assertThat(relayedToB)
+                    .as("some flooded packets must still be relayed under the burst allowance")
+                    .isGreaterThan(0);
+            assertThat(relayedToB)
+                    .as("relay count must stay near token-bucket cap, not floodCount=%d", floodCount)
+                    .isLessThanOrEqualTo(70);
+        } finally {
+            clientA.close();
+            clientB.close();
         }
     }
 

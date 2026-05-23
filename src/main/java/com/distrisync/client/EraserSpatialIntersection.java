@@ -5,14 +5,12 @@ import com.distrisync.model.Shape;
 import com.distrisync.server.CanvasStateManager;
 
 import java.util.ArrayDeque;
-import java.util.Collection;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.function.Supplier;
 
 /**
  * Object eraser: spatial hit-test against committed shapes and queue
@@ -26,17 +24,19 @@ public final class EraserSpatialIntersection {
 
     public record QueuedOperation(Operation operation, UUID shapeId) {}
 
-    private final Supplier<Collection<Shape>> shapesView;
+    private final SpatialHashGrid spatialGrid;
     private final Deque<QueuedOperation> pendingDeletes = new ArrayDeque<>();
 
-    public EraserSpatialIntersection(Supplier<Collection<Shape>> shapesView) {
-        this.shapesView = Objects.requireNonNull(shapesView, "shapesView");
+    public EraserSpatialIntersection(SpatialHashGrid spatialGrid) {
+        this.spatialGrid = Objects.requireNonNull(spatialGrid, "spatialGrid");
     }
 
-    /** Uses {@link CanvasStateManager#snapshot()} as the authoritative shape store. */
+    /** Builds a grid from {@link CanvasStateManager#snapshot()} for unit tests. */
     public static EraserSpatialIntersection forStateManager(CanvasStateManager stateManager) {
         Objects.requireNonNull(stateManager, "stateManager");
-        return new EraserSpatialIntersection(stateManager::snapshot);
+        SpatialHashGrid grid = new SpatialHashGrid();
+        stateManager.snapshot().forEach(grid::insert);
+        return new EraserSpatialIntersection(grid);
     }
 
     /**
@@ -62,7 +62,7 @@ public final class EraserSpatialIntersection {
 
     private Optional<Shape> findTopmostIntersecting(
             double x, double y, double eraserSize, EraserType eraserType) {
-        return shapesView.get().stream()
+        return spatialGrid.query(x, y).stream()
                 .filter(s -> !(s instanceof EraserPath))
                 .filter(s -> ShapeSpatialQuery.intersectsEraser(x, y, eraserSize, eraserType, s))
                 .max(Comparator.comparingLong(Shape::timestamp));

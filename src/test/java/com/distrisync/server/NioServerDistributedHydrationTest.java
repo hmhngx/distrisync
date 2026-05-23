@@ -114,7 +114,7 @@ class NioServerDistributedHydrationTest {
 
             List<Message> walRecords = walManager.recover(ROOM_ID, BOARD_ID);
             assertThat(walRecords).hasSize(1);
-            assertThat(walRecords.get(0).type()).isEqualTo(MessageType.MUTATION);
+            assertThat(walRecords.get(0).type()).isEqualTo(MessageType.MUTATION_BATCH);
 
             assertThat(nodeB.isEventIdRecorded(snapshotEnvelope.eventId())).isTrue();
 

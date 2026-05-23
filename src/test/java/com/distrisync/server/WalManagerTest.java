@@ -16,6 +16,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -738,8 +739,8 @@ class WalManagerTest {
      *   <li><b>Compaction phase</b> — a {@link CanvasStateManager} with exactly
      *       <em>one</em> surviving {@link Circle} shape (the last-writer-wins
      *       in-memory truth) is constructed.  {@link WalManager#compactWal} is
-     *       invoked with the snapshot, which serialises the single shape as one
-     *       {@code MUTATION} frame, writes it to a temp file, and atomically
+     *       invoked with the snapshot, which serialises shapes as chunked
+     *       {@code MUTATION_BATCH} frame(s), writes them to a temp file, and atomically
      *       replaces the active WAL via
      *       {@link java.nio.file.Files#move} + {@code ATOMIC_MOVE}.</li>
      *   <li><b>Recovery phase</b> — a brand-new {@link WalManager} instance bound
@@ -757,7 +758,7 @@ class WalManagerTest {
      *       than the bloated file; in practice the ratio is ~14× (100 × 33-byte
      *       frames → ~3 300 B, down to 1 × ~230-byte frame).</li>
      *   <li><b>Absolute upper bound</b> — compacted file fits within 1 KiB,
-     *       confirming it is a single {@code MUTATION} frame, not the full old log.</li>
+     *       confirming it is a minimal {@code MUTATION_BATCH} snapshot, not the full old log.</li>
      *   <li><b>Temp-file cleanup</b> — {@code {roomId}.wal.tmp} must not exist
      *       after successful compaction; it was atomically renamed to {@code .wal}.</li>
      *   <li><b>Shape count</b> — the compacted WAL replays into exactly 1 shape
@@ -765,16 +766,16 @@ class WalManagerTest {
      *   <li><b>Shape identity</b> — the recovered shape carries the same
      *       {@link Shape#objectId()} as the shape passed to {@code compactWal}.</li>
      *   <li><b>Lamport timestamp fidelity</b> — the recovered shape retains the
-     *       exact {@link Shape#timestamp()} value, proving the MUTATION frame
+     *       exact {@link Shape#timestamp()} value, proving the batch frame
      *       encoded the full shape record without truncation.</li>
      * </ol>
      *
-     * <h2>Why {@code MUTATION} frames, not {@code SHAPE_COMMIT}</h2>
-     * The WAL recovery path in {@link RoomContext} only replays {@code MUTATION},
-     * {@code SHAPE_DELETE}, and {@code CLEAR_USER_SHAPES} frames.
+     * <h2>Why {@code MUTATION_BATCH}, not {@code SHAPE_COMMIT}</h2>
+     * The WAL recovery path in {@link RoomContext} replays {@code MUTATION},
+     * {@code MUTATION_BATCH}, {@code SHAPE_DELETE}, and {@code CLEAR_USER_SHAPES}.
      * {@code SHAPE_COMMIT} frames would be silently skipped, leaving the canvas
      * empty after a post-compaction restart.  This test implicitly verifies that
-     * {@link WalManager#compactWal} writes the correct frame type.
+     * {@link WalManager#compactWal} writes the correct durable frame type.
      */
     @Test
     void testWalCompaction_ReducesFileSizeAndRetainsState() throws IOException {
@@ -813,7 +814,7 @@ class WalManagerTest {
                     .as("pre-condition: the canvas must contain exactly 1 shape before compaction")
                     .hasSize(1);
 
-            // Compact: replace the 100-frame WAL with a single MUTATION frame.
+            // Compact: replace the 100-frame WAL with a minimal MUTATION_BATCH snapshot.
             wal.compactWal(ROOM, BOARD, snapshot);
 
             long compactedSize = wal.walFileSize(ROOM, BOARD);
@@ -854,7 +855,7 @@ class WalManagerTest {
             // ── 6. Shape count ─────────────────────────────────────────────────
             assertThat(recovered.getBoard(BOARD).size())
                     .as("recovered CanvasStateManager must contain exactly 1 shape — " +
-                        "compaction must have written exactly one MUTATION frame (the surviving shape), " +
+                        "compaction must have written a MUTATION_BATCH snapshot (the surviving shape), " +
                         "not the 100 stale SHAPE_COMMIT frames it replaced")
                     .isEqualTo(1);
 
@@ -869,8 +870,102 @@ class WalManagerTest {
             // ── 8. Lamport timestamp fidelity ──────────────────────────────────
             assertThat(recoveredShapes.get(0).timestamp())
                     .as("recovered shape must retain the exact Lamport timestamp (9000) from the original — " +
-                        "ShapeCodec.encodeMutation must not truncate or reset the timestamp field")
+                        "ShapeCodec.encodeMutationBatch must not truncate or reset the timestamp field")
                     .isEqualTo(9_000L);
+        }
+    }
+
+    // =========================================================================
+    // replayStreamsManyFramesWithoutLoadingWholeFile
+    // =========================================================================
+
+    /**
+     * {@link WalManager#replay} must decode the same frame sequence as {@link #recover}
+     * using a streaming {@link java.nio.channels.FileChannel} read (no whole-file load).
+     */
+    @Test
+    void replayStreamsManyFramesWithoutLoadingWholeFile() throws IOException {
+        final String ROOM = "StreamRoom";
+        final int FRAME_COUNT = 300;
+
+        try (WalManager wal = new WalManager(tempDir)) {
+            for (int i = 1; i <= FRAME_COUNT; i++) {
+                wal.append(ROOM, BOARD, shapeCommit(i));
+            }
+        }
+
+        Path walFile = tempDir.resolve("StreamRoom_Board-1.wal");
+        assertThat(Files.size(walFile))
+                .as("WAL must exceed the streaming read buffer size so replay cannot be a single-read shortcut")
+                .isGreaterThan(8_192L);
+
+        List<Message> viaReplay = new ArrayList<>();
+        try (WalManager reader = new WalManager(tempDir)) {
+            reader.replay(ROOM, BOARD, viaReplay::add);
+        }
+
+        List<Message> viaRecover;
+        try (WalManager reader = new WalManager(tempDir)) {
+            viaRecover = reader.recover(ROOM, BOARD);
+        }
+
+        assertThat(viaReplay)
+                .as("replay() must return the same number of frames as recover()")
+                .hasSize(FRAME_COUNT);
+        assertThat(viaRecover).hasSize(FRAME_COUNT);
+
+        for (int i = 0; i < FRAME_COUNT; i++) {
+            assertThat(viaReplay.get(i).type()).isEqualTo(viaRecover.get(i).type());
+            assertThat(viaReplay.get(i).payload()).isEqualTo(viaRecover.get(i).payload());
+        }
+    }
+
+    // =========================================================================
+    // testAutoCompactionAfter1001Appends
+    // =========================================================================
+
+    /**
+     * {@link RoomContext#onWalAppended} must compact the WAL after more than
+     * 1000 WAL appends.
+     */
+    @Test
+    void testAutoCompactionAfter1001Appends() throws IOException {
+        final String ROOM = "AutoCompactRoom";
+        UUID survivingId = UUID.fromString("deadbeef-dead-beef-dead-beefdeadbeef");
+        Circle survivingShape = new Circle(
+                survivingId, 5_000L, "#00FF00",
+                10.0, 20.0, 30.0, true, 1.5, "Bob", "client-b");
+
+        try (WalManager wal = new WalManager(tempDir)) {
+            RoomManager roomManager = new RoomManager(wal);
+            RoomContext room = roomManager.getOrCreateRoom(ROOM);
+            CanvasStateManager board = room.getBoard(BOARD);
+            board.applyMutation(survivingShape);
+
+            for (int i = 1; i <= 1000; i++) {
+                roomManager.appendToWal(ROOM, BOARD, shapeCommit(i));
+            }
+
+            long bloatedSize = wal.walFileSize(ROOM, BOARD);
+            assertThat(bloatedSize)
+                    .as("pre-compaction WAL must be large after 1000 append-only noise frames")
+                    .isGreaterThan(2_000L);
+
+            roomManager.appendToWal(ROOM, BOARD, shapeCommit(1001));
+
+            long compactedSize = wal.walFileSize(ROOM, BOARD);
+            assertThat(compactedSize)
+                    .as("auto-compaction on the 1001st append must shrink the WAL to a snapshot")
+                    .isLessThan(bloatedSize / 5L);
+            assertThat(compactedSize)
+                    .isLessThan(1_024L);
+        }
+
+        try (WalManager freshWal = new WalManager(tempDir)) {
+            RoomContext recovered = new RoomContext(ROOM, freshWal);
+            assertThat(recovered.getBoard(BOARD).size()).isEqualTo(1);
+            assertThat(recovered.getBoard(BOARD).snapshot().get(0).objectId()).isEqualTo(survivingId);
+            assertThat(recovered.getBoard(BOARD).snapshot().get(0).timestamp()).isEqualTo(5_000L);
         }
     }
 }

@@ -5,6 +5,8 @@ import com.distrisync.protocol.RoomPermissions;
 
 import javafx.animation.AnimationTimer;
 import javafx.application.Platform;
+import javafx.beans.value.ChangeListener;
+import javafx.beans.value.WeakChangeListener;
 import javafx.concurrent.Worker;
 import javafx.geometry.Pos;
 import javafx.scene.Cursor;
@@ -166,6 +168,15 @@ public final class YoutubePlayerNode extends VBox {
     private MessageCodec.MediaStatePayload lastAppliedState;
     private boolean sliderDragging;
 
+    private ChangeListener<Number> volumeListener;
+    private WeakChangeListener<Number> volumeWeakListener;
+
+    private ChangeListener<Worker.State> loadWorkerStateListener;
+    private WeakChangeListener<Worker.State> loadWorkerStateWeakListener;
+
+    private ChangeListener<Number> permissionsListener;
+    private WeakChangeListener<Number> permissionsWeakListener;
+
     public YoutubePlayerNode(NetworkClient networkClient, ParticipantManager participantManager) {
         if (networkClient == null) {
             throw new IllegalArgumentException("networkClient must not be null");
@@ -294,11 +305,13 @@ public final class YoutubePlayerNode extends VBox {
         HBox volumeContainer = new HBox(8, volIcon, volumeSlider);
         volumeContainer.setAlignment(Pos.CENTER);
 
-        volumeSlider.valueProperty().addListener((obs, oldVal, newVal) -> {
+        volumeListener = (obs, oldVal, newVal) -> {
             if (playerReady.get()) {
                 webEngine.executeScript("window.setVolume(" + newVal.intValue() + ");");
             }
-        });
+        };
+        volumeWeakListener = new WeakChangeListener<>(volumeListener);
+        volumeSlider.valueProperty().addListener(volumeWeakListener);
 
         HBox controlsBar = new HBox(16, playPauseBtn, timelineSlider, timeRow, volumeContainer);
         controlsBar.getStyleClass().add("youtube-controls-bar");
@@ -311,7 +324,7 @@ public final class YoutubePlayerNode extends VBox {
         controlsBar.setPrefHeight(CONTROLS_BAR_HEIGHT);
         controlsBar.setMaxHeight(CONTROLS_BAR_HEIGHT);
 
-        webEngine.getLoadWorker().stateProperty().addListener((obs, old, state) -> {
+        loadWorkerStateListener = (obs, old, state) -> {
             if (state == Worker.State.SUCCEEDED) {
                 JSObject window = (JSObject) webEngine.executeScript("window");
                 window.setMember("javaBridge", javaBridge);
@@ -321,7 +334,9 @@ public final class YoutubePlayerNode extends VBox {
                     pendingServerState = null;
                 }
             }
-        });
+        };
+        loadWorkerStateWeakListener = new WeakChangeListener<>(loadWorkerStateListener);
+        webEngine.getLoadWorker().stateProperty().addListener(loadWorkerStateWeakListener);
 
         ensureLocalServer(PLAYER_HTML);
         webEngine.load("http://127.0.0.1:" + localServerPort + "/");
@@ -329,8 +344,9 @@ public final class YoutubePlayerNode extends VBox {
 
         setEffect(new DropShadow(BlurType.GAUSSIAN, Color.rgb(0, 0, 0, 0.6), 30, 0, 0, 15));
 
-        participantManager.localPermissionsProperty().addListener((obs, old, perms) ->
-                applyMediaPermissions());
+        permissionsListener = (obs, old, perms) -> applyMediaPermissions();
+        permissionsWeakListener = new WeakChangeListener<>(permissionsListener);
+        participantManager.localPermissionsProperty().addListener(permissionsWeakListener);
 
         controlsTimer = new AnimationTimer() {
             @Override
@@ -370,6 +386,21 @@ public final class YoutubePlayerNode extends VBox {
         }
         controlsTimer.stop();
         controlsTimerRunning = false;
+        if (volumeWeakListener != null) {
+            volumeSlider.valueProperty().removeListener(volumeWeakListener);
+        }
+        if (loadWorkerStateWeakListener != null) {
+            webEngine.getLoadWorker().stateProperty().removeListener(loadWorkerStateWeakListener);
+        }
+        if (permissionsWeakListener != null) {
+            participantManager.localPermissionsProperty().removeListener(permissionsWeakListener);
+        }
+        volumeListener = null;
+        volumeWeakListener = null;
+        loadWorkerStateListener = null;
+        loadWorkerStateWeakListener = null;
+        permissionsListener = null;
+        permissionsWeakListener = null;
         try {
             webEngine.executeScript(
                     "if(typeof player !== 'undefined' && player.stopVideo) player.stopVideo();");
