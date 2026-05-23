@@ -11,7 +11,8 @@ import java.util.Map;
  * Wire value  Meaning
  * ----------  -------
  * 0x01        HANDSHAKE    – initial client→server greeting (authorName, clientId); room via JOIN_ROOM
- * 0x02        SNAPSHOT     – full board state sent by server on join
+ * 0x02        SNAPSHOT     – server→client: hydration header (empty JSON array {@code []})
+ *                             or legacy full board state; chunked joins use {@code []} then batches
  * 0x03        MUTATION     – incremental shape add / update
  * 0x04        UDP_POINTER  – ephemeral cursor-position broadcast (fire-and-forget)
  * 0x05        SHAPE_START  – peer begins drawing a new shape (tool, color, origin)
@@ -50,6 +51,9 @@ import java.util.Map;
  *                             payload: { state, mediaTimeSeconds, serverEpochMs, videoId }
  * 0x23        MEDIA_CONTROL     – client→server: room media command (requires PERM_MANAGE_MEDIA)
  *                             payload: { action, requestedTime, targetId } — action: PLAY, PAUSE, SEEK, LOAD
+ * 0x24        MUTATION_BATCH    – client→server: batched committed shapes (e.g. freehand stroke segments)
+ *                             payload: JSON array of shape envelopes (same format as SNAPSHOT)
+ * 0x25        SNAPSHOT_END      – server→client: marks end of chunked snapshot hydration (empty payload)
  * </pre>
  */
 public enum MessageType {
@@ -88,7 +92,9 @@ public enum MessageType {
     DELETE_BOARD     ((byte) 0x20),
     BOARD_DELETED    ((byte) 0x21),
     MEDIA_STATE_UPDATE((byte) 0x22),
-    MEDIA_CONTROL    ((byte) 0x23);
+    MEDIA_CONTROL    ((byte) 0x23),
+    MUTATION_BATCH   ((byte) 0x24),
+    SNAPSHOT_END     ((byte) 0x25);
 
     private final byte wireCode;
 
