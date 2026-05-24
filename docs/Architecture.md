@@ -70,7 +70,7 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 
 | Wire Code | Enum Name          | Direction            | Persisted to WAL | Description                                                                 |
 |-----------|--------------------|----------------------|------------------|-----------------------------------------------------------------------------|
-| `0x01`    | `HANDSHAKE`        | Client → Server      | No               | Initial greeting. Payload: `{ authorName, clientId }`. Populates `ClientSession` metadata. |
+| `0x01`    | `HANDSHAKE`        | Client → Server      | No               | Initial greeting. Payload: `{ clientId }`. Registers session in lobby; legacy `authorName` / `roomId` fields are ignored. |
 | `0x02`    | `SNAPSHOT`         | Server → Client      | No               | Chunked join header: empty JSON array `[]`, or legacy full board payload. Starts hydration; shapes follow as `MUTATION_BATCH` frames until `SNAPSHOT_END`. |
 | `0x03`    | `MUTATION`         | Client ↔ Server      | **Yes**          | Committed shape add/update. Payload: single shape envelope with `_type` discriminator, `objectId` (UUID), `timestamp` (Lamport). |
 | `0x04`    | `UDP_POINTER`      | Client → Server (UDP)| No               | Ephemeral cursor-position broadcast. Fire-and-forget; loss is acceptable.  |
@@ -82,7 +82,7 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x0A`    | `SHAPE_DELETE`     | Server → All peers   | **Yes**          | Server confirms deletion. Payload: `{ "shapeId": "<uuid>" }`. Same ownership gate as `UNDO_REQUEST` when accepted from a client. |
 | `0x0B`    | `TEXT_UPDATE`      | Client → All peers   | No               | Ephemeral live-typing event. Requires `PERM_DRAW`. Payload: `{ objectId, clientId, authorName, x, y, currentText }`. Never written to `shapeMap`; final committed `TextNode` arrives as a `MUTATION`. |
 | `0x0C`    | `LOBBY_STATE`      | Server → Client      | No               | Room discovery snapshot. Payload: JSON array of `{ roomId, userCount }`, merged from active rooms plus persisted WAL stems. |
-| `0x0D`    | `JOIN_ROOM`        | Client ↔ Server      | No               | **Client→server:** `{ roomId, initialBoardId? }`. **Server→peers:** `{ clientId, authorName }` when a member joins. |
+| `0x0D`    | `JOIN_ROOM`        | Client ↔ Server      | No               | **Client→server:** `{ roomId, displayName, initialBoardId? }` (or legacy string room id). **Server→joiner + peers:** `{ clientId, authorName }` with sanitized, deduplicated room display name (§5.7). |
 | `0x0E`    | `LEAVE_ROOM`       | Client ↔ Server      | No               | **Client→server:** empty (return to lobby). **Server→peers:** JSON string `clientId` on depart / kick / disconnect. |
 | `0x0F`    | `SWITCH_BOARD`     | Client → Server      | No               | Switches the active board within the current room workspace. Payload: JSON string board id (e.g. `"Board-1"`). |
 | `0x10`    | `BOARD_LIST_UPDATE`| Server → Client      | No               | Announces room board-index changes for multi-board workspaces. Payload is a JSON array of board id strings. |
@@ -399,6 +399,41 @@ The server may call `flushWriteQueue` when the outbound queue approaches capacit
 Legacy servers may still send a full JSON array in one `SNAPSHOT`; the client detects non-empty payloads and calls `deliverSnapshot` immediately without buffering.
 
 `NioServerChunkedSnapshotTest` and `ShapeCodecMutationBatchTest` lock server chunking and codec round-trips.
+
+### 5.7 Per-Room Display Names
+
+Display identity is **room-scoped**, not global at handshake time.
+
+```
+Client                          NioServer                         Peers
+  │── HANDSHAKE { clientId } ───►│ lobby registration
+  │◄── LOBBY_STATE ──────────────│
+  │── JOIN_ROOM { roomId, displayName, initialBoardId? } ──►│
+  │                              │ sanitizeDisplayName (strip, max 20, clientId fallback)
+  │                              │ deduplicateAuthorName (append " #XXXX" on collision)
+  │                              │ session.authorName = confirmed name
+  │◄── JOIN_ROOM { clientId, authorName } (self) ───────────│
+  │◄── SNAPSHOT / UDP_ADMISSION / … ─────────────────────────│
+  │                              │── JOIN_ROOM broadcast ───►│ roster update
+```
+
+**Server (`NioServer`):**
+
+| Step | Behaviour |
+|------|-----------|
+| `sanitizeDisplayName` | Blank → first 8 chars of `clientId`; otherwise strip and cap at **20** UTF-16 code units |
+| `deduplicateAuthorName` | If another live session in the room already uses the name, append ` #` + 4 hex digits until unique |
+| Self-confirm | Joiner receives `encodeRoomMemberJoined(clientId, authorName)` before the peer fan-out |
+
+**Client (`NetworkClient` / `WhiteboardApp`):**
+
+| Field | Role |
+|-------|------|
+| `displayName` | Last name requested in `sendJoinRoom` |
+| `lockedRoomName` | Server-confirmed name from self `JOIN_ROOM`; used by `effectiveAuthorName()` for shapes, text ghosts, and reconnect `JOIN_ROOM` |
+| Lobby UI | `displayNameField` validated (non-blank); join/create disabled until valid (`WhiteboardAppLobbyDisplayNameTest`) |
+
+`MessageCodec.HandshakePayload` is `{ clientId }` only. `JoinRoomPayload` adds `displayName`. `encodeHandshake(String clientId)` and `encodeJoinRoom(roomId, displayName[, boardId])` reflect the split.
 
 ---
 
@@ -914,7 +949,7 @@ NetworkClient
             └── ObservableList<Participant> participants  ← FX binding surface
 
 Participant
-    ├── StringProperty name
+    ├── StringProperty name          ← server-confirmed `authorName` from `JOIN_ROOM` (§5.7)
     ├── BooleanProperty muted        ← VOICE_STATE
     ├── BooleanProperty speaking     ← UserSpeakingListener / setSpeaking
     ├── StringProperty currentBoardId← BOARD_SWITCH
@@ -1241,7 +1276,7 @@ resumeAfterSessionRevoked()
     └─ publishTcpConnected(true)
 ```
 
-This path intentionally **does not** re-issue `JOIN_ROOM` for the evicted room. Accidental disconnects (EOF / I/O error) still use the normal `reconnect()` loop with deferred join replay. `NetworkClientStateTest` asserts `running` toggles false on kick and true after resume.
+This path intentionally **does not** re-issue `JOIN_ROOM` for the evicted room. Accidental disconnects (EOF / I/O error) still use the normal `reconnect()` loop with deferred join replay, re-sending `JOIN_ROOM` with `resolveReconnectDisplayName()` (`lockedRoomName` when set). `NetworkClientStateTest` asserts `running` toggles false on kick and true after resume.
 
 ---
 
@@ -1270,6 +1305,8 @@ While locked, members requesting a non-existent `initialBoardId` on `JOIN_ROOM` 
 | Layout | Right-aligned slide-out (`VIEW_ID = collaboration-roster`), 250 px panel |
 | Grouping | `VBox` sections per `currentBoardId`, expand/collapse preserved across rebuilds |
 | Host indicator | Crown on row where `clientId == hostClientId` |
+| Speaking | Blue speaker SVG (`.roster-speaking-icon`) toggled from `Participant.isSpeaking`; replaces prior avatar `speaking-ring` |
+| Hardware mute | Slashed mic icon when `Participant.isMuted` |
 | Moderation menu | Context menu: Kick, Revoke Speak, Grant Speak — visible when local `PERM_MANAGE_USERS` |
 | Feedback | `ToastNotification` for kicks, speak changes, session revoked |
 | Board lock | Toggle bound to `RoomState.boardCreationLockedProperty()` |
@@ -1281,9 +1318,9 @@ While locked, members requesting a non-existent `initialBoardId` on `JOIN_ROOM` 
 
 | Direction | Payload | When |
 |-----------|---------|------|
-| C→S `JOIN_ROOM` | `{ roomId, initialBoardId? }` | Client enters room |
-| S→peer `JOIN_ROOM` | `{ clientId, authorName }` | Member joined |
-| C→S `LEAVE_ROOM` | `""` | Client returns to lobby |
+| C→S `JOIN_ROOM` | `{ roomId, displayName, initialBoardId? }` | Client enters room with requested display name |
+| S→joiner + peers `JOIN_ROOM` | `{ clientId, authorName }` | Member joined; `authorName` is server-confirmed (§5.7) |
+| C→S `LEAVE_ROOM` | `""` | Client returns to lobby; clears `lockedRoomName` on client |
 | S→peer `LEAVE_ROOM` | `"clientId"` | Member left, disconnected, or kicked |
 
 `RoomMembershipListener` and `NioServerRoomMembershipBroadcastTest` cover peer join/leave fan-out.
@@ -1493,7 +1530,7 @@ sequenceDiagram
 
 | Step | What is happening |
 |------|-------------------|
-| 1–10 | Client connects, sends `HANDSHAKE`, enters lobby, and then sends `JOIN_ROOM`. `SNAPSHOT` is sent only after join processing. First joiner receives `OWNER` permissions and becomes `hostClientId`. Peers receive server→client `JOIN_ROOM` membership notifications. |
+| 1–10 | Client connects, sends `HANDSHAKE { clientId }`, enters lobby, then `JOIN_ROOM { roomId, displayName }`. Server assigns sanitized/deduplicated `authorName` and echoes self `JOIN_ROOM` before `SNAPSHOT`. First joiner receives `OWNER` permissions and becomes `hostClientId`. Peers receive membership `JOIN_ROOM` notifications. |
 | 11–16 | Board hydration: WAL replay on first `getBoard`, then chunked `SNAPSHOT []` → `MUTATION_BATCH`* → `SNAPSHOT_END` (§5.6). |
 | 17–19 | `PING`/`PONG` every 5 s after handshake; client maintains a rolling average of the last 10 RTT samples. |
 | 20–27 | Live draw (`SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT`) is relayed only, not persisted. |
