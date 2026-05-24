@@ -66,10 +66,10 @@ class NioServerChunkedSnapshotTest {
         try (SocketChannel channel = SocketChannel.open()) {
             channel.configureBlocking(true);
             channel.connect(new InetSocketAddress(HOST, port));
-            writeFully(channel, MessageCodec.encodeHandshake("joiner", "joiner-client"));
+            writeFully(channel, MessageCodec.encodeHandshake("joiner-client"));
             drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
-            writeFully(channel, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(channel, MessageCodec.encodeJoinRoom(roomId, "joiner", boardId));
             List<Message> afterJoin = drainMessages(channel, 5_000);
 
             int snapIdx = indexOfType(afterJoin, MessageType.SNAPSHOT);

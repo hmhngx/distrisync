@@ -200,8 +200,8 @@ class NioServerTest {
             chA.connect(new InetSocketAddress(HOST, serverPort));
             chB.connect(new InetSocketAddress(HOST, serverPort));
 
-            writeFullyBlocking(chA, MessageCodec.encodeHandshake("UserA", "client-fetch-a"));
-            writeFullyBlocking(chB, MessageCodec.encodeHandshake("UserB", "client-fetch-b"));
+            writeFullyBlocking(chA, MessageCodec.encodeHandshake("client-fetch-a"));
+            writeFullyBlocking(chB, MessageCodec.encodeHandshake("client-fetch-b"));
 
             await("both clients registered in lobby on server")
                     .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
@@ -284,13 +284,13 @@ class NioServerTest {
         startServer();
 
         var listener = new MutationTrackingListener("A");
-        NetworkClient clientA = new NetworkClient(HOST, serverPort, "UserA", "client-a");
+        NetworkClient clientA = new NetworkClient(HOST, serverPort, "client-a");
 
         clientA.addListener(listener);
 
         try {
             clientA.connect();
-            clientA.sendJoinRoom("Room-1", "Board-1");
+            clientA.sendJoinRoom("Room-1", "UserA", "Board-1");
 
             await("JOIN_ROOM processed and UDP token issued")
                     .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
@@ -326,7 +326,7 @@ class NioServerTest {
         startServer();
 
         var listener = new MutationTrackingListener("A");
-        NetworkClient clientA = new NetworkClient(HOST, serverPort, "UserA", "client-a");
+        NetworkClient clientA = new NetworkClient(HOST, serverPort, "client-a");
         clientA.addListener(listener);
 
         try (DatagramChannel udpClient = DatagramChannel.open()) {
@@ -335,7 +335,7 @@ class NioServerTest {
             udpClient.bind(new InetSocketAddress(HOST, 0));
 
             clientA.connect();
-            clientA.sendJoinRoom("Room-1", "Board-1");
+            clientA.sendJoinRoom("Room-1", "UserA", "Board-1");
 
             await("session has UDP token after join")
                     .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
@@ -379,9 +379,9 @@ class NioServerTest {
         var listenerB = new MutationTrackingListener("B");
         var listenerC = new MutationTrackingListener("C");
 
-        NetworkClient clientA = new NetworkClient(HOST, serverPort, "UserA", idA);
-        NetworkClient clientB = new NetworkClient(HOST, serverPort, "UserB", idB);
-        NetworkClient clientC = new NetworkClient(HOST, serverPort, "UserC", idC);
+        NetworkClient clientA = new NetworkClient(HOST, serverPort, idA);
+        NetworkClient clientB = new NetworkClient(HOST, serverPort, idB);
+        NetworkClient clientC = new NetworkClient(HOST, serverPort, idC);
 
         clientA.addListener(listenerA);
         clientB.addListener(listenerB);
@@ -402,9 +402,9 @@ class NioServerTest {
             clientB.connect();
             clientC.connect();
 
-            clientA.sendJoinRoom("Room-1", "Board-1");
-            clientB.sendJoinRoom("Room-1", "Board-1");
-            clientC.sendJoinRoom("Room-2", "Board-1");
+            clientA.sendJoinRoom("Room-1", "UserA", "Board-1");
+            clientB.sendJoinRoom("Room-1", "UserB", "Board-1");
+            clientC.sendJoinRoom("Room-2", "UserC", "Board-1");
 
             await("all clients received SNAPSHOT after join")
                     .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
@@ -480,8 +480,8 @@ class NioServerTest {
         String idA = "11111111-1111-1111-1111-111111111111";
         String idB = "22222222-2222-2222-2222-222222222222";
 
-        NetworkClient clientA = new NetworkClient(HOST, serverPort, "UserA", idA);
-        NetworkClient clientB = new NetworkClient(HOST, serverPort, "UserB", idB);
+        NetworkClient clientA = new NetworkClient(HOST, serverPort, idA);
+        NetworkClient clientB = new NetworkClient(HOST, serverPort, idB);
 
         try (DatagramChannel udpA = DatagramChannel.open();
              DatagramChannel udpB = DatagramChannel.open()) {
@@ -493,8 +493,8 @@ class NioServerTest {
 
             clientA.connect();
             clientB.connect();
-            clientA.sendJoinRoom("Room-1", "Board-1");
-            clientB.sendJoinRoom("Room-1", "Board-1");
+            clientA.sendJoinRoom("Room-1", "UserA", "Board-1");
+            clientB.sendJoinRoom("Room-1", "UserB", "Board-1");
 
             await("sessions joined Room-1")
                     .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
@@ -591,9 +591,9 @@ class NioServerTest {
         var listenerB = new MutationTrackingListener("B");
         var listenerC = new MutationTrackingListener("C");
 
-        NetworkClient clientA = new NetworkClient(HOST, serverPort, "UserA", "client-a");
-        NetworkClient clientB = new NetworkClient(HOST, serverPort, "UserB", "client-b");
-        NetworkClient clientC = new NetworkClient(HOST, serverPort, "UserC", "client-c");
+        NetworkClient clientA = new NetworkClient(HOST, serverPort, "client-a");
+        NetworkClient clientB = new NetworkClient(HOST, serverPort, "client-b");
+        NetworkClient clientC = new NetworkClient(HOST, serverPort, "client-c");
 
         clientA.addListener(listenerA);
         clientB.addListener(listenerB);
@@ -604,7 +604,7 @@ class NioServerTest {
             clientB.connect();
             clientC.connect();
 
-            clientA.sendJoinRoom("SharedRoom", "Math-Notes");
+            clientA.sendJoinRoom("SharedRoom", "UserA", "Math-Notes");
 
             await("owner receives initial SNAPSHOT on Math-Notes")
                     .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
@@ -622,8 +622,8 @@ class NioServerTest {
 
             clientA.sendSwitchBoard("Math-Notes");
 
-            clientB.sendJoinRoom("SharedRoom", "Diagrams");
-            clientC.sendJoinRoom("SharedRoom", "Math-Notes");
+            clientB.sendJoinRoom("SharedRoom", "UserB", "Diagrams");
+            clientC.sendJoinRoom("SharedRoom", "UserC", "Math-Notes");
 
             await("all three clients receive initial SNAPSHOT")
                     .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)
@@ -687,13 +687,13 @@ class NioServerTest {
         preCtx.getBoard("Diagrams").applyMutation(diagramOnly);
 
         var listener = new SnapshotCountingListener();
-        NetworkClient client = new NetworkClient(HOST, serverPort, "Switcher", "client-switch");
+        NetworkClient client = new NetworkClient(HOST, serverPort, "client-switch");
 
         client.addListener(listener);
 
         try {
             client.connect();
-            client.sendJoinRoom("SwitchRoom", "Math-Notes");
+            client.sendJoinRoom("SwitchRoom", "Switcher", "Math-Notes");
 
             await("first SNAPSHOT after join (empty Math-Notes)")
                     .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)

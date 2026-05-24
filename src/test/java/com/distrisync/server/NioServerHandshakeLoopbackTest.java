@@ -20,6 +20,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Verifies HANDSHAKE unicasts a self {@link MessageType#JOIN_ROOM} loopback before lobby fan-out.
+ * Display identity is empty until {@code JOIN_ROOM}.
  */
 class NioServerHandshakeLoopbackTest {
 
@@ -45,7 +46,7 @@ class NioServerHandshakeLoopbackTest {
     }
 
     @Test
-    void handshake_unicastsSelfJoinRoomWithAuthorName() throws Exception {
+    void handshake_unicastsSelfJoinRoomWithEmptyDisplayName() throws Exception {
         WalManager walManager = new WalManager(tempDir);
         RoomManager roomManager = new RoomManager(walManager);
         startServer(roomManager, walManager);
@@ -54,7 +55,7 @@ class NioServerHandshakeLoopbackTest {
         try (SocketChannel channel = SocketChannel.open()) {
             channel.configureBlocking(true);
             channel.connect(new InetSocketAddress(HOST, port));
-            writeFully(channel, MessageCodec.encodeHandshake("Alice", "client-a"));
+            writeFully(channel, MessageCodec.encodeHandshake("client-a"));
 
             List<Message> afterHandshake = drainMessages(channel, 5_000);
 
@@ -64,7 +65,7 @@ class NioServerHandshakeLoopbackTest {
                     .filter(p -> "client-a".equals(p.clientId()))
                     .findFirst()
                     .orElseThrow(() -> new AssertionError("expected self JOIN_ROOM after HANDSHAKE"));
-            assertThat(selfJoin.authorName()).isEqualTo("Alice");
+            assertThat(selfJoin.authorName()).isEmpty();
         }
     }
 

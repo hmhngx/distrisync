@@ -69,8 +69,8 @@ public final class SlowConsumerChaosTest {
             OutputStream out = socket.getOutputStream();
             InputStream in = socket.getInputStream();
 
-            writeFrame(out, MessageCodec.encodeHandshake("chaos-slow-consumer", clientId));
-            writeFrame(out, MessageCodec.encodeJoinRoom(roomId));
+            writeFrame(out, MessageCodec.encodeHandshake(clientId));
+            writeFrame(out, MessageCodec.encodeJoinRoom(roomId, "chaos-slow-consumer"));
             System.out.printf(
                     "HANDSHAKE + JOIN_ROOM sent (SO_RCVBUF=%d) — starting read-freeze thread.%n",
                     socket.getReceiveBufferSize());

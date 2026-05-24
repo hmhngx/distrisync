@@ -48,6 +48,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -68,9 +69,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *       {@code HANDSHAKE} (lobby + {@code LOBBY_STATE}), then {@code JOIN_ROOM}
  *       for a canvas {@code SNAPSHOT}.</li>
  *   <li><b>HANDSHAKE</b> – the first frame must be a {@code HANDSHAKE} with
- *       {@code authorName} and {@code clientId}.  The client is placed in the
- *       global discovery lobby; the server pushes {@code LOBBY_STATE} to all
- *       lobby clients.</li>
+ *       {@code clientId}.  The client is placed in the global discovery lobby;
+ *       the server pushes {@code LOBBY_STATE} to all lobby clients.</li>
  *   <li><b>JOIN_ROOM</b> – client leaves the lobby and enters a canvas room;
  *       the server sends that room's {@code SNAPSHOT}.</li>
  *   <li><b>LEAVE_ROOM</b> – client returns to the lobby and receives a fresh
@@ -115,6 +115,7 @@ public final class NioServer implements Runnable {
 
     /** Fixed prefix size for UDP token / {@link ClientSession#clientId} relay header. */
     private static final int UDP_IDENTITY_BYTES = 36;
+    private static final int MAX_DISPLAY_NAME_LEN = 20;
 
     private final int port;
     private final RoomManager roomManager;
@@ -596,7 +597,6 @@ public final class NioServer implements Runnable {
                     break;
                 }
                 MessageCodec.HandshakePayload hp = MessageCodec.decodeHandshake(msg);
-                session.authorName = hp.authorName();
                 session.clientId   = hp.clientId();
                 ByteBuffer selfJoin = MessageCodec.encodeRoomMemberJoined(
                         session.clientId, session.authorName);
@@ -612,8 +612,8 @@ public final class NioServer implements Runnable {
 
                 roomManager.registerHandshakeToLobby(senderKey);
 
-                log.info("HANDSHAKE session={} authorName='{}' clientId='{}' → lobby",
-                        session.sessionId, session.authorName, session.clientId);
+                log.info("HANDSHAKE session={} clientId='{}' → lobby",
+                        session.sessionId, session.clientId);
             }
 
             case JOIN_ROOM -> {
@@ -634,6 +634,9 @@ public final class NioServer implements Runnable {
                     break;
                 }
                 try {
+                    RoomContext targetRoom = roomManager.getOrCreateRoom(rid);
+                    String sanitizedName = sanitizeDisplayName(jp.displayName(), session.clientId);
+                    session.authorName = deduplicateAuthorName(targetRoom, senderKey, sanitizedName);
                     RoomContext room = roomManager.assignClientToRoom(senderKey, rid, session.roomId);
                     revokeUdpAdmission(session);
                     String udpToken = UUID.randomUUID().toString();
@@ -653,9 +656,13 @@ public final class NioServer implements Runnable {
                     sendSnapshot(session, senderKey, room);
                     sendUdpAdmission(session, senderKey, udpToken);
                     broadcastBoardList(room);
-                    broadcastToRoom(rid,
-                            MessageCodec.encodeRoomMemberJoined(session.clientId, session.authorName),
-                            senderKey, OutboundClass.CRITICAL);
+                    ByteBuffer selfJoinConfirm = MessageCodec.encodeRoomMemberJoined(
+                            session.clientId, session.authorName);
+                    if (safeEnqueue(session, senderKey, selfJoinConfirm, OutboundClass.CRITICAL)
+                            != EnqueueResult.OVERFLOW_DISCONNECT) {
+                        flushWriteQueue(session, senderKey);
+                    }
+                    broadcastToRoom(rid, selfJoinConfirm, senderKey, OutboundClass.CRITICAL);
                     fanoutBoardSwitch(room, session.clientId, session.currentBoardId, senderKey);
                     hydrateBoardPresenceForJoiner(room, senderKey, session);
                     ByteBuffer lockFrame = MessageCodec.encodeBoardLockState(room.isBoardCreationLocked);
@@ -1510,6 +1517,45 @@ public final class NioServer implements Runnable {
             return active.stream().sorted().findFirst().orElse(MessageCodec.DEFAULT_INITIAL_BOARD_ID);
         }
         return requested;
+    }
+
+    private String sanitizeDisplayName(String requested, String clientId) {
+        String sanitized = requested != null ? requested.strip() : "";
+        if (sanitized.isBlank()) {
+            String id = clientId != null ? clientId : "";
+            return id.length() > 8 ? id.substring(0, 8) : id;
+        }
+        if (sanitized.length() > MAX_DISPLAY_NAME_LEN) {
+            return sanitized.substring(0, MAX_DISPLAY_NAME_LEN);
+        }
+        return sanitized;
+    }
+
+    private boolean isAuthorNameTaken(RoomContext room, SelectionKey joiningKey, String name) {
+        for (SelectionKey key : room.activeKeysForSelectorIteration()) {
+            if (!key.isValid() || key == joiningKey) {
+                continue;
+            }
+            if (!(key.attachment() instanceof ClientSession peer)) {
+                continue;
+            }
+            if (name.equals(peer.authorName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String deduplicateAuthorName(RoomContext room, SelectionKey joiningKey, String baseName) {
+        if (!isAuthorNameTaken(room, joiningKey, baseName)) {
+            return baseName;
+        }
+        String candidate;
+        do {
+            String hex = String.format("%04X", ThreadLocalRandom.current().nextInt(0x10000));
+            candidate = baseName + " #" + hex;
+        } while (isAuthorNameTaken(room, joiningKey, candidate));
+        return candidate;
     }
 
     /** Empty JSON array payload that starts chunked join/board-switch hydration. */

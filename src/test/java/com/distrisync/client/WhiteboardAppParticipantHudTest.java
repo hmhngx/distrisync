@@ -1,7 +1,6 @@
 package com.distrisync.client;
 
 import javafx.scene.Scene;
-import javafx.scene.layout.StackPane;
 import javafx.stage.Stage;
 import org.junit.jupiter.api.Test;
 import org.testfx.framework.junit5.ApplicationTest;
@@ -16,7 +15,7 @@ import static org.testfx.api.FxAssert.verifyThat;
 import static org.testfx.matcher.base.NodeMatchers.isVisible;
 
 /**
- * Voice HUD: participant avatars reflect {@link Participant#isSpeakingProperty()}.
+ * Voice HUD: collaboration roster shows a speaking icon from {@link Participant#isSpeakingProperty()}.
  */
 class WhiteboardAppParticipantHudTest extends ApplicationTest {
 
@@ -31,7 +30,7 @@ class WhiteboardAppParticipantHudTest extends ApplicationTest {
         app = new WhiteboardApp();
         app.start(stage);
         canvasScene = getField(app, "canvasScene", Scene.class);
-        networkClient = new NetworkClient("127.0.0.1", 9090, "Test User", TEST_CLIENT_ID);
+        networkClient = new NetworkClient("127.0.0.1", 9090, TEST_CLIENT_ID);
         setField(app, "networkClient", networkClient);
         invokeWireParticipantHud(app, networkClient.getParticipantManager());
         WhiteboardAppTestFxSupport.showCanvasScene(stage, canvasScene);
@@ -48,12 +47,8 @@ class WhiteboardAppParticipantHudTest extends ApplicationTest {
             participant.setSpeaking(true);
         });
 
-        String avatarId = CollaborationRoster.avatarNodeId(TEST_CLIENT_ID);
-        StackPane avatar = lookup("#" + avatarId).queryAs(StackPane.class);
-        verifyThat(avatar, isVisible());
-
         await().atMost(2, TimeUnit.SECONDS).untilAsserted(() ->
-                assertThat(avatar.getStyleClass()).contains("speaking-ring"));
+                verifyThat(lookup(".roster-speaking-icon"), isVisible()));
     }
 
     private static void invokeWireParticipantHud(WhiteboardApp app, ParticipantManager manager) {

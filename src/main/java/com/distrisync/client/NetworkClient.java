@@ -74,7 +74,7 @@ import java.util.concurrent.locks.LockSupport;
  * client.addListener(myCanvasListener);
  * client.addLobbyListener(myLobbyListener);
  * client.connect();                        // handshake → lobby; LOBBY_STATE pushed by server
- * client.sendJoinRoom("MyRoom");          // async; SNAPSHOT follows when joined
+ * client.sendJoinRoom("MyRoom", "Alice");  // async; SNAPSHOT follows when joined
  * client.sendMutation(someShape);         // enqueued; async dispatch
  * client.close();                          // graceful shutdown
  * }</pre>
@@ -121,8 +121,16 @@ public final class NetworkClient implements AutoCloseable {
 
     private final String host;
     private final int    port;
-    private final String authorName;
     private final String clientId;
+
+    /** Room-level display identity; set on {@link #sendJoinRoom}, cleared on {@link #sendLeaveRoom}. */
+    private volatile String displayName = "";
+
+    /**
+     * Server-confirmed room display name from a self {@code JOIN_ROOM} notification;
+     * used for reconnect {@code JOIN_ROOM} payloads and outbound canvas identity.
+     */
+    private volatile String lockedRoomName = null;
 
     /**
      * Room id used for {@code JOIN_ROOM} on reconnect. Empty while the client
@@ -254,10 +262,13 @@ public final class NetworkClient implements AutoCloseable {
     private volatile String deferredJoinRoomId = "";
 
     /**
-     * When non-blank, deferred join uses {@link MessageCodec#encodeJoinRoom(String, String)}.
-     * Blank means {@link MessageCodec#encodeJoinRoom(String)} (server default board).
+     * When non-blank, deferred join uses {@link MessageCodec#encodeJoinRoom(String, String, String)}.
+     * Blank means {@link MessageCodec#encodeJoinRoom(String, String)} (server default board).
      */
     private volatile String deferredJoinBoardId = "";
+
+    /** Display name held for a deferred {@link #sendJoinRoom} until {@link #protocolReady}. */
+    private volatile String deferredJoinDisplayName = "";
 
     /**
      * Reference to the read daemon thread so {@link #resumeAfterSessionRevoked}
@@ -290,35 +301,32 @@ public final class NetworkClient implements AutoCloseable {
 
     /**
      * Creates an anonymous {@code NetworkClient} targeting the given server endpoint.
-     * Attribution defaults to empty author name and a random {@code clientId}.
-     * Call {@link #connect()} for the lobby, then {@link #sendJoinRoom(String)}.
+     * A random {@code clientId} is generated. Call {@link #connect()} for the lobby,
+     * then {@link #sendJoinRoom(String, String)} with a display name.
      *
      * @param host server host name or IP; must not be blank
      * @param port server TCP port; must be in [1, 65535]
      */
     public NetworkClient(String host, int port) {
-        this(host, port, "", java.util.UUID.randomUUID().toString());
+        this(host, port, java.util.UUID.randomUUID().toString());
     }
 
     /**
-     * Creates an attributed {@code NetworkClient} targeting the given server endpoint.
-     * The {@code authorName} and {@code clientId} are embedded in the {@code HANDSHAKE}
-     * frame and attached to every shape the client mutates.  After {@link #connect()}
-     * the client stays in the lobby until {@link #sendJoinRoom(String)}.
+     * Creates a {@code NetworkClient} targeting the given server endpoint.
+     * Only {@code clientId} is sent in the {@code HANDSHAKE}; display identity is
+     * declared per room via {@link #sendJoinRoom(String, String)}.
      *
-     * @param host       server host name or IP; must not be blank
-     * @param port       server TCP port; must be in [1, 65535]
-     * @param authorName human-readable display name; may be empty but not {@code null}
-     * @param clientId   stable session identifier; may be empty but not {@code null}
+     * @param host     server host name or IP; must not be blank
+     * @param port     server TCP port; must be in [1, 65535]
+     * @param clientId stable session identifier; may be empty but not {@code null}
      */
-    public NetworkClient(String host, int port, String authorName, String clientId) {
+    public NetworkClient(String host, int port, String clientId) {
         if (host == null || host.isBlank())
             throw new IllegalArgumentException("host must not be blank");
         if (port < 1 || port > 65_535)
             throw new IllegalArgumentException("Invalid port: " + port);
         this.host       = host;
         this.port       = port;
-        this.authorName = authorName != null ? authorName : "";
         this.clientId   = clientId   != null ? clientId   : "";
         audioEngine.setVoiceStateSync(this::sendVoiceState);
         audioEngine.setParticipantManager(participantManager);
@@ -333,7 +341,7 @@ public final class NetworkClient implements AutoCloseable {
      * Establishes the initial TCP connection using the reconnect backoff
      * strategy, sends the {@code HANDSHAKE} frame, and starts the read and
      * write daemon threads. The server places the client in the lobby and may
-     * push {@code LOBBY_STATE}; call {@link #sendJoinRoom(String)} to enter a room
+     * push {@code LOBBY_STATE}; call {@link #sendJoinRoom(String, String)} to enter a room
      * and receive {@code SNAPSHOT}.
      *
      * <p>This method is idempotent only for the first call; subsequent calls
@@ -437,7 +445,7 @@ public final class NetworkClient implements AutoCloseable {
         record Payload(String shapeId, String tool, String color,
                        double strokeWidth, double x, double y, String authorName) {}
         enqueueFrame(MessageCodec.encodeObject(MessageType.SHAPE_START,
-                new Payload(shapeId.toString(), tool, color, strokeWidth, x, y, authorName)));
+                new Payload(shapeId.toString(), tool, color, strokeWidth, x, y, effectiveAuthorName())));
     }
 
     /**
@@ -486,7 +494,7 @@ public final class NetworkClient implements AutoCloseable {
         if (objectId    == null) throw new IllegalArgumentException("objectId must not be null");
         if (currentText == null) throw new IllegalArgumentException("currentText must not be null");
         if (!running.get()) return;
-        enqueueFrame(MessageCodec.encodeTextUpdate(objectId, clientId, authorName, x, y, currentText));
+        enqueueFrame(MessageCodec.encodeTextUpdate(objectId, clientId, effectiveAuthorName(), x, y, currentText));
         log.debug("TEXT_UPDATE enqueued objectId={}", objectId);
     }
 
@@ -597,9 +605,25 @@ public final class NetworkClient implements AutoCloseable {
         log.debug("UNDO_REQUEST enqueued shapeId={}", shapeId);
     }
 
-    /** Returns the author name this client advertised in its {@code HANDSHAKE}. */
+    /** Returns the server-confirmed room display name when locked; otherwise the last requested name. */
     public String getAuthorName() {
-        return authorName;
+        return effectiveAuthorName();
+    }
+
+    private String effectiveAuthorName() {
+        String locked = lockedRoomName;
+        if (locked != null && !locked.isBlank()) {
+            return locked;
+        }
+        return displayName != null ? displayName : "";
+    }
+
+    private String resolveReconnectDisplayName() {
+        String locked = lockedRoomName;
+        if (locked != null && !locked.isBlank()) {
+            return locked;
+        }
+        return displayName != null ? displayName : "";
     }
 
     /** Returns the client-ID this client advertised in its {@code HANDSHAKE}. */
@@ -608,7 +632,7 @@ public final class NetworkClient implements AutoCloseable {
     }
 
     /**
-     * Last room passed to {@link #sendJoinRoom(String)}; empty in the lobby
+     * Last room passed to {@link #sendJoinRoom(String, String)}; empty in the lobby
      * (including immediately after {@link #sendLeaveRoom()}).
      */
     public String getActiveRoomId() {
@@ -867,7 +891,7 @@ public final class NetworkClient implements AutoCloseable {
             return;
         }
         lastCursorSendMs = now;
-        enqueueFrame(MessageCodec.encodeCursorSync(clientId, authorName, x, y));
+        enqueueFrame(MessageCodec.encodeCursorSync(clientId, effectiveAuthorName(), x, y));
     }
 
     /**
@@ -1015,43 +1039,57 @@ public final class NetworkClient implements AutoCloseable {
 
     /**
      * Sends a {@code HANDSHAKE} frame synchronously on the current channel.
-     * The payload carries {@code authorName} and {@code clientId} so the server
-     * can associate subsequent mutations with the originating user.
-     * This always completes before the I/O threads are started (or restarted
-     * after a reconnect). Uses {@link #writeFully} so it never races the write thread.
+     * The payload carries {@code clientId} only; display identity is sent with
+     * {@code JOIN_ROOM}. This always completes before the I/O threads are started
+     * (or restarted after a reconnect). Uses {@link #writeFully} so it never races
+     * the write thread.
      */
     private void sendHandshake() throws IOException {
-        ByteBuffer handshake = MessageCodec.encodeHandshake(authorName, clientId);
+        ByteBuffer handshake = MessageCodec.encodeHandshake(clientId);
         writeFully(handshake);
-        log.debug("HANDSHAKE sent to {}:{} authorName='{}' clientId='{}'",
-                host, port, authorName, clientId);
+        log.debug("HANDSHAKE sent to {}:{} clientId='{}'", host, port, clientId);
     }
 
     /**
      * Enters a canvas room (async). The server responds with {@code SNAPSHOT}.
      * Updates {@link #getActiveRoomId()} for reconnect semantics.
      *
-     * @param roomId non-blank room identifier
+     * @param roomId      non-blank room identifier
+     * @param displayName room-level display identity; may be empty but not {@code null}
      */
-    public void sendJoinRoom(String roomId) {
+    public void joinRoom(String roomId, String displayName) {
+        sendJoinRoom(roomId, displayName);
+    }
+
+    /**
+     * Enters a canvas room (async). The server responds with {@code SNAPSHOT}.
+     * Updates {@link #getActiveRoomId()} for reconnect semantics.
+     *
+     * @param roomId      non-blank room identifier
+     * @param displayName room-level display identity; may be empty but not {@code null}
+     */
+    public void sendJoinRoom(String roomId, String displayName) {
         if (!running.get()) return;
         String rid = roomId != null ? roomId.strip() : "";
         if (rid.isBlank()) {
             log.debug("sendJoinRoom ignored — blank roomId");
             return;
         }
+        String name = displayName != null ? displayName : "";
+        this.displayName = name;
         activeRoomId = rid;
         lastSnapshotBoardId = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
         currentBoardId = lastSnapshotBoardId;
         ensureBoardKnown(lastSnapshotBoardId);
         notifyWorkspaceListeners();
         if (protocolReady.get()) {
-            enqueueFrame(MessageCodec.encodeJoinRoom(rid));
-            log.debug("JOIN_ROOM enqueued roomId='{}'", rid);
+            enqueueFrame(MessageCodec.encodeJoinRoom(rid, name));
+            log.debug("JOIN_ROOM enqueued roomId='{}' displayName='{}'", rid, name);
         } else {
             deferredJoinRoomId = rid;
             deferredJoinBoardId = "";
-            log.debug("JOIN_ROOM deferred until protocol ready roomId='{}'", rid);
+            deferredJoinDisplayName = name;
+            log.debug("JOIN_ROOM deferred until protocol ready roomId='{}' displayName='{}'", rid, name);
         }
     }
 
@@ -1060,9 +1098,10 @@ public final class NetworkClient implements AutoCloseable {
      * {@code SNAPSHOT} for that board.
      *
      * @param roomId          non-blank room identifier
+     * @param displayName     room-level display identity; may be empty but not {@code null}
      * @param initialBoardId  non-blank board id (e.g. {@code "Math-Notes"})
      */
-    public void sendJoinRoom(String roomId, String initialBoardId) {
+    public void sendJoinRoom(String roomId, String displayName, String initialBoardId) {
         if (!running.get()) return;
         String rid = roomId != null ? roomId.strip() : "";
         if (rid.isBlank()) {
@@ -1074,18 +1113,22 @@ public final class NetworkClient implements AutoCloseable {
             log.debug("sendJoinRoom ignored — blank initialBoardId");
             return;
         }
+        String name = displayName != null ? displayName : "";
+        this.displayName = name;
         activeRoomId = rid;
         lastSnapshotBoardId = board;
         currentBoardId = board;
         ensureBoardKnown(board);
         notifyWorkspaceListeners();
         if (protocolReady.get()) {
-            enqueueFrame(MessageCodec.encodeJoinRoom(rid, board));
-            log.debug("JOIN_ROOM enqueued roomId='{}' boardId='{}'", rid, board);
+            enqueueFrame(MessageCodec.encodeJoinRoom(rid, name, board));
+            log.debug("JOIN_ROOM enqueued roomId='{}' displayName='{}' boardId='{}'", rid, name, board);
         } else {
             deferredJoinRoomId = rid;
             deferredJoinBoardId = board;
-            log.debug("JOIN_ROOM deferred until protocol ready roomId='{}' boardId='{}'", rid, board);
+            deferredJoinDisplayName = name;
+            log.debug("JOIN_ROOM deferred until protocol ready roomId='{}' displayName='{}' boardId='{}'",
+                    rid, name, board);
         }
     }
 
@@ -1159,10 +1202,10 @@ public final class NetworkClient implements AutoCloseable {
     /**
      * Blocking {@code JOIN_ROOM} for the reconnect path only (write thread not used).
      */
-    private void sendJoinRoomBlocking(String roomId) throws IOException {
-        ByteBuffer frame = MessageCodec.encodeJoinRoom(roomId);
+    private void sendJoinRoomBlocking(String roomId, String name) throws IOException {
+        ByteBuffer frame = MessageCodec.encodeJoinRoom(roomId, name);
         writeFully(frame);
-        log.info("JOIN_ROOM sent (blocking) to {}:{} roomId='{}'", host, port, roomId);
+        log.info("JOIN_ROOM sent (blocking) to {}:{} roomId='{}' displayName='{}'", host, port, roomId, name);
     }
 
     /**
@@ -1172,6 +1215,8 @@ public final class NetworkClient implements AutoCloseable {
     public void sendLeaveRoom() {
         if (!running.get()) return;
         activeRoomId = "";
+        displayName = "";
+        lockedRoomName = null;
         resetWorkspaceForLobby();
         publishUdpActive(false);
         audioEngine.stopCaptureDaemon();
@@ -1263,6 +1308,7 @@ public final class NetworkClient implements AutoCloseable {
         protocolReady.set(false);
         deferredJoinRoomId = "";
         deferredJoinBoardId = "";
+        deferredJoinDisplayName = "";
         SocketChannel stale = channel;
         if (stale != null) {
             try { stale.close(); } catch (IOException ignored) {}
@@ -1271,7 +1317,7 @@ public final class NetworkClient implements AutoCloseable {
         sendHandshake();
         String rid = activeRoomId;
         if (rid != null && !rid.isBlank()) {
-            sendJoinRoomBlocking(rid);
+            sendJoinRoomBlocking(rid, resolveReconnectDisplayName());
             lastSnapshotBoardId = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
             currentBoardId = lastSnapshotBoardId;
             ensureBoardKnown(lastSnapshotBoardId);
@@ -1412,12 +1458,14 @@ public final class NetworkClient implements AutoCloseable {
         deferredJoinRoomId = "";
         String board = deferredJoinBoardId;
         deferredJoinBoardId = "";
+        String name = deferredJoinDisplayName;
+        deferredJoinDisplayName = "";
         if (rid != null && !rid.isBlank()) {
             ByteBuffer frame = (board != null && !board.isBlank())
-                    ? MessageCodec.encodeJoinRoom(rid, board)   
-                    : MessageCodec.encodeJoinRoom(rid);
+                    ? MessageCodec.encodeJoinRoom(rid, name, board)
+                    : MessageCodec.encodeJoinRoom(rid, name);
             enqueueFrame(frame);
-            log.debug("Flushed deferred JOIN_ROOM roomId='{}' boardId='{}'", rid, board);
+            log.debug("Flushed deferred JOIN_ROOM roomId='{}' displayName='{}' boardId='{}'", rid, name, board);
         }
     }
 
@@ -1585,6 +1633,12 @@ public final class NetworkClient implements AutoCloseable {
                     MessageCodec.RoomMemberJoinedPayload p = MessageCodec.decodeRoomMemberJoined(msg);
                     participantManager.putParticipant(p.clientId(), p.authorName());
                     if (p.clientId().equals(clientId)) {
+                        String confirmed = p.authorName();
+                        if (confirmed != null && !confirmed.isBlank()) {
+                            lockedRoomName = confirmed;
+                            displayName = confirmed;
+                            log.debug("JOIN_ROOM self-confirm authorName='{}'", confirmed);
+                        }
                         break;
                     }
                     log.debug("JOIN_ROOM peer-join clientId='{}' authorName='{}'",
@@ -1853,6 +1907,41 @@ public final class NetworkClient implements AutoCloseable {
         } catch (Exception e) {
             throw new IllegalStateException("ROLE_UPDATE test frame failed", e);
         }
+    }
+
+    /**
+     * Feeds server→client {@code JOIN_ROOM} peer-join through {@link #dispatchMessage} for unit tests.
+     */
+    void ingestRoomMemberJoinedForStateTest(String joinedClientId, String authorName) {
+        running.set(true);
+        protocolReady.set(true);
+        try {
+            ByteBuffer frame = MessageCodec.encodeRoomMemberJoined(joinedClientId, authorName);
+            Message msg = MessageCodec.decode(frame);
+            dispatchMessage(msg);
+        } catch (Exception e) {
+            throw new IllegalStateException("JOIN_ROOM peer-join test frame failed", e);
+        }
+    }
+
+    String getLockedRoomNameForTest() {
+        return lockedRoomName;
+    }
+
+    void setLockedRoomNameForTest(String name) {
+        lockedRoomName = name;
+    }
+
+    void setDisplayNameForTest(String name) {
+        displayName = name != null ? name : "";
+    }
+
+    void setActiveRoomIdForTest(String roomId) {
+        activeRoomId = roomId != null ? roomId : "";
+    }
+
+    String resolveReconnectDisplayNameForTest() {
+        return resolveReconnectDisplayName();
     }
 
     /**

@@ -61,11 +61,11 @@ class NioServerLifecycleTest {
             channel.configureBlocking(true);
             channel.connect(new InetSocketAddress(HOST, serverPort));
 
-            writeFully(channel, MessageCodec.encodeHandshake("deleter", "deleter-client"));
+            writeFully(channel, MessageCodec.encodeHandshake("deleter-client"));
             drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
             // Must join as room owner — lobby clients lack PERM_DELETE_ROOM (RBAC Phase 1).
-            writeFully(channel, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(channel, MessageCodec.encodeJoinRoom(roomId, "deleter", boardId));
             drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
             writeFully(channel, MessageCodec.encodeDeleteRoom(roomId));

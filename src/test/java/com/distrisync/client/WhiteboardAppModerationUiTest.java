@@ -34,7 +34,7 @@ class WhiteboardAppModerationUiTest extends ApplicationTest {
         app = new WhiteboardApp();
         app.start(stage);
         canvasScene = getField(app, "canvasScene", Scene.class);
-        networkClient = new NetworkClient("127.0.0.1", 9090, "Test", "test-client");
+        networkClient = new NetworkClient("127.0.0.1", 9090, "test-client");
         setField(app, "networkClient", networkClient);
         invokeWireMicToggleHud(app, networkClient.getAudioEngine());
         invokeWireParticipantHud(app, networkClient.getParticipantManager());

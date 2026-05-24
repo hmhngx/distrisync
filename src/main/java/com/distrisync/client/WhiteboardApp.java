@@ -190,6 +190,7 @@ public class WhiteboardApp extends Application {
     static final String TOOL_DOCK_TOGGLE_BUTTON_ID = "whiteboard-tool-dock-toggle";
     /** Login card primary action (flat button reset / TestFX). */
     static final String LOGIN_JOIN_NETWORK_BUTTON_ID = "login-join-network";
+    static final String LOBBY_DISPLAY_NAME_FIELD_ID = "lobby-display-name-field";
     static final String LOBBY_MODAL_CARD_ID = "lobby-modal-card";
     static final String LOGIN_MODAL_CARD_ID = "login-modal-card";
 
@@ -367,6 +368,8 @@ public class WhiteboardApp extends Application {
     private StackPane lobbyToastShell;
     private Animation lobbyToastSequence;
     private TextField newRoomField;
+    private TextField displayNameField;
+    private Button lobbyCreateRoomBtn;
 
     static final String LOBBY_TOAST_SHELL_ID = "lobby-toast-shell";
 
@@ -665,22 +668,17 @@ public class WhiteboardApp extends Application {
         loginTitle.getStyleClass().add("lobby-header");
         loginTitle.setMaxWidth(Double.MAX_VALUE);
 
-        Label loginSubtitle = new Label("Enter your display name to continue");
+        Label loginSubtitle = new Label("Connect to the collaboration server");
         loginSubtitle.getStyleClass().add("lobby-subtitle");
         loginSubtitle.setWrapText(true);
         loginSubtitle.setMaxWidth(Double.MAX_VALUE);
-
-        TextField nameField = new TextField();
-        nameField.setPromptText("Display name");
-        nameField.getStyleClass().add("text-input-modern");
-        nameField.setMaxWidth(Double.MAX_VALUE);
 
         Button joinNetworkBtn = new Button("Join Network");
         joinNetworkBtn.setId(LOGIN_JOIN_NETWORK_BUTTON_ID);
         joinNetworkBtn.getStyleClass().add("primary-button-large");
         joinNetworkBtn.setMaxWidth(Double.MAX_VALUE);
 
-        VBox loginForm = new VBox(16, loginTitle, loginSubtitle, nameField, joinNetworkBtn);
+        VBox loginForm = new VBox(16, loginTitle, loginSubtitle, joinNetworkBtn);
         loginForm.setAlignment(Pos.TOP_LEFT);
         loginForm.setFillWidth(true);
         loginForm.setMaxWidth(Double.MAX_VALUE);
@@ -698,18 +696,13 @@ public class WhiteboardApp extends Application {
         loginScene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
 
         Runnable attemptJoin = () -> {
-            String raw = nameField.getText() != null ? nameField.getText().strip() : "";
-            if (raw.isEmpty()) {
-                return;
+            if (networkClient == null) {
+                initNetworking();
             }
-            authorName = raw;
-            clientId = UUID.randomUUID().toString();
-            initNetworking();
             stage.setScene(lobbyScene);
             stage.setTitle("DistriSync – Lobby");
         };
         joinNetworkBtn.setOnAction(e -> attemptJoin.run());
-        nameField.setOnAction(e -> attemptJoin.run());
 
         stage.setScene(loginScene);
         stage.show();
@@ -1491,22 +1484,38 @@ public class WhiteboardApp extends Application {
         header.getStyleClass().add("lobby-header");
         header.setMaxWidth(Double.MAX_VALUE);
 
+        Label displayNameLabel = new Label("Display name");
+        displayNameLabel.getStyleClass().add("lobby-room-title");
+        displayNameLabel.setMaxWidth(Double.MAX_VALUE);
+
+        displayNameField = new TextField();
+        displayNameField.setId(LOBBY_DISPLAY_NAME_FIELD_ID);
+        displayNameField.setPromptText("Your name in the room");
+        displayNameField.getStyleClass().add("lobby-textfield");
+        displayNameField.setMaxWidth(Double.MAX_VALUE);
+        displayNameField.textProperty().addListener((obs, oldText, newText) ->
+                updateLobbyDisplayNameValidation());
+
+        VBox displayNameSection = new VBox(8, displayNameLabel, displayNameField);
+        displayNameSection.setFillWidth(true);
+        VBox.setMargin(displayNameSection, new Insets(0, 0, 16, 0));
+
         newRoomField = new TextField();
         newRoomField.setPromptText("New room name…");
         newRoomField.getStyleClass().add("lobby-textfield");
         newRoomField.setMinWidth(160);
         newRoomField.setMaxWidth(Double.MAX_VALUE);
 
-        Button createBtn = new Button("Create Room");
-        createBtn.getStyleClass().add("tool-button");
-        createBtn.setOnAction(e -> joinRoomFromLobby(newRoomField.getText()));
+        lobbyCreateRoomBtn = new Button("Create Room");
+        lobbyCreateRoomBtn.getStyleClass().add("tool-button");
+        lobbyCreateRoomBtn.setOnAction(e -> joinRoomFromLobby(newRoomField.getText()));
         newRoomField.setOnAction(e -> joinRoomFromLobby(newRoomField.getText()));
 
         HBox createRow = new HBox(12);
         createRow.setAlignment(Pos.CENTER_LEFT);
         createRow.setMaxWidth(Double.MAX_VALUE);
         HBox.setHgrow(newRoomField, Priority.ALWAYS);
-        createRow.getChildren().addAll(newRoomField, createBtn);
+        createRow.getChildren().addAll(newRoomField, lobbyCreateRoomBtn);
         VBox.setMargin(createRow, new Insets(0, 0, 32, 0));
 
         Label availableRoomsLabel = new Label("Available Rooms");
@@ -1565,7 +1574,7 @@ public class WhiteboardApp extends Application {
         StackPane.setAlignment(lobbyToastShell, Pos.BOTTOM_CENTER);
         StackPane.setMargin(lobbyToastShell, new Insets(0, 0, 32, 0));
 
-        container.getChildren().addAll(header, createRow, scroll);
+        container.getChildren().addAll(header, displayNameSection, createRow, scroll);
 
         VBox lobbyModalCard = new VBox(container);
         lobbyModalCard.setId(LOBBY_MODAL_CARD_ID);
@@ -1576,7 +1585,67 @@ public class WhiteboardApp extends Application {
 
         root.getChildren().addAll(lobbyModalCard, lobbyToastShell);
         setLobbyStickyStatus("Connecting…", "lobby-status-muted");
+        updateLobbyDisplayNameValidation();
         return root;
+    }
+
+    static boolean isLobbyDisplayNameValid(String text) {
+        return text != null && !text.strip().isBlank();
+    }
+
+    static void applyLobbyDisplayNameFieldStyle(TextField field, boolean valid) {
+        if (field == null) {
+            return;
+        }
+        field.setStyle(valid ? "-fx-border-color: green;" : "-fx-border-color: red;");
+    }
+
+    private void updateLobbyDisplayNameValidation() {
+        boolean valid = isLobbyDisplayNameValid(displayNameField != null ? displayNameField.getText() : "");
+        applyLobbyDisplayNameFieldStyle(displayNameField, valid);
+        if (lobbyCreateRoomBtn != null) {
+            lobbyCreateRoomBtn.setDisable(!valid);
+        }
+        setLobbyJoinButtonsEnabled(valid);
+    }
+
+    private void setLobbyJoinButtonsEnabled(boolean joinEnabled) {
+        if (lobbyRoomList == null) {
+            return;
+        }
+        boolean connected = networkClient != null && networkClient.isRunning();
+        for (var cardNode : lobbyRoomList.getChildren()) {
+            if (!(cardNode instanceof FlowPane card)) {
+                continue;
+            }
+            for (var child : card.getChildren()) {
+                if (!(child instanceof FlowPane actions)) {
+                    continue;
+                }
+                for (var actionNode : actions.getChildren()) {
+                    if (actionNode instanceof Button joinBtn && "Join".equals(joinBtn.getText())) {
+                        joinBtn.setDisable(!joinEnabled || !connected);
+                    }
+                }
+            }
+        }
+    }
+
+    private void restoreLobbyDisplayNameField() {
+        if (displayNameField == null) {
+            return;
+        }
+        String prefilled = "";
+        if (authorName != null && !authorName.isBlank() && !"Anonymous".equals(authorName)) {
+            prefilled = authorName;
+        } else if (networkClient != null) {
+            String fromClient = networkClient.getAuthorName();
+            if (fromClient != null && !fromClient.isBlank()) {
+                prefilled = fromClient;
+            }
+        }
+        displayNameField.setText(prefilled);
+        updateLobbyDisplayNameValidation();
     }
 
     private void cancelLobbyToastAnimation() {
@@ -1639,8 +1708,12 @@ public class WhiteboardApp extends Application {
      * Joins or creates a room by id (lobby UI). No-op if disconnected or blank.
      */
     private void joinRoomFromLobby(String roomIdOrName) {
-        String name = roomIdOrName != null ? roomIdOrName.strip() : "";
-        if (name.isBlank()) {
+        String roomId = roomIdOrName != null ? roomIdOrName.strip() : "";
+        if (roomId.isBlank()) {
+            return;
+        }
+        String displayName = displayNameField != null ? displayNameField.getText().trim() : "";
+        if (displayName.isBlank()) {
             return;
         }
         if (networkClient == null || !networkClient.isRunning()) {
@@ -1648,13 +1721,14 @@ public class WhiteboardApp extends Application {
             return;
         }
         long now = System.currentTimeMillis();
-        if (name.equals(lastLobbyJoinRoomId) && (now - lastLobbyJoinMillis) < 500) {
+        if (roomId.equals(lastLobbyJoinRoomId) && (now - lastLobbyJoinMillis) < 500) {
             return;
         }
         lastLobbyJoinMillis = now;
-        lastLobbyJoinRoomId = name;
-        showToast("Joining room \"" + name + "\"…");
-        networkClient.sendJoinRoom(name);
+        lastLobbyJoinRoomId = roomId;
+        authorName = displayName;
+        showToast("Joining room \"" + roomId + "\"…");
+        networkClient.joinRoom(roomId, displayName);
         scheduleLobbyJoinWatchdog();
     }
 
@@ -2219,6 +2293,9 @@ public class WhiteboardApp extends Application {
             joinBtn.getStyleClass().add("tool-button");
             String rid = info.roomId();
             joinBtn.setOnAction(e -> joinRoomFromLobby(rid));
+            boolean joinEnabled = isLobbyDisplayNameValid(
+                    displayNameField != null ? displayNameField.getText() : "");
+            joinBtn.setDisable(!joinEnabled || networkClient == null || !networkClient.isRunning());
 
             Button deleteBtn = new Button("Delete");
             deleteBtn.getStyleClass().add("danger-btn");
@@ -2283,6 +2360,7 @@ public class WhiteboardApp extends Application {
         if (primaryStage != null && lobbyScene != null) {
             primaryStage.setScene(lobbyScene);
             primaryStage.setTitle("DistriSync – Lobby");
+            restoreLobbyDisplayNameField();
         }
         setStatus("⬤ In lobby", FG_MUTED);
     }
@@ -2401,11 +2479,6 @@ public class WhiteboardApp extends Application {
         collaborationRoster.setBoardLockToggleHandler(networkClient::sendBoardLockState);
         networkClient.getRoomState().boardCreationLockedProperty().addListener((obs, was, locked) ->
                 collaborationRoster.syncBoardLockCheckbox(Boolean.TRUE.equals(locked)));
-        String displayName = networkClient.getAuthorName();
-        if (displayName == null || displayName.isBlank()) {
-            displayName = "You";
-        }
-        manager.putParticipant(networkClient.getClientId(), displayName);
         manager.setCurrentBoardId(networkClient.getClientId(), networkClient.getCurrentBoardId());
         if (RoomPermissions.canManageRoom(manager.getLocalPermissions())
                 || RoomPermissions.canDeleteRoom(manager.getLocalPermissions())) {
@@ -3235,10 +3308,7 @@ public class WhiteboardApp extends Application {
         networkHost = host;
         networkPort = port;
 
-        networkClient = new NetworkClient(host, port, authorName, clientId);
-        networkClient.getParticipantManager().putParticipant(
-                networkClient.getClientId(),
-                networkClient.getAuthorName());
+        networkClient = new NetworkClient(host, port, clientId);
         wirePerformanceHud(networkClient);
         wireMicToggleHud(networkClient.getAudioEngine());
         wireParticipantHud(networkClient.getParticipantManager());
@@ -3312,6 +3382,10 @@ public class WhiteboardApp extends Application {
                         recreateRemoteCursorManager();
                         primaryStage.setScene(canvasScene);
                         bindPermissionsToUI();
+                        String confirmedName = networkClient.getAuthorName();
+                        if (confirmedName != null && !confirmedName.isBlank()) {
+                            authorName = confirmedName;
+                        }
                         primaryStage.setTitle("DistriSync – " + authorName + "  [" + roomId + "]");
                         controlPane.toFront();
                         setStatus("⬤ Connected", GREEN);

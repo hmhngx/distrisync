@@ -60,10 +60,10 @@ class NioServerJoinRoleUpdateTest {
         try (SocketChannel channel = SocketChannel.open()) {
             channel.configureBlocking(true);
             channel.connect(new InetSocketAddress(HOST, port));
-            writeFully(channel, MessageCodec.encodeHandshake("owner", "owner-client"));
+            writeFully(channel, MessageCodec.encodeHandshake("owner-client"));
             drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
-            writeFully(channel, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(channel, MessageCodec.encodeJoinRoom(roomId, "owner", boardId));
             List<Message> afterJoin = drainMessages(channel, 5_000);
 
             int roleIdx = indexOfType(afterJoin, MessageType.ROLE_UPDATE);
@@ -98,16 +98,16 @@ class NioServerJoinRoleUpdateTest {
             owner.configureBlocking(true);
             member.configureBlocking(true);
             owner.connect(new InetSocketAddress(HOST, port));
-            writeFully(owner, MessageCodec.encodeHandshake("owner", "owner-client"));
+            writeFully(owner, MessageCodec.encodeHandshake("owner-client"));
             drainUntilQuiet(owner, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-            writeFully(owner, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(owner, MessageCodec.encodeJoinRoom(roomId, "owner", boardId));
             drainUntilQuiet(owner, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
             member.connect(new InetSocketAddress(HOST, port));
-            writeFully(member, MessageCodec.encodeHandshake("member", "member-client"));
+            writeFully(member, MessageCodec.encodeHandshake("member-client"));
             drainUntilQuiet(member, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
-            writeFully(member, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(member, MessageCodec.encodeJoinRoom(roomId, "member", boardId));
             List<Message> afterJoin = drainMessages(member, 5_000);
 
             int roleIdx = indexOfType(afterJoin, MessageType.ROLE_UPDATE);

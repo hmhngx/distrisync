@@ -89,7 +89,7 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Moderation (`MODERATION_ACTION` / `SESSION_REVOKED`)** — hosts and moderators send `MODERATION_ACTION` (`0x1B`) with `actionType` `KICK`, `REVOKE_SPEAK`, or `GRANT_SPEAK`. Commands publish on the Redis control channel in cluster mode. **KICK** sets `ClientSession.severed`, sends `SESSION_REVOKED` (`0x1C`, `{ reason }`), then disconnects and broadcasts peer `LEAVE_ROOM`; the victim client stops I/O threads, clears room/board state, and shows a lobby toast. **REVOKE_SPEAK** / **GRANT_SPEAK** toggle `PERM_SPEAK` and push `ROLE_UPDATE` to the affected client; `AudioEngine` hard-stops capture when speak is revoked.
 
-- **Collaboration Roster (`CollaborationRoster`)** — slide-out panel grouped by active board (`Participant.currentBoardId`), host crown indicators, mute/speaking badges, and a context menu (Kick / Revoke Speak / Grant Speak) when `PERM_MANAGE_USERS` is held. Integrates `ParticipantManager`, `RoomState`, and `ToastNotification` for moderation feedback. `ParticipantListView` remains for compact HUD rows; `wireCollaborationRoster()` is the primary in-room presence UI.
+- **Collaboration Roster (`CollaborationRoster`)** — slide-out panel grouped by active board (`Participant.currentBoardId`), host crown indicators, hardware-mute slash icon, and a blue **speaker** SVG when `Participant.isSpeaking` (replacing the prior avatar ring). Context menu (Kick / Revoke Speak / Grant Speak) when `PERM_MANAGE_USERS` is held. Integrates `ParticipantManager`, `RoomState`, and `ToastNotification` for moderation feedback. `ParticipantListView` remains for compact HUD rows; `wireCollaborationRoster()` is the primary in-room presence UI.
 
 - **Board Presence, Lock & Deletion** — when a peer switches boards, the server broadcasts `BOARD_SWITCH` (`0x1E`, `{ clientId, newBoardId }`) room-wide so the roster regroups without polling. Hosts toggle `RoomContext.boardCreationLocked` via `TOGGLE_BOARD_LOCK` (`0x1F`, `{ locked }`); members cannot create new boards while locked and fall back to an existing board on join. **`DELETE_BOARD` / `BOARD_DELETED` (`0x20` / `0x21`):** room managers send a JSON string `boardId` (not `Board-1`); `RoomContext` tombstones the id, `WalManager.deleteBoardFiles` removes `{roomId}_{boardId}.wal`, occupants on the deleted board are moved to `Board-1` with a fresh `SNAPSHOT`, and all clients receive `BOARD_DELETED` to prune thumbnails and show a toast. The Task View switcher exposes a trash control when `PERM_MANAGE_ROOM` is held.
 
@@ -97,7 +97,11 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Watch Party & YouTube Sync (`YoutubePlayerNode` / `MEDIA_CONTROL`)** — room-global media state in `RoomContext.currentMediaState`. Hosts send `MEDIA_CONTROL` (`PLAY`, `PAUSE`, `SEEK`, `LOAD`, `STOP`); `MessageCodec.deriveMediaState` computes the next snapshot with `serverEpochMs`. `MEDIA_STATE_UPDATE` is broadcast room-wide (and on the Redis **control** channel in cluster mode); joiners receive the current snapshot after `JOIN_ROOM`. `YoutubePlayerNode` hosts the YouTube IFrame API in a local `HttpServer`-served page (avoids `file://` restrictions), buffers early `MEDIA_STATE_UPDATE` frames until the `WebView` load succeeds, then applies server state with drift sync (green / amber / orange indicator). Transport UI is gated to `PERM_MANAGE_MEDIA`; `dispose()` stops local playback, loads `about:blank`, and clears pending state before overlay removal. Members can hide the player locally without stopping the session; **STOP** clears room media for everyone. `MediaStateListener` bridges `NetworkClient` to `WhiteboardApp`.
 
-- **Bidirectional Room Membership (`JOIN_ROOM` / `LEAVE_ROOM`)** — client→server `JOIN_ROOM` carries `{ roomId, initialBoardId? }`; server→peer `JOIN_ROOM` notifies `{ clientId, authorName }`. Client→server `LEAVE_ROOM` is empty; server→peer `LEAVE_ROOM` carries the departing `clientId` string (including moderation kicks and disconnects).
+- **Per-Room Display Names (`HANDSHAKE` + `JOIN_ROOM`)** — `HANDSHAKE` carries only `{ clientId }` (stable session id into the lobby). Room identity is declared on `JOIN_ROOM` as `{ roomId, displayName, initialBoardId? }`. The server sanitizes names (strip, max **20** chars, fallback to an 8-char `clientId` prefix when blank) and deduplicates collisions in-room by appending ` #XXXX`. The joiner receives a self `JOIN_ROOM` `{ clientId, authorName }` with the **confirmed** name; `NetworkClient` stores it in `lockedRoomName` for reconnect and outbound `SHAPE_START` / `TEXT_UPDATE` attribution. Legacy `authorName` in `HANDSHAKE` JSON is ignored.
+
+- **Lobby Display-Name UX** — the login screen only connects TCP (`Join Network`); the lobby modal has a validated **Display name** field (`lobby-display-name-field`) with green/red border feedback. Create/join room actions stay disabled until a non-blank name is entered (`WhiteboardAppLobbyDisplayNameTest`).
+
+- **Bidirectional Room Membership (`JOIN_ROOM` / `LEAVE_ROOM`)** — client→server `JOIN_ROOM` carries `{ roomId, displayName, initialBoardId? }`; server→peer `JOIN_ROOM` notifies `{ clientId, authorName }` (server-confirmed display name). Client→server `LEAVE_ROOM` is empty and clears `lockedRoomName`; server→peer `LEAVE_ROOM` carries the departing `clientId` string (including moderation kicks and disconnects).
 
 - **Canvas Viewport Resize Coalescing** — `CanvasViewportResizeHandler` listens to the canvas container's width/height properties and coalesces invalidations into a single `Platform.runLater` redraw, avoiding redundant full-canvas repaints when JavaFX resizes the `Canvas` surface (which would otherwise clear pixel buffers at 0×0 during layout).
 
@@ -213,6 +217,7 @@ distrisync/
 │           │   ├── SpatialHashGridTest.java
 │           │   ├── NetworkClientTelemetryTest.java
 │           │   ├── NetworkClientStateTest.java
+│           │   ├── WhiteboardAppLobbyDisplayNameTest.java
 │           │   ├── ParticipantManagerTest.java
 │           │   ├── CollaborationRosterModerationTest.java
 │           │   ├── PointerStateTrackerTest.java
@@ -280,7 +285,7 @@ distrisync/
 
 | `MessageType` | Byte | Direction | Persisted to WAL | Description |
 |---|---|---|---|---|
-| `HANDSHAKE` | `0x01` | C → S | No | Client identification (`clientId`, `authorName`) |
+| `HANDSHAKE` | `0x01` | C → S | No | Session identification (`clientId` only); places client in lobby. Legacy `authorName` in JSON is ignored |
 | `SNAPSHOT` | `0x02` | S → C | No | Join/board-switch hydration header (`[]`) or legacy full state; chunked joins stream shapes via `MUTATION_BATCH` until `SNAPSHOT_END` |
 | `MUTATION` | `0x03` | C ↔ S | **Yes** | Committed shape add/update; broadcast to board peers |
 | `UDP_POINTER` | `0x04` | UDP only | No | Ephemeral cursor position (multicast, not TCP) |
@@ -292,7 +297,7 @@ distrisync/
 | `SHAPE_DELETE` | `0x0A` | S → C | **Yes** | Broadcast shape removal after authorized undo/delete |
 | `TEXT_UPDATE` | `0x0B` | C ↔ S | No | Live text ghost preview; requires `PERM_DRAW`; relayed to board peers, not persisted |
 | `LOBBY_STATE` | `0x0C` | S → C | No | JSON array of `{ roomId, userCount }` for room discovery |
-| `JOIN_ROOM` | `0x0D` | C ↔ S | No | **C→S:** `{ roomId, initialBoardId? }` (legacy string roomId accepted). **S→peers:** `{ clientId, authorName }` on member join |
+| `JOIN_ROOM` | `0x0D` | C ↔ S | No | **C→S:** `{ roomId, displayName, initialBoardId? }` (legacy string roomId accepted). **S→joiner + peers:** `{ clientId, authorName }` with server-sanitized, deduplicated display name |
 | `LEAVE_ROOM` | `0x0E` | C ↔ S | No | **C→S:** return to lobby (empty). **S→peers:** JSON string `clientId` when a member leaves or is kicked |
 | `SWITCH_BOARD` | `0x0F` | C → S | No | JSON string target board id; server responds with `SNAPSHOT` |
 | `BOARD_LIST_UPDATE` | `0x10` | S → C | No | JSON array of board id strings actively in use within the room |

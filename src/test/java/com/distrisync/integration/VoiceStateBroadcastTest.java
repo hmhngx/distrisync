@@ -67,8 +67,8 @@ class VoiceStateBroadcastTest {
 
         listenerB = mock(VoiceStateListener.class);
 
-        clientA = new NetworkClient(HOST, serverPort, "UserA", "client-a");
-        clientB = new NetworkClient(HOST, serverPort, "UserB", "client-b");
+        clientA = new NetworkClient(HOST, serverPort, "client-a");
+        clientB = new NetworkClient(HOST, serverPort, "client-b");
         clientB.addVoiceStateListener(listenerB);
 
         clientA.addListener(new SnapshotGate(clientASnapshot));
@@ -76,8 +76,8 @@ class VoiceStateBroadcastTest {
 
         clientA.connect();
         clientB.connect();
-        clientA.sendJoinRoom("Global");
-        clientB.sendJoinRoom("Global");
+        clientA.sendJoinRoom("Global", "UserA");
+        clientB.sendJoinRoom("Global", "UserB");
 
         await("both clients receive initial SNAPSHOT")
                 .atMost(SETUP_TIMEOUT_S, TimeUnit.SECONDS)

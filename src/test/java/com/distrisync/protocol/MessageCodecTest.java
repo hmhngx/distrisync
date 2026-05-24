@@ -91,21 +91,19 @@ class MessageCodecTest {
 
     @Test
     void handshake_encode_decode_roundTrip() {
-        ByteBuffer frame = MessageCodec.encodeHandshake("Alice", "cid-1");
+        ByteBuffer frame = MessageCodec.encodeHandshake("cid-1");
         Message    msg   = MessageCodec.decode(frame);
         MessageCodec.HandshakePayload hp = MessageCodec.decodeHandshake(msg);
 
         assertThat(msg.type()).isEqualTo(MessageType.HANDSHAKE);
-        assertThat(hp.authorName()).isEqualTo("Alice");
         assertThat(hp.clientId()).isEqualTo("cid-1");
     }
 
     @Test
-    void handshake_legacyRoomIdInJson_isIgnored() {
+    void handshake_legacyAuthorNameInJson_isIgnored() {
         String legacyJson = "{\"authorName\":\"x\",\"clientId\":\"y\",\"roomId\":\"old-room\"}";
         Message msg = new Message(MessageType.HANDSHAKE, legacyJson);
         MessageCodec.HandshakePayload hp = MessageCodec.decodeHandshake(msg);
-        assertThat(hp.authorName()).isEqualTo("x");
         assertThat(hp.clientId()).isEqualTo("y");
     }
 
@@ -133,12 +131,13 @@ class MessageCodecTest {
 
     @Test
     void joinRoom_roundTrip_objectPayload_defaultsBoard() {
-        ByteBuffer frame = MessageCodec.encodeJoinRoom("my-room");
+        ByteBuffer frame = MessageCodec.encodeJoinRoom("my-room", "Alice");
         Message msg = MessageCodec.decode(frame);
         assertThat(msg.type()).isEqualTo(MessageType.JOIN_ROOM);
         MessageCodec.JoinRoomPayload jp = MessageCodec.decodeJoinRoom(msg);
         assertThat(jp.roomId()).isEqualTo("my-room");
         assertThat(jp.initialBoardId()).isEqualTo(MessageCodec.DEFAULT_INITIAL_BOARD_ID);
+        assertThat(jp.displayName()).isEqualTo("Alice");
     }
 
     @Test
@@ -148,15 +147,17 @@ class MessageCodecTest {
         MessageCodec.JoinRoomPayload jp = MessageCodec.decodeJoinRoom(msg);
         assertThat(jp.roomId()).isEqualTo("legacy-room");
         assertThat(jp.initialBoardId()).isEqualTo(MessageCodec.DEFAULT_INITIAL_BOARD_ID);
+        assertThat(jp.displayName()).isEmpty();
     }
 
     @Test
     void joinRoom_roundTrip_withInitialBoard() {
-        ByteBuffer frame = MessageCodec.encodeJoinRoom("r1", "Board-2");
+        ByteBuffer frame = MessageCodec.encodeJoinRoom("r1", "Alice", "Board-2");
         Message msg = MessageCodec.decode(frame);
         MessageCodec.JoinRoomPayload jp = MessageCodec.decodeJoinRoom(msg);
         assertThat(jp.roomId()).isEqualTo("r1");
         assertThat(jp.initialBoardId()).isEqualTo("Board-2");
+        assertThat(jp.displayName()).isEqualTo("Alice");
     }
 
     @Test
@@ -187,7 +188,7 @@ class MessageCodecTest {
 
     @Test
     void roomMemberJoined_decode_rejectsClientJoinPayload() {
-        ByteBuffer frame = MessageCodec.encodeJoinRoom("my-room");
+        ByteBuffer frame = MessageCodec.encodeJoinRoom("my-room", "Alice");
         Message msg = MessageCodec.decode(frame);
         assertThatThrownBy(() -> MessageCodec.decodeRoomMemberJoined(msg))
                 .isInstanceOf(IllegalArgumentException.class)
