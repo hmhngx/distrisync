@@ -2304,6 +2304,26 @@ public class WhiteboardApp extends Application {
         }
     }
 
+    /**
+     * Resolves a session {@code clientId} to the roster display name from
+     * {@link ParticipantManager}; falls back to a truncated id or {@code Unknown}.
+     */
+    private String resolveDisplayName(String clientId) {
+        if (clientId == null || clientId.isBlank()) {
+            return "Unknown";
+        }
+        if (networkClient != null) {
+            Participant p = networkClient.getParticipantManager().get(clientId);
+            if (p != null) {
+                String name = p.getName();
+                if (name != null && !name.isBlank()) {
+                    return name;
+                }
+            }
+        }
+        return clientId.length() > 8 ? clientId.substring(0, 8) : clientId;
+    }
+
     private void handlePeerLeft(String clientId) {
         if (networkClient == null || clientId == null || clientId.isBlank()) {
             return;
@@ -2698,8 +2718,8 @@ public class WhiteboardApp extends Application {
             // a tooltip attributing it to its author.
             if (!isDragging) {
                 Shape hit = findShapeAt(e.getX(), e.getY());
-                if (hit != null && !hit.authorName().isBlank()) {
-                    ownerTooltip.setText("Drawn by: " + hit.authorName());
+                if (hit != null) {
+                    ownerTooltip.setText("Drawn by: " + resolveDisplayName(hit.clientId()));
                     ownerTooltip.show(target, e.getScreenX() + 14, e.getScreenY() + 14);
                 } else {
                     ownerTooltip.hide();
@@ -3378,10 +3398,12 @@ public class WhiteboardApp extends Application {
 
             @Override
             public void onShapeStart(UUID shapeId, String tool, String color,
-                                     double strokeWidth, double x, double y, String authorName) {
+                                     double strokeWidth, double x, double y,
+                                     String authorName, String clientId) {
                 Platform.runLater(() -> {
                     transientShapes.put(shapeId,
-                            new TransientShapeEntry(shapeId, tool, color, strokeWidth, x, y, authorName));
+                            new TransientShapeEntry(shapeId, tool, color, strokeWidth, x, y,
+                                    authorName, clientId));
                     renderTransient();
                 });
             }
@@ -3463,7 +3485,7 @@ public class WhiteboardApp extends Application {
                 Platform.runLater(() -> {
                     VBox ghost = ghostTextNodes.get(objectId);
                     if (ghost == null) {
-                        ghost = buildGhostTextNode(authorName, clientId);
+                        ghost = buildGhostTextNode(resolveDisplayName(clientId), clientId);
                         ghostTextNodes.put(objectId, ghost);
                         cursorPane.getChildren().add(ghost);
                     }
@@ -3497,7 +3519,7 @@ public class WhiteboardApp extends Application {
         networkClient.addCursorSyncListener((peerId, peerName, cx, cy) ->
                 Platform.runLater(() -> {
                     if (remoteCursorManager != null) {
-                        remoteCursorManager.updateTarget(peerId, peerName, cx, cy);
+                        remoteCursorManager.updateTarget(peerId, resolveDisplayName(peerId), cx, cy);
                     }
                 }));
     }
@@ -3705,8 +3727,8 @@ public class WhiteboardApp extends Application {
             // ── Figma-style author attribution label ──────────────────────────
             // Rendered at the tip of the in-progress shape so every observer
             // can see which peer is drawing at a glance.
-            if (entry.authorName != null && !entry.authorName.isBlank()) {
-                String label   = entry.authorName;
+            if (entry.clientId != null && !entry.clientId.isBlank()) {
+                String label   = resolveDisplayName(entry.clientId);
                 double lx      = entry.lastX + 10;
                 double ly      = entry.lastY - 10;
                 double approxW = label.length() * 6.8;
@@ -3999,13 +4021,16 @@ public class WhiteboardApp extends Application {
         final double       startY;
         /** Display name of the remote peer who owns this in-progress gesture. */
         final String       authorName;
+        /** Session-scoped peer id (server-stamped on {@code SHAPE_START}). */
+        final String       clientId;
         double             lastX;
         double             lastY;
         /** Accumulated points — only populated for FREEHAND / ERASER gestures. */
         final List<double[]> points = new ArrayList<>();
 
         TransientShapeEntry(UUID shapeId, String tool, String color,
-                            double strokeWidth, double x, double y, String authorName) {
+                            double strokeWidth, double x, double y,
+                            String authorName, String clientId) {
             this.shapeId     = shapeId;
             this.tool        = tool;
             this.color       = color;
@@ -4013,6 +4038,7 @@ public class WhiteboardApp extends Application {
             this.startX      = x;
             this.startY      = y;
             this.authorName  = authorName != null ? authorName : "";
+            this.clientId    = clientId != null ? clientId : "";
             this.lastX       = x;
             this.lastY       = y;
             if ("FREEHAND".equals(tool) || "ERASER".equals(tool)) {
