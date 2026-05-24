@@ -76,6 +76,12 @@ final class ClientSession {
     volatile boolean handshakeComplete = false;
 
     /**
+     * Set when the server has decided to terminate this TCP session; stops further inbound
+     * frame processing in {@link NioServer#handleRead}.
+     */
+    volatile boolean severed = false;
+
+    /**
      * Bitmask of {@link RoomPermissions} granted on {@code JOIN_ROOM}; {@link RoomPermissions#SPECTATOR}
      * while in the lobby.
      */

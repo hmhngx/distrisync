@@ -56,10 +56,14 @@ class NetworkClientStateTest {
             client.ingestSessionRevokedForStateTest("policy violation");
             assertThat(client.isAutoReconnectEnabledForTest()).isFalse();
             assertThat(client.getActiveRoomId()).isBlank();
+            assertThat(client.isRunning()).isFalse();
             client.resumeAfterSessionRevoked();
             await().atMost(5, TimeUnit.SECONDS)
                     .pollInterval(50, TimeUnit.MILLISECONDS)
-                    .untilAsserted(() -> assertThat(client.isAutoReconnectEnabledForTest()).isTrue());
+                    .untilAsserted(() -> {
+                        assertThat(client.isAutoReconnectEnabledForTest()).isTrue();
+                        assertThat(client.isRunning()).isTrue();
+                    });
         }
     }
 

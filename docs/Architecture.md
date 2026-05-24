@@ -74,13 +74,13 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x02`    | `SNAPSHOT`         | Server → Client      | No               | Chunked join header: empty JSON array `[]`, or legacy full board payload. Starts hydration; shapes follow as `MUTATION_BATCH` frames until `SNAPSHOT_END`. |
 | `0x03`    | `MUTATION`         | Client ↔ Server      | **Yes**          | Committed shape add/update. Payload: single shape envelope with `_type` discriminator, `objectId` (UUID), `timestamp` (Lamport). |
 | `0x04`    | `UDP_POINTER`      | Client → Server (UDP)| No               | Ephemeral cursor-position broadcast. Fire-and-forget; loss is acceptable.  |
-| `0x05`    | `SHAPE_START`      | Client → All peers   | No               | Peer begins drawing; carries tool, color, and origin coordinates.           |
+| `0x05`    | `SHAPE_START`      | Client → All peers   | No               | Peer begins drawing; server injects `clientId` from session before relay. Payload includes tool, color, origin, `authorName`. |
 | `0x06`    | `SHAPE_UPDATE`     | Client → All peers   | No               | Incremental coordinate stream for an in-progress shape (live preview).      |
 | `0x07`    | `SHAPE_COMMIT`     | Client → All peers   | No               | Drawing gesture completed; peers flush their transient preview canvas layer.|
-| `0x08`    | `CLEAR_USER_SHAPES`| Client ↔ All peers   | **Yes**          | Remove all shapes owned by `clientId`. Payload: JSON string of `clientId`. Server broadcasts after purging `shapeMap`. |
-| `0x09`    | `UNDO_REQUEST`     | Client → Server      | No               | Delete one shape by UUID. Payload: `{ "shapeId": "<uuid>" }`. Server responds with `SHAPE_DELETE`. |
-| `0x0A`    | `SHAPE_DELETE`     | Server → All peers   | **Yes**          | Server confirms deletion. Payload: `{ "shapeId": "<uuid>" }`. Broadcast to all peers except originator. |
-| `0x0B`    | `TEXT_UPDATE`      | Client → All peers   | No               | Ephemeral live-typing event. Payload: `{ objectId, clientId, authorName, x, y, currentText }`. Never written to `shapeMap`; final committed `TextNode` arrives as a `MUTATION`. |
+| `0x08`    | `CLEAR_USER_SHAPES`| Client ↔ All peers   | **Yes**          | Remove all shapes owned by `clientId`. Payload: JSON string of `targetClientId`. `targetClientId` must match `session.clientId` unless sender has `PERM_MANAGE_USERS`. |
+| `0x09`    | `UNDO_REQUEST`     | Client → Server      | No               | Delete one shape by UUID. Payload: `{ "shapeId": "<uuid>" }`. Allowed only when stored shape `clientId` matches session (or sender has `PERM_MANAGE_USERS`); server responds with `SHAPE_DELETE`. |
+| `0x0A`    | `SHAPE_DELETE`     | Server → All peers   | **Yes**          | Server confirms deletion. Payload: `{ "shapeId": "<uuid>" }`. Same ownership gate as `UNDO_REQUEST` when accepted from a client. |
+| `0x0B`    | `TEXT_UPDATE`      | Client → All peers   | No               | Ephemeral live-typing event. Requires `PERM_DRAW`. Payload: `{ objectId, clientId, authorName, x, y, currentText }`. Never written to `shapeMap`; final committed `TextNode` arrives as a `MUTATION`. |
 | `0x0C`    | `LOBBY_STATE`      | Server → Client      | No               | Room discovery snapshot. Payload: JSON array of `{ roomId, userCount }`, merged from active rooms plus persisted WAL stems. |
 | `0x0D`    | `JOIN_ROOM`        | Client ↔ Server      | No               | **Client→server:** `{ roomId, initialBoardId? }`. **Server→peers:** `{ clientId, authorName }` when a member joins. |
 | `0x0E`    | `LEAVE_ROOM`       | Client ↔ Server      | No               | **Client→server:** empty (return to lobby). **Server→peers:** JSON string `clientId` on depart / kick / disconnect. |
@@ -97,14 +97,14 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x19`    | `STATE_SNAPSHOT`   | Backplane only       | No               | Hot node bulk board payload (same JSON array shape as `SNAPSHOT`). Answers `STATE_REQUEST`; never accepted from TCP clients. |
 | `0x1A`    | `CURSOR_SYNC`      | Client ↔ Server      | No               | Ephemeral multiplayer cursor. Payload: `{ clientId, authorName, x, y }`. Relayed in-room on TCP; cross-node via Redis `:presence` channel (no WAL / dedup). |
 | `0x1B`    | `MODERATION_ACTION`| Client → Server / Backplane | No | `{ actionType, targetClientId, reason }`. Supported `actionType`: `KICK`, `REVOKE_SPEAK`, `GRANT_SPEAK`. Requires `PERM_MANAGE_USERS`. |
-| `0x1C`    | `SESSION_REVOKED`  | Server → Client      | No               | `{ reason }`. Sent to a kicked client; triggers lobby return and UI toast. |
+| `0x1C`    | `SESSION_REVOKED`  | Server → Client      | No               | `{ reason }`. Sent to a kicked client; triggers lobby return, auto-reconnect suppression, and TCP teardown on the client (see §22.3). |
 | `0x1D`    | `ROLE_UPDATE`      | Server → Client      | No               | `{ newHostClientId, newPermissions, roomHostClientId? }`. Syncs affected client permissions and room host id. |
 | `0x1E`    | `BOARD_SWITCH`     | Server → Room        | No               | `{ clientId, newBoardId }`. Room-wide active-board presence for roster grouping. |
 | `0x1F`    | `TOGGLE_BOARD_LOCK`| Client ↔ Server      | No               | `{ locked }`. Host sets `RoomContext.boardCreationLocked`; server broadcasts state to all room members. |
 | `0x20`    | `DELETE_BOARD`     | Client → Server      | No               | JSON string `boardId`. Requires `PERM_MANAGE_ROOM`. Cannot delete `Board-1` (default). Tombstones board + deletes WAL. |
 | `0x21`    | `BOARD_DELETED`    | Server → Room        | No               | JSON string `boardId`. Notifies all occupants to refresh board list / Task View UI. |
 | `0x22`    | `MEDIA_STATE_UPDATE` | Server → Room      | No               | `{ state, mediaTimeSeconds, serverEpochMs, videoId }` — authoritative room-global media snapshot. When `state` is `PLAYING`, position at client time `t` is `mediaTimeSeconds + (t - serverEpochMs) / 1000.0`; when `PAUSED`, use `mediaTimeSeconds` directly. Hydrated on join and via control channel on multi-node clusters. |
-| `0x23`    | `MEDIA_CONTROL`    | Client → Server      | No               | `{ action, requestedTime, targetId }` — `action`: `PLAY`, `PAUSE`, `SEEK`, `LOAD`, `STOP`. Requires `PERM_MANAGE_MEDIA`. Server derives `MEDIA_STATE_UPDATE`, stores `RoomContext.currentMediaState` (`null` after `STOP`), broadcasts locally, and publishes to Redis control channel. |
+| `0x23`    | `MEDIA_CONTROL`    | Client → Server      | No               | `{ action, requestedTime, targetId }` — `action`: `PLAY`, `PAUSE`, `SEEK`, `LOAD`, `STOP`. Requires `PERM_MANAGE_MEDIA`. Server derives `MEDIA_STATE_UPDATE`, stores `RoomContext.currentMediaState` (`null` after `STOP`), broadcasts locally, and publishes to Redis control channel. Invalid actions throw `IllegalArgumentException` and are logged without fan-out. |
 | `0x24`    | `MUTATION_BATCH`     | Client ↔ Server      | **Yes**          | Batched committed shapes (freehand stroke segments). Payload: JSON array of shape envelopes (same format as `SNAPSHOT`). Server applies each shape via LWW `applyMutation`, then one WAL append and one board broadcast per frame. On join, server streams board state as chunked `MUTATION_BATCH` frames between `SNAPSHOT` `[]` and `SNAPSHOT_END`. |
 | `0x25`    | `SNAPSHOT_END`       | Server → Client      | No               | Marks end of chunked snapshot hydration. Empty payload; client applies buffered shapes from preceding batches. |
 
@@ -212,6 +212,11 @@ TCP is a **byte-stream** transport. It has no concept of message boundaries — 
 | `SelectionKey.OP_WRITE`| Armed *only* when a previous write stalled (TCP send-buffer full); cleared when the queue drains |
 | `ClientSession.readBuffer` | 64 KiB per-connection accumulation buffer; uses `flip() / compact()` idiom for safe partial-frame handling |
 | `ClientSession.writeQueue` | `ArrayDeque<ByteBuffer>` FIFO; each entry is an independent copy so one buffer can be enqueued for N recipients |
+| `ClientSession.severed` | Set at the start of `severSession` / `closeKey`; `handleRead` stops decoding further frames in the same TCP batch when `severed` or `!key.isValid()` |
+
+### 3.1.1 Dead-session read short-circuit
+
+After `SESSION_REVOKED`, moderation KICK, or any `closeKey` teardown, `ClientSession.severed` is set before the channel is cancelled. In `handleRead`, each iteration of the decode loop checks `session.severed` and `SelectionKey.isValid()` **before** `MessageCodec.decode`; remaining bytes in `readBuffer` are cleared so ghost frames in the same read batch cannot run `processMessage`. `NioServerDeadSessionReadTest` covers malformed-teardown and pre-marked `severed` paths.
 
 ### 3.2 Why This Prevents Thread Starvation vs. 1:1 Thread-per-Client
 
@@ -251,7 +256,7 @@ Each client generates a `UUID.randomUUID()` for every shape it creates *before* 
 
 1. **No round-trip required for identity** — the client can render its own shape optimistically before the server acknowledges it.
 2. **Idempotency** — if a `MUTATION` frame is delivered twice (e.g. due to a network retry), the second application is a no-op because the stored `timestamp` will be `≥` the incoming one.
-3. **Distributed undo** — any client holding the `objectId` of a shape it created can issue an `UNDO_REQUEST` with that UUID, and the server's `deleteShape(UUID)` operates in O(1) with no scan.
+3. **Distributed undo** — a client may issue `UNDO_REQUEST` for a shape only when the stored `clientId` matches its session (or it holds `PERM_MANAGE_USERS`); the server's `getShape` + ownership check precedes `deleteShape(UUID)` in O(1).
 
 **Conflict resolution — last-writer-wins by Lamport timestamp:**
 
@@ -268,21 +273,27 @@ shapeMap.compute(incoming.objectId(), (id, existing) -> {
 
 `ConcurrentHashMap.compute()` acquires an internal per-segment lock for the duration of the lambda, making this a **single atomic compare-and-swap** with no external synchronization required. The server only broadcasts a mutation to peers if `applied[0]` is `true`, preventing stale updates from polluting the network.
 
+**Server-side attribution:** before `applyMutation`, `NioServer` replaces `Shape.clientId` with `session.clientId` via `ShapeAuthority.stampClientId` (unless the sender has `PERM_MANAGE_USERS`). Clients may still send author names in the payload, but durable ownership is always session-bound.
+
 ### 4.3 Undo Flow
 
 ```
 Client                    Server (NioServer)         CanvasStateManager
   │                             │                          │
   │── UNDO_REQUEST ────────────►│                          │
-  │   { shapeId: "uuid" }       │── deleteShape(uuid) ────►│
+  │   { shapeId: "uuid" }       │── getShape(uuid) ───────►│
+  │                             │◄── shape (or null) ──────│
+  │                             │  reject if clientId ≠ session
+  │                             │  (unless PERM_MANAGE_USERS)
+  │                             │── deleteShape(uuid) ────►│
   │                             │                          │── shapeMap.remove(uuid)
   │                             │◄── true (deleted) ───────│
   │                             │                          │
-  │                             │── SHAPE_DELETE ─────────►│ (broadcast to all room peers)
+  │                             │── SHAPE_DELETE ─────────►│ (broadcast to board peers)
   │                             │   { shapeId: "uuid" }    │
 ```
 
-`deleteShape()` is a single `ConcurrentHashMap.remove()` call — O(1) and safe from any thread. The server does **not** send a confirmation back to the requesting client; the client that issued `UNDO_REQUEST` removes the shape from its own canvas optimistically and only the *other* clients receive the `SHAPE_DELETE` broadcast.
+`CanvasStateManager.getShape(UUID)` supports the ownership gate; `deleteShape()` remains O(1). The server does **not** send a confirmation back to the requesting client; the client that issued `UNDO_REQUEST` removes the shape from its own canvas optimistically and only the *other* clients receive the `SHAPE_DELETE` broadcast.
 
 ### 4.4 Scoped Clear (CLEAR_USER_SHAPES)
 
@@ -291,7 +302,7 @@ Client                    Server (NioServer)         CanvasStateManager
 shapeMap.values().removeIf(shape -> shape.clientId().equals(targetClientId));
 ```
 
-This removes all shapes attributed to one `clientId` in a single pass using `ConcurrentHashMap`'s internal per-segment locks, making it consistent without a global lock. The server then rebroadcasts the same `CLEAR_USER_SHAPES` frame so every peer removes those shapes from its own local rendering canvas.
+This removes all shapes attributed to one `clientId` in a single pass using `ConcurrentHashMap`'s internal per-segment locks, making it consistent without a global lock. The server rejects `CLEAR_USER_SHAPES` when `targetClientId ≠ session.clientId` and the sender lacks `PERM_MANAGE_USERS`, then rebroadcasts the frame so every peer removes those shapes from its own local rendering canvas.
 
 ---
 
@@ -825,7 +836,20 @@ GC eviction removes in-memory room routing only. It does not delete WAL files. D
 
 `WhiteboardApp.Tool` enumerates `LINE`, `CIRCLE`, `RECTANGLE`, `ELLIPSE`, `ARROW`, `FREEHAND`, `ERASER`, and `TEXT`. Drag gestures on the base canvas call `GlobalCanvasShapeFactory` methods, which read colour and stroke width from `GlobalCanvasContext` and stamp `authorName` / `clientId`. Single-shape tools call `addAndSend(shape)` → one `MUTATION`. **FREEHAND** commits all stroke segments via `addAndSendBatch` → one or few `MUTATION_BATCH` frames (chunked to stay under the server's 64 KiB read buffer), replacing the previous per-segment `MUTATION` storm.
 
-Live preview for vector tools still uses the ephemeral `SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT` relay path; only the final geometry is persisted.
+Live preview for vector tools still uses the ephemeral `SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT` relay path; only the final geometry is persisted. **`SHAPE_START` relay:** the server parses the client payload, adds `clientId` from `ClientSession`, and re-encodes before `broadcastToBoard` so peers receive a trusted session id for attribution (see §11.4).
+
+### 11.4 Live Attribution (`resolveDisplayName`)
+
+`WhiteboardApp` resolves display names from `ParticipantManager` by `clientId` rather than trusting wire `authorName` alone:
+
+| Surface | Source id | Resolver |
+|---|---|---|
+| In-progress stroke label | `TransientShapeEntry.clientId` from relayed `SHAPE_START` | `resolveDisplayName(clientId)` |
+| Committed shape tooltip | `Shape.clientId()` from stored state | same |
+| Live text ghost | `TEXT_UPDATE.clientId` | same |
+| `CURSOR_SYNC` badge | peer `clientId` | same |
+
+Fallback order: roster display name → truncated `clientId` (8 chars) → `"Unknown"`. Server-stamped `clientId` on mutations and `SHAPE_START` keeps attribution aligned with session identity (§20.1).
 
 ### 11.3 Incremental Base-Canvas Rendering
 
@@ -1121,6 +1145,20 @@ These tools complement the Surefire suite (`server/backplane/*`, `NioServerRemot
 
 `NioServerRbacTest` and `RoomPermissionsTest` lock deny paths for draw, speak, moderation, board-lock, board-delete, and media-control commands.
 
+### 20.1 Server-Side Object Authority
+
+On the client→server hot path, `NioServer` treats `ClientSession.clientId` (from `HANDSHAKE`) as the unforgeable identity source — the same model as `VOICE_STATE` and `CURSOR_SYNC` (`payload.clientId` must match the session).
+
+| Message | Enforcement |
+|---------|-------------|
+| `MUTATION` / `MUTATION_BATCH` | `Shape.clientId` is overwritten with `session.clientId` before apply, WAL, and broadcast (unless the sender has `PERM_MANAGE_USERS`) |
+| `SHAPE_DELETE` | Delete allowed only when the stored shape's `clientId` matches `session.clientId`, or the sender has `PERM_MANAGE_USERS` |
+| `UNDO_REQUEST` | Same ownership gate as `SHAPE_DELETE` |
+| `CLEAR_USER_SHAPES` | `targetClientId` must equal `session.clientId` unless the sender has `PERM_MANAGE_USERS` |
+| `TEXT_UPDATE` | Requires `PERM_DRAW` (spectators cannot relay live typing) |
+
+`ShapeAuthority.stampClientId` performs the sealed-hierarchy copy; `CanvasStateManager.getShape` supports delete ownership checks. `NioServerObjectAuthorityTest` covers IDOR regressions.
+
 ---
 
 ## 21. Host Election & ROLE_UPDATE
@@ -1175,6 +1213,35 @@ Moderator (PERM_MANAGE_USERS)
 Owners (`canDeleteRoom`) cannot be kicked or have speak revoked. Unsupported `actionType` values are logged and ignored.
 
 `NioServerModerationKickTest`, `NioServerModerationRevokeSpeakTest`, and `NioServerModerationGrantSpeakTest` assert local and backplane paths. `MessageCodecModerationTest` locks JSON contracts.
+
+On KICK, `severSession` sets `ClientSession.severed` immediately so any further frames already buffered for that TCP session are discarded by the `handleRead` short-circuit (see §3.1.1).
+
+### 22.3 Client `SESSION_REVOKED` lifecycle
+
+When a kicked client receives `SESSION_REVOKED` on the read thread, `NetworkClient`:
+
+```
+SESSION_REVOKED { reason }
+    ├─ suppressAutoReconnect()          // do not re-JOIN the evicted room
+    ├─ running.set(false)
+    ├─ closeChannelQuietly()            // tcpConnected → false
+    ├─ resetWorkspaceForLobby()         // clear room/board/canvas state
+    └─ publishUdpActive(false)          // stop treating UDP audio as live
+```
+
+`WhiteboardApp` shows a toast via `SessionRevokedListener` and calls `resumeAfterSessionRevoked()` so the user can continue in the lobby:
+
+```
+resumeAfterSessionRevoked()
+    ├─ running.set(true)                // re-arm even if kick cleared running
+    ├─ autoReconnectEnabled.set(true)
+    ├─ connectWithBackoff() + HANDSHAKE
+    ├─ startReadThread() / startWriteThread() if daemons exited
+    ├─ sendFetchLobby()
+    └─ publishTcpConnected(true)
+```
+
+This path intentionally **does not** re-issue `JOIN_ROOM` for the evicted room. Accidental disconnects (EOF / I/O error) still use the normal `reconnect()` loop with deferred join replay. `NetworkClientStateTest` asserts `running` toggles false on kick and true after resume.
 
 ---
 
@@ -1431,4 +1498,4 @@ sequenceDiagram
 | 17–19 | `PING`/`PONG` every 5 s after handshake; client maintains a rolling average of the last 10 RTT samples. |
 | 20–27 | Live draw (`SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT`) is relayed only, not persisted. |
 | 28–34 | `MUTATION` applies LWW CAS in memory, appends to board WAL, then broadcasts to same room + same board peers. |
-| 35–40 | `UNDO_REQUEST` deletes in memory, persists `SHAPE_DELETE`, then broadcasts deletion to peers except originator. |
+| 35–40 | `UNDO_REQUEST` checks stored shape ownership before delete; persists `SHAPE_DELETE` and broadcasts to board peers except originator. |

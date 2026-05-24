@@ -538,8 +538,17 @@ public final class NioServer implements Runnable {
         log.debug("Read {} bytes from session={}", bytesRead, session.sessionId);
 
         session.readBuffer.flip();
+        if (session.severed || !key.isValid()) {
+            session.readBuffer.clear();
+            session.readBuffer.compact();
+            return;
+        }
         try {
             while (session.readBuffer.hasRemaining()) {
+                if (!key.isValid() || session.severed) {
+                    session.readBuffer.clear();
+                    break;
+                }
                 Message msg;
                 try {
                     msg = MessageCodec.decode(session.readBuffer);
@@ -808,21 +817,26 @@ public final class NioServer implements Runnable {
                     return;
                 }
 
+                Shape trusted = RoomPermissions.canManageUsers(session.permissions)
+                        ? shape
+                        : ShapeAuthority.stampClientId(shape, session.clientId);
+                Message trustedMsg = new Message(MessageType.MUTATION, ShapeCodec.encodeMutation(trusted));
+
                 CanvasStateManager board = room.getBoard(session.currentBoardId);
                 if (board == null) {
                     return;
                 }
-                boolean applied = board.applyMutation(shape);
+                boolean applied = board.applyMutation(trusted);
 
                 if (applied) {
                     log.debug("MUTATION accepted  type={} id={} ts={} author='{}' room='{}' board='{}' from={}",
-                            shape.getClass().getSimpleName(), shape.objectId(),
-                            shape.timestamp(), shape.authorName(), session.roomId, session.currentBoardId,
+                            trusted.getClass().getSimpleName(), trusted.objectId(),
+                            trusted.timestamp(), trusted.authorName(), session.roomId, session.currentBoardId,
                             session.sessionId);
 
                     final String roomId = session.roomId;
                     final String boardId = session.currentBoardId;
-                    submitMutationSideEffects(roomId, boardId, msg, senderKey);
+                    submitMutationSideEffects(roomId, boardId, trustedMsg, senderKey);
                 } else {
                     log.debug("MUTATION rejected (stale)  id={} from={}", shape.objectId(), session.sessionId);
                 }
@@ -849,13 +863,23 @@ public final class NioServer implements Runnable {
                     return;
                 }
 
+                boolean stampClientId = !RoomPermissions.canManageUsers(session.permissions);
+                List<Shape> trustedBatch = new java.util.ArrayList<>(batch.size());
+                for (Shape shape : batch) {
+                    trustedBatch.add(stampClientId
+                            ? ShapeAuthority.stampClientId(shape, session.clientId)
+                            : shape);
+                }
+                Message trustedMsg = new Message(
+                        MessageType.MUTATION_BATCH, ShapeCodec.encodeMutationBatch(trustedBatch));
+
                 CanvasStateManager board = room.getBoard(session.currentBoardId);
                 if (board == null) {
                     return;
                 }
 
                 boolean anyApplied = false;
-                for (Shape shape : batch) {
+                for (Shape shape : trustedBatch) {
                     if (board.applyMutation(shape)) {
                         anyApplied = true;
                     }
@@ -863,11 +887,11 @@ public final class NioServer implements Runnable {
 
                 if (anyApplied) {
                     log.debug("MUTATION_BATCH accepted  count={} room='{}' board='{}' from={}",
-                            batch.size(), session.roomId, session.currentBoardId, session.sessionId);
+                            trustedBatch.size(), session.roomId, session.currentBoardId, session.sessionId);
 
                     final String roomId = session.roomId;
                     final String boardId = session.currentBoardId;
-                    submitMutationSideEffects(roomId, boardId, msg, senderKey);
+                    submitMutationSideEffects(roomId, boardId, trustedMsg, senderKey);
                 } else {
                     log.debug("MUTATION_BATCH rejected (all stale)  count={} from={}",
                             batch.size(), session.sessionId);
@@ -898,6 +922,15 @@ public final class NioServer implements Runnable {
                 if (board == null) {
                     return;
                 }
+                Shape existing = board.getShape(shapeId);
+                if (existing == null) {
+                    log.debug("SHAPE_DELETE no-op  shapeId={} session={}", shapeId, session.sessionId);
+                    return;
+                }
+                if (!RoomPermissions.canManageUsers(session.permissions)
+                        && !session.clientId.equals(existing.clientId())) {
+                    return;
+                }
                 if (!board.deleteShape(shapeId)) {
                     log.debug("SHAPE_DELETE no-op  shapeId={} session={}", shapeId, session.sessionId);
                     return;
@@ -908,7 +941,32 @@ public final class NioServer implements Runnable {
                 broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey, OutboundClass.CRITICAL);
             }
 
-            case SHAPE_START, SHAPE_UPDATE, SHAPE_COMMIT -> {
+            case SHAPE_START -> {
+                if (!RoomPermissions.canDraw(session.permissions)) {
+                    return;
+                }
+                RoomContext room = resolveRoom(session, senderKey);
+                if (room == null) return;
+                if (session.currentBoardId.isBlank()) {
+                    log.warn("SHAPE_START with no active board session={} — ignoring", session.sessionId);
+                    return;
+                }
+                ByteBuffer frame;
+                try {
+                    JsonObject p = MessageCodec.gson().fromJson(msg.payload(), JsonObject.class);
+                    p.addProperty("clientId", session.clientId);
+                    frame = MessageCodec.encode(new Message(MessageType.SHAPE_START,
+                            MessageCodec.gson().toJson(p)));
+                } catch (Exception e) {
+                    log.warn("Malformed SHAPE_START session={}: {}", session.sessionId, e.getMessage());
+                    return;
+                }
+                log.debug("SHAPE_START relayed  room='{}' board='{}' from session={}",
+                        session.roomId, session.currentBoardId, session.sessionId);
+                broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey, OutboundClass.CRITICAL);
+            }
+
+            case SHAPE_UPDATE, SHAPE_COMMIT -> {
                 if (!RoomPermissions.canDraw(session.permissions)) {
                     return;
                 }
@@ -927,6 +985,9 @@ public final class NioServer implements Runnable {
             }
 
             case TEXT_UPDATE -> {
+                if (!RoomPermissions.canDraw(session.permissions)) {
+                    return;
+                }
                 RoomContext room = resolveRoom(session, senderKey);
                 if (room == null) return;
                 if (session.currentBoardId.isBlank()) {
@@ -955,6 +1016,10 @@ public final class NioServer implements Runnable {
                     targetClientId = MessageCodec.decodeClearUserShapes(msg);
                 } catch (Exception e) {
                     log.warn("Malformed CLEAR_USER_SHAPES payload from session={}: {}", session.sessionId, e.getMessage());
+                    return;
+                }
+                if (!RoomPermissions.canManageUsers(session.permissions)
+                        && !session.clientId.equals(targetClientId)) {
                     return;
                 }
                 CanvasStateManager board = room.getBoard(session.currentBoardId);
@@ -996,6 +1061,16 @@ public final class NioServer implements Runnable {
                 if (board == null) {
                     return;
                 }
+                Shape existing = board.getShape(shapeId);
+                if (existing == null) {
+                    log.debug("UNDO_REQUEST no-op (shape not found)  shapeId={} session={}",
+                            shapeId, session.sessionId);
+                    return;
+                }
+                if (!RoomPermissions.canManageUsers(session.permissions)
+                        && !session.clientId.equals(existing.clientId())) {
+                    return;
+                }
                 boolean deleted = board.deleteShape(shapeId);
                 if (deleted) {
                     log.debug("UNDO_REQUEST accepted  shapeId={} room='{}' board='{}' author='{}' session={}",
@@ -1011,9 +1086,6 @@ public final class NioServer implements Runnable {
 
                     ByteBuffer frame = MessageCodec.encode(deleteMsg);
                     broadcastToBoard(session.roomId, session.currentBoardId, frame, senderKey, OutboundClass.CRITICAL);
-                } else {
-                    log.debug("UNDO_REQUEST no-op (shape not found)  shapeId={} session={}",
-                            shapeId, session.sessionId);
                 }
             }
 
@@ -1178,20 +1250,26 @@ public final class NioServer implements Runnable {
                     log.warn("Malformed MEDIA_CONTROL session={}: {}", session.sessionId, e.getMessage());
                     break;
                 }
-                long epoch = System.currentTimeMillis();
-                MessageCodec.MediaStatePayload next = MessageCodec.deriveMediaState(
-                        mediaControl, mediaRoom.currentMediaState, epoch);
-                if ("STOP".equals(mediaControl.action().strip().toUpperCase())) {
-                    mediaRoom.currentMediaState = null;
-                } else {
-                    mediaRoom.currentMediaState = next;
+                try {
+                    long epoch = System.currentTimeMillis();
+                    MessageCodec.MediaStatePayload next = MessageCodec.deriveMediaState(
+                            mediaControl, mediaRoom.currentMediaState, epoch);
+                    if ("STOP".equals(mediaControl.action().strip().toUpperCase())) {
+                        mediaRoom.currentMediaState = null;
+                    } else {
+                        mediaRoom.currentMediaState = next;
+                    }
+                    ByteBuffer mediaFrame = MessageCodec.encodeMediaState(next);
+                    broadcastToRoom(session.roomId, mediaFrame, null, OutboundClass.CRITICAL);
+                    publishControlEnvelope(session.roomId,
+                            new Message(MessageType.MEDIA_STATE_UPDATE, MessageCodec.gson().toJson(next)));
+                    log.info("MEDIA_CONTROL applied  room='{}' action='{}' state='{}' by={}",
+                            session.roomId, mediaControl.action(), next.state(), clientLogLabel(session));
+                } catch (IllegalArgumentException e) {
+                    log.warn("Invalid MEDIA_CONTROL action from session={}: {}",
+                            session.sessionId, e.getMessage());
+                    break;
                 }
-                ByteBuffer mediaFrame = MessageCodec.encodeMediaState(next);
-                broadcastToRoom(session.roomId, mediaFrame, null, OutboundClass.CRITICAL);
-                publishControlEnvelope(session.roomId,
-                        new Message(MessageType.MEDIA_STATE_UPDATE, MessageCodec.gson().toJson(next)));
-                log.info("MEDIA_CONTROL applied  room='{}' action='{}' state='{}' by={}",
-                        session.roomId, mediaControl.action(), next.state(), clientLogLabel(session));
             }
 
             case MODERATION_ACTION -> {
@@ -1792,6 +1870,8 @@ public final class NioServer implements Runnable {
             closeKey(targetKey);
             return;
         }
+
+        session.severed = true;
 
         ByteBuffer frame = MessageCodec.encodeSessionRevoked(reason);
         if (safeEnqueue(session, targetKey, frame, OutboundClass.CRITICAL) == EnqueueResult.OVERFLOW_DISCONNECT) {
@@ -2576,6 +2656,7 @@ public final class NioServer implements Runnable {
         Object attachment = key.attachment();
 
         if (attachment instanceof ClientSession s) {
+            s.severed = true;
             String roomId = s.roomId;
             String departingClientId = s.clientId;
             revokeUdpAdmission(s);

@@ -65,8 +65,16 @@ public final class CanvasStateManager {
      *         {@code false} if no shape with that id existed (UNDO_REQUEST
      *         should be silently ignored in that case)
      */
-    public boolean deleteShape(UUID id) {
+    /**
+     * Returns the shape with {@code id}, or {@code null} if none is stored.
+     */
+    public Shape getShape(UUID id) {
         if (id == null) throw new IllegalArgumentException("id must not be null");
+        return shapeMap.get(id);
+    }
+
+    public boolean deleteShape(UUID id) {
+        if (id == null) throw new IllegalArgumentException("id must be null");
         boolean removed = shapeMap.remove(id) != null;
         if (removed) {
             log.debug("Shape deleted id={}", id);

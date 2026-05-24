@@ -60,9 +60,13 @@ public interface CanvasUpdateListener {
      * @param y           starting Y coordinate
      * @param authorName  display name of the peer who started this gesture;
      *                    may be empty but never {@code null}
+     * @param clientId    session-scoped identifier of the drawing peer; stamped by
+     *                    the server on {@code SHAPE_START} relay; may be empty on
+     *                    legacy payloads but never {@code null}
      */
     default void onShapeStart(UUID shapeId, String tool, String color,
-                              double strokeWidth, double x, double y, String authorName) {}
+                              double strokeWidth, double x, double y,
+                              String authorName, String clientId) {}
 
     /**
      * A remote peer dragged the mouse; coordinates reflect the current tip of

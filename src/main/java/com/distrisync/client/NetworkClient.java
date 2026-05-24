@@ -260,6 +260,12 @@ public final class NetworkClient implements AutoCloseable {
     private volatile String deferredJoinBoardId = "";
 
     /**
+     * Reference to the read daemon thread so {@link #resumeAfterSessionRevoked}
+     * can restart it after proactive kick teardown.
+     */
+    private volatile Thread readThread;
+
+    /**
      * Reference to the write daemon thread so that producers can
      * {@link LockSupport#unpark} it when new work is enqueued.
      */
@@ -1228,6 +1234,17 @@ public final class NetworkClient implements AutoCloseable {
         }
     }
 
+    private void closeChannelQuietly() {
+        SocketChannel ch = channel;
+        if (ch != null) {
+            try {
+                ch.close();
+            } catch (IOException ignored) {
+            }
+        }
+        publishTcpConnected(false);
+    }
+
     // =========================================================================
     // Reconnect
     // =========================================================================
@@ -1275,6 +1292,7 @@ public final class NetworkClient implements AutoCloseable {
         t.setDaemon(true);
         t.setUncaughtExceptionHandler((thread, ex) ->
                 log.error("Read thread terminated with fatal exception — client offline", ex));
+        readThread = t;
         t.start();
     }
 
@@ -1324,6 +1342,14 @@ public final class NetworkClient implements AutoCloseable {
                     publishUdpActive(false);
                     running.set(false);
                     throw fatal;
+                }
+                if (running.get() && (channel == null || !channel.isOpen())) {
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
                 }
             }
         }
@@ -1388,7 +1414,7 @@ public final class NetworkClient implements AutoCloseable {
         deferredJoinBoardId = "";
         if (rid != null && !rid.isBlank()) {
             ByteBuffer frame = (board != null && !board.isBlank())
-                    ? MessageCodec.encodeJoinRoom(rid, board)
+                    ? MessageCodec.encodeJoinRoom(rid, board)   
                     : MessageCodec.encodeJoinRoom(rid);
             enqueueFrame(frame);
             log.debug("Flushed deferred JOIN_ROOM roomId='{}' boardId='{}'", rid, board);
@@ -1470,8 +1496,10 @@ public final class NetworkClient implements AutoCloseable {
                     double y          = p.get("y").getAsDouble();
                     String author     = p.has("authorName") && !p.get("authorName").isJsonNull()
                                         ? p.get("authorName").getAsString() : "";
+                    String shapeClientId = p.has("clientId") && !p.get("clientId").isJsonNull()
+                                        ? p.get("clientId").getAsString() : "";
                     for (CanvasUpdateListener listener : listeners) {
-                        listener.onShapeStart(shapeId, tool, color, strokeW, x, y, author);
+                        listener.onShapeStart(shapeId, tool, color, strokeW, x, y, author, shapeClientId);
                     }
                 } catch (Exception e) {
                     log.debug("Malformed SHAPE_START payload ignored: {}", e.getMessage());
@@ -1701,6 +1729,8 @@ public final class NetworkClient implements AutoCloseable {
                 }
                 log.info("SESSION_REVOKED received reason='{}'", reason);
                 suppressAutoReconnect();
+                running.set(false);
+                closeChannelQuietly();
                 activeRoomId = "";
                 resetWorkspaceForLobby();
                 publishUdpActive(false);
@@ -1954,9 +1984,7 @@ public final class NetworkClient implements AutoCloseable {
      * Re-enables auto-reconnect and performs handshake + lobby fetch without re-joining a room.
      */
     public void resumeAfterSessionRevoked() {
-        if (!running.get()) {
-            return;
-        }
+        running.set(true);
         autoReconnectEnabled.set(true);
         Thread t = new Thread(() -> {
             try {
@@ -1965,17 +1993,18 @@ public final class NetworkClient implements AutoCloseable {
                     protocolReady.set(false);
                     deferredJoinRoomId = "";
                     deferredJoinBoardId = "";
-                    SocketChannel stale = channel;
-                    if (stale != null) {
-                        try {
-                            stale.close();
-                        } catch (IOException ignored) {
-                        }
-                    }
+                    closeChannelQuietly();
                     channel = connectWithBackoff();
                     sendHandshake();
                     protocolReady.set(true);
+                    if (readThread == null || !readThread.isAlive()) {
+                        startReadThread();
+                    }
+                    if (writeThread == null || !writeThread.isAlive()) {
+                        startWriteThread();
+                    }
                     sendFetchLobby();
+                    publishTcpConnected(true);
                     log.info("Resumed TCP to {}:{} after SESSION_REVOKED (lobby)", host, port);
                 }
             } catch (IOException e) {
