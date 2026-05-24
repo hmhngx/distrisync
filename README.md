@@ -33,7 +33,7 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Sealed Shape Hierarchy** — `Shape` is a Java 21 sealed interface permitting `Line`, `Circle`, `RectangleNode`, `EllipseNode`, `ArrowNode`, `TextNode`, and `EraserPath` (legacy render-only). Each record carries `objectId` (UUID), Lamport `timestamp`, `color`, `strokeWidth`, `authorName`, and `clientId`. Server-side `ShapeCodec` and a mirrored client `ClientShapeCodec` deserialise via a `"_type"` discriminator field with Gson. The tool dock exposes **LINE**, **CIRCLE**, **RECTANGLE**, **ELLIPSE**, **ARROW**, **FREEHAND**, **ERASER**, and **TEXT**.
 
-- **Live Collaborative Drawing (`SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT`)** — streaming stroke events are relayed to all peers by the server without persistence; the receiving client renders a `TransientShapeEntry` on the remote transient canvas layer, providing smooth live-ink preview before commit.
+- **Live Collaborative Drawing (`SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT`)** — streaming stroke events are relayed to all peers by the server without persistence; the receiving client renders a `TransientShapeEntry` on the remote transient canvas layer, providing smooth live-ink preview before commit. On relay, the server injects `clientId` from the authenticated TCP session into `SHAPE_START` payloads so peers can resolve attribution from roster state.
 
 - **MS Paint–Style Text Tool** — clicking the canvas in `TEXT` mode opens a floating `TextField` directly on the control pane. Keystrokes are throttled and transmitted as `TEXT_UPDATE` frames (~50 ms interval); peers render a ghost `VBox` with a live caret (`▏`) on their cursor pane. Pressing Enter commits a `TextNode` via `MUTATION` + `SHAPE_COMMIT`, which dismisses all ghost previews.
 
@@ -45,11 +45,15 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **UDP Audio Relay Rate Limiting** — each `ClientSession` owns a token bucket (burst 50, refill 1 token / 20 ms ≈ 50 pkt/s) checked in `NioServer.handleUdpRead` before room fan-out; excess push-to-talk packets are dropped silently to bound amplification.
 
-- **Scoped `CLEAR_USER_SHAPES`** — the "Clear Board" button sends a `CLEAR_USER_SHAPES` frame carrying only the issuing client's `clientId`. The server calls `CanvasStateManager.clearUserShapes(clientId)` and broadcasts the scoped clear to peers, who purge only that owner's shapes. No other client's work is affected.
+- **Scoped `CLEAR_USER_SHAPES`** — the "Clear Board" button sends a `CLEAR_USER_SHAPES` frame carrying only the issuing client's `clientId`. The server calls `CanvasStateManager.clearUserShapes(clientId)` and broadcasts the scoped clear to peers, who purge only that owner's shapes. Members may clear only their own shapes; moderators with `PERM_MANAGE_USERS` may clear any participant's work.
 
-- **Undo (`UNDO_REQUEST` / `SHAPE_DELETE`)** — the client sends an `UNDO_REQUEST`; the server calls `deleteShape` on the state manager and, on success, broadcasts a `SHAPE_DELETE` frame so all peers remove the shape atomically.
+- **Undo (`UNDO_REQUEST` / `SHAPE_DELETE`)** — the client sends an `UNDO_REQUEST`; the server verifies the stored shape's `clientId` matches the session (or the sender has `PERM_MANAGE_USERS`), then calls `deleteShape` and broadcasts `SHAPE_DELETE` so all peers remove the shape atomically. Same ownership gate applies to client-originated `SHAPE_DELETE`.
 
-- **Figma-Style Live Attribution** — in-progress remote strokes display a floating author label rendered at the stroke tip from `TransientShapeEntry.authorName` (sourced from the `SHAPE_START` handshake). Committed shapes surface the author name in a hover tooltip via `findShapeAt` hit-testing + `ownerTooltip` overlay.
+- **Server-Side Object Authority (`ShapeAuthority`)** — on `MUTATION` / `MUTATION_BATCH`, the server overwrites `Shape.clientId` with the authenticated session id before apply, WAL append, and fan-out (unless the sender has `PERM_MANAGE_USERS`). Prevents forged attribution and cross-user delete/clear IDOR. `CanvasStateManager.getShape` supports ownership checks on delete paths.
+
+- **Dead-Session Read Short-Circuit** — `ClientSession.severed` is set on KICK / `SESSION_REVOKED` / `closeKey`; `NioServer.handleRead` stops decoding further frames in the same TCP read batch so ghost frames cannot mutate state after teardown.
+
+- **Figma-Style Live Attribution** — in-progress remote strokes display a floating label at the stroke tip from `TransientShapeEntry.clientId`, resolved via `ParticipantManager` (`resolveDisplayName`). Committed shapes show the same roster name in a hover tooltip from `findShapeAt` + `ownerTooltip`. Live text ghosts and `CURSOR_SYNC` cursors use the same resolver.
 
 - **UDP Multicast Cursor Presence** — `UdpPointerTracker` joins multicast group `239.255.42.42:9292`; pointer positions are transmitted at 20 Hz (only on mouse move). Each peer is represented by a deterministically coloured dot + name badge on a dedicated `cursorPane` with fade-out removal on timeout.
 
@@ -61,7 +65,7 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Last-Writer-Wins Convergence** — `CanvasStateManager` uses `ConcurrentHashMap.compute` with a strictly-greater-timestamp guard, so concurrent mutations from multiple peers converge without server-side locking or operational transforms.
 
-- **Reconnect with Back-off** — `NetworkClient` reconnects automatically after EOF or I/O errors using a synchronised `reconnect()` cycle that re-executes the full `HANDSHAKE` → `SNAPSHOT` flow to restore canvas state.
+- **Reconnect with Back-off** — `NetworkClient` reconnects automatically after EOF or I/O errors using a synchronised `reconnect()` cycle that re-executes the full `HANDSHAKE` → `SNAPSHOT` flow to restore canvas state. Moderation **KICK** is different: `SESSION_REVOKED` calls `suppressAutoReconnect()`, sets `running = false`, closes the TCP channel, and resets workspace state to the lobby without re-joining the evicted room. `resumeAfterSessionRevoked()` re-enables auto-reconnect, opens a fresh TCP session, restarts read/write daemons if they exited, sends `FETCH_LOBBY`, and leaves the client in the lobby ready to pick another room (`NetworkClientStateTest`).
 
 - **Lobby Discovery, Pull Refresh, and Durable Room Deletion (`LOBBY_STATE` / `FETCH_LOBBY` / `DELETE_ROOM` / `ROOM_DELETED`)** — lobby discovery now supports both push (`LOBBY_STATE` fan-out) and pull (`FETCH_LOBBY`) refresh flows so clients can force an immediate room list update. `LOBBY_STATE` merges in-memory active rooms with persisted WAL room stems (showing `userCount = 0` when no users are connected), so durable rooms remain discoverable after restart. Admin-style room teardown is now first-class: `DELETE_ROOM` removes the room from routing, deletes all matching WAL files, emits `ROOM_DELETED` to connected occupants (who are moved back to lobby), and then broadcasts a fresh lobby snapshot.
 
@@ -79,11 +83,11 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Global Canvas Context & Shape Factory** — `GlobalCanvasContext` centralises active stroke colour (`ObjectProperty<Color>`), stroke width (`DoubleProperty`), and eraser brush geometry (`EraserType` circle vs square). `GlobalCanvasShapeFactory` commits `Line`, `Circle`, `RectangleNode`, `EllipseNode`, `ArrowNode`, and `TextNode` instances using the current context, keeping the properties bar and network payloads consistent.
 
-- **Room RBAC (`RoomPermissions`)** — bitmask permissions on `ClientSession` and `Participant`. `OWNER` grants draw, speak, manage users, delete room, manage room settings, and manage media; `MEMBER` grants draw + speak; `SPECTATOR` is lobby-only. Server rejects `MUTATION` / `MUTATION_BATCH` / live strokes without `PERM_DRAW`, UDP audio without `PERM_SPEAK`, `MODERATION_ACTION` without `PERM_MANAGE_USERS`, `TOGGLE_BOARD_LOCK` / `DELETE_BOARD` without `PERM_MANAGE_ROOM`, and `MEDIA_CONTROL` without `PERM_MANAGE_MEDIA`.
+- **Room RBAC (`RoomPermissions`)** — bitmask permissions on `ClientSession` and `Participant`. `OWNER` grants draw, speak, manage users, delete room, manage room settings, and manage media; `MEMBER` grants draw + speak; `SPECTATOR` is lobby-only. Server rejects `MUTATION` / `MUTATION_BATCH` / live strokes / `TEXT_UPDATE` without `PERM_DRAW`, UDP audio without `PERM_SPEAK`, `MODERATION_ACTION` without `PERM_MANAGE_USERS`, `TOGGLE_BOARD_LOCK` / `DELETE_BOARD` without `PERM_MANAGE_ROOM`, and `MEDIA_CONTROL` without `PERM_MANAGE_MEDIA`. Invalid `MEDIA_CONTROL` actions are logged and dropped without fan-out.
 
 - **Host Election & `ROLE_UPDATE`** — first joiner becomes host with `OWNER` permissions. On host disconnect, `NioServer.selectHostCandidate` promotes the longest-connected peer and fans out `ROLE_UPDATE` (`0x1D`, `{ newHostClientId, newPermissions, roomHostClientId? }`) so every client updates crowns and local capability flags.
 
-- **Moderation (`MODERATION_ACTION` / `SESSION_REVOKED`)** — hosts and moderators send `MODERATION_ACTION` (`0x1B`) with `actionType` `KICK`, `REVOKE_SPEAK`, or `GRANT_SPEAK`. Commands publish on the Redis control channel in cluster mode. **KICK** disconnects the target and broadcasts peer `LEAVE_ROOM`; the victim receives `SESSION_REVOKED` (`0x1C`, `{ reason }`). **REVOKE_SPEAK** / **GRANT_SPEAK** toggle `PERM_SPEAK` and push `ROLE_UPDATE` to the affected client; `AudioEngine` hard-stops capture when speak is revoked.
+- **Moderation (`MODERATION_ACTION` / `SESSION_REVOKED`)** — hosts and moderators send `MODERATION_ACTION` (`0x1B`) with `actionType` `KICK`, `REVOKE_SPEAK`, or `GRANT_SPEAK`. Commands publish on the Redis control channel in cluster mode. **KICK** sets `ClientSession.severed`, sends `SESSION_REVOKED` (`0x1C`, `{ reason }`), then disconnects and broadcasts peer `LEAVE_ROOM`; the victim client stops I/O threads, clears room/board state, and shows a lobby toast. **REVOKE_SPEAK** / **GRANT_SPEAK** toggle `PERM_SPEAK` and push `ROLE_UPDATE` to the affected client; `AudioEngine` hard-stops capture when speak is revoked.
 
 - **Collaboration Roster (`CollaborationRoster`)** — slide-out panel grouped by active board (`Participant.currentBoardId`), host crown indicators, mute/speaking badges, and a context menu (Kick / Revoke Speak / Grant Speak) when `PERM_MANAGE_USERS` is held. Integrates `ParticipantManager`, `RoomState`, and `ToastNotification` for moderation feedback. `ParticipantListView` remains for compact HUD rows; `wireCollaborationRoster()` is the primary in-room presence UI.
 
@@ -172,6 +176,7 @@ distrisync/
 │   │   │   │   ├── WalManager.java
 │   │   │   │   ├── CanvasStateManager.java
 │   │   │   │   ├── ShapeCodec.java
+│   │   │   │   ├── ShapeAuthority.java
 │   │   │   │   └── backplane/
 │   │   │   │       ├── BackplaneEnvelope.java
 │   │   │   │       ├── BackplaneEnvelopeCodec.java
@@ -207,6 +212,7 @@ distrisync/
 │           │   ├── EraserSpatialIntersectionTest.java
 │           │   ├── SpatialHashGridTest.java
 │           │   ├── NetworkClientTelemetryTest.java
+│           │   ├── NetworkClientStateTest.java
 │           │   ├── ParticipantManagerTest.java
 │           │   ├── CollaborationRosterModerationTest.java
 │           │   ├── PointerStateTrackerTest.java
@@ -231,6 +237,8 @@ distrisync/
 │               ├── ClientSessionUdpRateLimitTest.java
 │               ├── MetricsHttpServerTest.java
 │               ├── NioServerChunkedSnapshotTest.java
+│               ├── NioServerDeadSessionReadTest.java
+│               ├── NioServerObjectAuthorityTest.java
 │               ├── NioServerDistributedHydrationTest.java
 │               ├── NioServerRemoteAuthorityTest.java
 │               ├── NioServerRemoteMailboxTest.java
@@ -256,6 +264,7 @@ distrisync/
 │               ├── ServerMetricsTest.java
 │               ├── ShapeCodecNewShapesTest.java
 │               ├── ShapeCodecMutationBatchTest.java
+│               ├── ShapeAuthorityTest.java
 │               └── WalManagerTest.java
 ├── docs/
 │   └── Architecture.md
@@ -275,13 +284,13 @@ distrisync/
 | `SNAPSHOT` | `0x02` | S → C | No | Join/board-switch hydration header (`[]`) or legacy full state; chunked joins stream shapes via `MUTATION_BATCH` until `SNAPSHOT_END` |
 | `MUTATION` | `0x03` | C ↔ S | **Yes** | Committed shape add/update; broadcast to board peers |
 | `UDP_POINTER` | `0x04` | UDP only | No | Ephemeral cursor position (multicast, not TCP) |
-| `SHAPE_START` | `0x05` | C ↔ S | No | Begin live stroke; relayed to board peers, not persisted |
+| `SHAPE_START` | `0x05` | C ↔ S | No | Begin live stroke; server relays with session `clientId` injected; not persisted |
 | `SHAPE_UPDATE` | `0x06` | C ↔ S | No | Incremental stroke points; relayed to board peers, not persisted |
 | `SHAPE_COMMIT` | `0x07` | C ↔ S | No | Finalise live stroke; peer dismisses transient layer |
-| `CLEAR_USER_SHAPES` | `0x08` | C ↔ S | **Yes** | Remove all shapes owned by a specific `clientId` on active board |
-| `UNDO_REQUEST` | `0x09` | C → S | No | Request last-shape deletion from active board |
-| `SHAPE_DELETE` | `0x0A` | S → C | **Yes** | Broadcast shape removal after undo |
-| `TEXT_UPDATE` | `0x0B` | C ↔ S | No | Live text ghost preview; relayed to board peers, not persisted |
+| `CLEAR_USER_SHAPES` | `0x08` | C ↔ S | **Yes** | Remove shapes for `targetClientId`; members may only clear self unless `PERM_MANAGE_USERS` |
+| `UNDO_REQUEST` | `0x09` | C → S | No | Delete shape by UUID; allowed only for own shapes unless `PERM_MANAGE_USERS` |
+| `SHAPE_DELETE` | `0x0A` | S → C | **Yes** | Broadcast shape removal after authorized undo/delete |
+| `TEXT_UPDATE` | `0x0B` | C ↔ S | No | Live text ghost preview; requires `PERM_DRAW`; relayed to board peers, not persisted |
 | `LOBBY_STATE` | `0x0C` | S → C | No | JSON array of `{ roomId, userCount }` for room discovery |
 | `JOIN_ROOM` | `0x0D` | C ↔ S | No | **C→S:** `{ roomId, initialBoardId? }` (legacy string roomId accepted). **S→peers:** `{ clientId, authorName }` on member join |
 | `LEAVE_ROOM` | `0x0E` | C ↔ S | No | **C→S:** return to lobby (empty). **S→peers:** JSON string `clientId` when a member leaves or is kicked |
@@ -298,7 +307,7 @@ distrisync/
 | `STATE_SNAPSHOT` | `0x19` | Backplane | No | Hot node bulk board payload (same JSON array shape as `SNAPSHOT`); backplane hydration only |
 | `CURSOR_SYNC` | `0x1A` | C ↔ S | No | Ephemeral multiplayer cursor: `{ clientId, authorName, x, y }`; relayed in-room on TCP and via Redis `:presence` channel cross-node |
 | `MODERATION_ACTION` | `0x1B` | C → S / Backplane | No | `{ actionType, targetClientId, reason }` — `KICK`, `REVOKE_SPEAK`, or `GRANT_SPEAK`; requires `PERM_MANAGE_USERS` |
-| `SESSION_REVOKED` | `0x1C` | S → C | No | `{ reason }` — target session ended by moderation; client returns to lobby |
+| `SESSION_REVOKED` | `0x1C` | S → C | No | `{ reason }` — moderation kick; client suppresses auto-reconnect, tears down TCP, resets to lobby; use `resumeAfterSessionRevoked()` to reconnect to server lobby only |
 | `ROLE_UPDATE` | `0x1D` | S → C | No | `{ newHostClientId, newPermissions, roomHostClientId? }` — permission sync / host migration |
 | `BOARD_SWITCH` | `0x1E` | S → room | No | `{ clientId, newBoardId }` — peer active board for roster grouping |
 | `TOGGLE_BOARD_LOCK` | `0x1F` | C ↔ S | No | **C→S:** `{ locked }` (host). **S→room:** broadcast current lock; gates new board creation for members |
