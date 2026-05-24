@@ -364,6 +364,25 @@ public final class CollaborationRoster extends HBox {
         return icon;
     }
 
+    private static Node createSpeakerIcon() {
+        SVGPath speaker = new SVGPath();
+        speaker.setContent(
+                "M3 9v6h4l5 5V4L7 9H3zm7.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06"
+                        + "c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z");
+        speaker.setFill(Color.web("#0078D7"));
+        speaker.setScaleX(0.45);
+        speaker.setScaleY(0.45);
+        StackPane icon = new StackPane(speaker);
+        icon.getStyleClass().add("roster-speaking-icon");
+        icon.setMinSize(16, 16);
+        icon.setPrefSize(16, 16);
+        icon.setMaxSize(16, 16);
+        icon.setVisible(false);
+        icon.setManaged(false);
+        Tooltip.install(icon, new Tooltip("Speaking"));
+        return icon;
+    }
+
     private static Label createCrownLabel() {
         Label crown = new Label("\u2655");
         crown.getStyleClass().add("roster-crown-icon");
@@ -526,6 +545,7 @@ public final class CollaborationRoster extends HBox {
         private final HBox root;
         private final Label crownLabel;
         private final Node hwMuteIcon;
+        private final Node speakerIcon;
         private final Tooltip hwMuteTooltip;
         private final Label nameLabel;
         private final Button modButton;
@@ -544,6 +564,7 @@ public final class CollaborationRoster extends HBox {
             this.participant = participant;
 
             crownLabel = createCrownLabel();
+            speakerIcon = createSpeakerIcon();
             hwMuteIcon = createSlashedMicIcon();
             hwMuteIcon.getStyleClass().add("roster-hw-mute-icon");
             hwMuteTooltip = new Tooltip("Microphone Muted");
@@ -561,7 +582,7 @@ public final class CollaborationRoster extends HBox {
 
             nameLabel = new Label(participant.getName());
             nameLabel.getStyleClass().add("roster-user-name");
-            nameLabel.setMaxWidth(PANEL_WIDTH - 112);
+            nameLabel.setMaxWidth(PANEL_WIDTH - 128);
             nameLabel.setTextOverrun(OverrunStyle.ELLIPSIS);
             HBox.setHgrow(nameLabel, Priority.ALWAYS);
 
@@ -573,7 +594,7 @@ public final class CollaborationRoster extends HBox {
             modButton.setTooltip(new Tooltip("Moderation actions"));
             modButton.setOnAction(e -> contextMenu.show(modButton, Side.BOTTOM, 0, 0));
 
-            root = new HBox(8, crownLabel, avatar, nameLabel, hwMuteIcon, modButton);
+            root = new HBox(8, crownLabel, avatar, nameLabel, speakerIcon, hwMuteIcon, modButton);
             root.setAlignment(Pos.CENTER_LEFT);
             root.getStyleClass().add("roster-user-row");
 
@@ -582,7 +603,8 @@ public final class CollaborationRoster extends HBox {
                 initials.setText(initialsFor(now));
             };
             mutedListener = (obs, was, muted) -> applyVisualMuteState();
-            speakingListener = (obs, was, speaking) -> applySpeakingRing(Boolean.TRUE.equals(speaking));
+            speakingListener = (obs, was, speaking) ->
+                    applyActiveSpeakerIcon(Boolean.TRUE.equals(speaking));
             boardListener = (obs, was, now) -> rebuildSections();
             permsListener = (obs, was, now) -> {
                 applyPermissionIndicators();
@@ -650,7 +672,7 @@ public final class CollaborationRoster extends HBox {
 
         void syncFromParticipant() {
             nameLabel.setText(participant.getName());
-            applySpeakingRing(participant.isSpeaking());
+            applyActiveSpeakerIcon(participant.isSpeaking());
             applyPermissionIndicators();
             applyVisualMuteState();
             refreshContextMenu();
@@ -679,14 +701,9 @@ public final class CollaborationRoster extends HBox {
             }
         }
 
-        private void applySpeakingRing(boolean speaking) {
-            if (speaking) {
-                if (!avatar.getStyleClass().contains("speaking-ring")) {
-                    avatar.getStyleClass().add("speaking-ring");
-                }
-            } else {
-                avatar.getStyleClass().remove("speaking-ring");
-            }
+        private void applyActiveSpeakerIcon(boolean speaking) {
+            speakerIcon.setVisible(speaking);
+            speakerIcon.setManaged(speaking);
         }
 
         private void applyPermissionIndicators() {

@@ -28,7 +28,7 @@ class NetworkClientTelemetryTest {
 
     @Test
     void pongReceipt_setsPingPropertyToElapsedSinceOriginTimestamp() {
-        NetworkClient client = new NetworkClient("127.0.0.1", 1, "author", "client-id");
+        NetworkClient client = new NetworkClient("127.0.0.1", 1, "client-id");
         // Origin is fixed in the payload; the client computes RTT when the FX queue runs applyPingRtt.
         final long simulatedAgeMs = 100L;
         long wallBeforeIngest = System.currentTimeMillis();
@@ -51,7 +51,7 @@ class NetworkClientTelemetryTest {
 
     @Test
     void pongReceipt_rollingAverageOfLastThreeSamples() {
-        NetworkClient client = new NetworkClient("127.0.0.1", 1, "author", "client-id");
+        NetworkClient client = new NetworkClient("127.0.0.1", 1, "client-id");
         long wall = System.currentTimeMillis();
 
         client.ingestPongForTelemetryTest(

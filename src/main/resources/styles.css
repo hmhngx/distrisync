@@ -423,6 +423,11 @@
     -fx-opacity: 0.85;
 }
 
+.roster-speaking-icon {
+    -fx-alignment: center;
+    -fx-opacity: 0.95;
+}
+
 /* Panels pinned to the workspace margin: drop border so layout aligns to StackPane inset (no inner inset). */
 .hud-panel.workspace-perimeter-node,
 .floating-panel.workspace-perimeter-node {

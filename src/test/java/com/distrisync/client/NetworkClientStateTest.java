@@ -27,7 +27,7 @@ class NetworkClientStateTest {
 
     @Test
     void roleUpdate_forLocalClient_setsLocalPermissions() {
-        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "author", "client-id")) {
+        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "client-id")) {
             client.ingestRoleUpdateForStateTest("client-id", RoomPermissions.OWNER, "client-id");
             await().atMost(3, TimeUnit.SECONDS)
                     .pollInterval(20, TimeUnit.MILLISECONDS)
@@ -38,7 +38,7 @@ class NetworkClientStateTest {
 
     @Test
     void testRoomDeleted_triggersLobbyFetch() {
-        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "author", "client-id")) {
+        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "client-id")) {
             client.ingestRoomDeletedForStateTest();
 
             await().atMost(3, TimeUnit.SECONDS)
@@ -51,7 +51,7 @@ class NetworkClientStateTest {
 
     @Test
     void sessionRevoked_suppressesAutoReconnectAndClearsRoom() {
-        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "author", "client-id")) {
+        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "client-id")) {
             assertThat(client.isAutoReconnectEnabledForTest()).isTrue();
             client.ingestSessionRevokedForStateTest("policy violation");
             assertThat(client.isAutoReconnectEnabledForTest()).isFalse();
@@ -68,8 +68,59 @@ class NetworkClientStateTest {
     }
 
     @Test
+    void selfJoinRoom_confirmLocksAuthorNameAndHydratesParticipant() {
+        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "client-id")) {
+            client.setDisplayNameForTest("Admin");
+            client.ingestRoomMemberJoinedForStateTest("client-id", "Admin #F4A2");
+
+            await().atMost(3, TimeUnit.SECONDS)
+                    .pollInterval(20, TimeUnit.MILLISECONDS)
+                    .untilAsserted(() -> {
+                        assertThat(client.getAuthorName()).isEqualTo("Admin #F4A2");
+                        assertThat(client.getLockedRoomNameForTest()).isEqualTo("Admin #F4A2");
+                        assertThat(client.getParticipantManager().get("client-id").getName())
+                                .isEqualTo("Admin #F4A2");
+                    });
+        }
+    }
+
+    @Test
+    void selfJoinRoom_emptyAuthorName_doesNotClearLockedName() {
+        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "client-id")) {
+            client.setLockedRoomNameForTest("Admin #F4A2");
+            client.setDisplayNameForTest("Admin #F4A2");
+            client.ingestRoomMemberJoinedForStateTest("client-id", "");
+
+            assertThat(client.getLockedRoomNameForTest()).isEqualTo("Admin #F4A2");
+            assertThat(client.getAuthorName()).isEqualTo("Admin #F4A2");
+        }
+    }
+
+    @Test
+    void sendLeaveRoom_clearsLockedRoomName() {
+        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "client-id")) {
+            client.setLockedRoomNameForTest("Admin #F4A2");
+            client.setDisplayNameForTest("Admin #F4A2");
+            client.setActiveRoomIdForTest("room-1");
+            client.ingestRoomMemberJoinedForStateTest("client-id", "Admin #F4A2");
+            client.sendLeaveRoom();
+            assertThat(client.getLockedRoomNameForTest()).isNull();
+            assertThat(client.getAuthorName()).isBlank();
+        }
+    }
+
+    @Test
+    void reconnectPrefersLockedRoomNameOverRequestedDisplayName() {
+        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "client-id")) {
+            client.setLockedRoomNameForTest("Admin #F4A2");
+            client.setDisplayNameForTest("Admin");
+            assertThat(client.resolveReconnectDisplayNameForTest()).isEqualTo("Admin #F4A2");
+        }
+    }
+
+    @Test
     void sessionRevoked_reinitializeAudioEngine_restoresLiveEngine() {
-        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "author", "client-id")) {
+        try (NetworkClient client = new NetworkClient("127.0.0.1", 1, "client-id")) {
             client.ingestSessionRevokedForStateTest("kicked");
             client.getAudioEngine().close();
             AudioEngine closed = client.getAudioEngine();

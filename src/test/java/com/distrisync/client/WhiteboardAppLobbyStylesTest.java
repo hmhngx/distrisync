@@ -54,7 +54,12 @@ class WhiteboardAppLobbyStylesTest extends ApplicationTest {
 
     @Test
     void testLobbyInputAndButtonAreInline() {
-        TextField newRoomField = lookup(".lobby-textfield").queryAs(TextField.class);
+        TextField newRoomField = lookup(".lobby-textfield").queryAll().stream()
+                .filter(TextField.class::isInstance)
+                .map(TextField.class::cast)
+                .filter(tf -> "New room name…".equals(tf.getPromptText()))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("New room field not found"));
         Button createRoom = lookup(".tool-button").queryAll().stream()
                 .filter(Button.class::isInstance)
                 .map(Button.class::cast)
