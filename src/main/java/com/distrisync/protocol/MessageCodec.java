@@ -245,28 +245,25 @@ public final class MessageCodec {
      * JSON payload of a {@link MessageType#HANDSHAKE} frame: display name and
      * stable client id. Room membership is established with {@link MessageType#JOIN_ROOM}.
      *
-     * @param authorName human-readable display name; never {@code null} after decode
-     * @param clientId   session-scoped stable identifier from the client
+     * @param clientId session-scoped stable identifier from the client
      */
-    public record HandshakePayload(String authorName, String clientId) {}
+    public record HandshakePayload(String clientId) {}
 
     /**
-     * Encodes a {@code HANDSHAKE} frame with the given fields.
+     * Encodes a {@code HANDSHAKE} frame with the given {@code clientId}.
      *
-     * @param authorName may be {@code null} (stored as empty string)
-     * @param clientId   may be {@code null} (stored as empty string)
+     * @param clientId may be {@code null} (stored as empty string)
      */
-    public static ByteBuffer encodeHandshake(String authorName, String clientId) {
+    public static ByteBuffer encodeHandshake(String clientId) {
         HandshakePayload payload = new HandshakePayload(
-                authorName != null ? authorName : "",
                 clientId != null ? clientId : "");
         return encodeObject(MessageType.HANDSHAKE, payload);
     }
 
     /**
      * Parses a {@code HANDSHAKE} message payload into a {@link HandshakePayload}.
-     * Malformed JSON falls back to {@code ("", "")}. Legacy {@code roomId} in JSON
-     * is ignored (room is chosen via {@code JOIN_ROOM}).
+     * Malformed JSON falls back to {@code ""}. Legacy {@code authorName} and
+     * {@code roomId} in JSON are ignored (identity is chosen via {@code JOIN_ROOM}).
      *
      * @param msg a decoded message whose type is {@link MessageType#HANDSHAKE}
      * @return normalized handshake fields
@@ -279,17 +276,13 @@ public final class MessageCodec {
         }
         try {
             JsonObject p = JsonParser.parseString(msg.payload()).getAsJsonObject();
-            String an = "";
-            if (p.has("authorName") && !p.get("authorName").isJsonNull()) {
-                an = p.get("authorName").getAsString();
-            }
             String cid = "";
             if (p.has("clientId") && !p.get("clientId").isJsonNull()) {
                 cid = p.get("clientId").getAsString();
             }
-            return new HandshakePayload(an, cid);
+            return new HandshakePayload(cid);
         } catch (Exception e) {
-            return new HandshakePayload("", "");
+            return new HandshakePayload("");
         }
     }
 
@@ -329,31 +322,34 @@ public final class MessageCodec {
     }
 
     /**
-     * JSON body for {@link MessageType#JOIN_ROOM}: target room and optional initial board.
+     * JSON body for {@link MessageType#JOIN_ROOM}: target room, optional initial board, and display name.
      *
      * @param roomId         non-blank room identifier
      * @param initialBoardId board to open; if {@code null} or blank, {@link #DEFAULT_INITIAL_BOARD_ID} is used
+     * @param displayName    room-level display identity; never {@code null} after decode
      */
-    public record JoinRoomPayload(String roomId, String initialBoardId) {}
+    public record JoinRoomPayload(String roomId, String initialBoardId, String displayName) {}
 
     /**
-     * Encodes {@code JOIN_ROOM} as {@code {"roomId":"..."}} (no {@code initialBoardId} field).
+     * Encodes {@code JOIN_ROOM} with {@code displayName} (no {@code initialBoardId} field).
      * The server defaults the board to {@link #DEFAULT_INITIAL_BOARD_ID}.
      */
-    public static ByteBuffer encodeJoinRoom(String roomId) {
+    public static ByteBuffer encodeJoinRoom(String roomId, String displayName) {
         if (roomId == null) throw new IllegalArgumentException("roomId must not be null");
         JsonObject o = new JsonObject();
         o.addProperty("roomId", roomId);
+        o.addProperty("displayName", displayName != null ? displayName : "");
         return encode(new Message(MessageType.JOIN_ROOM, GSON.toJson(o)));
     }
 
     /**
-     * Encodes {@code JOIN_ROOM} including {@code initialBoardId} when non-blank.
+     * Encodes {@code JOIN_ROOM} including {@code displayName} and {@code initialBoardId} when non-blank.
      */
-    public static ByteBuffer encodeJoinRoom(String roomId, String initialBoardId) {
+    public static ByteBuffer encodeJoinRoom(String roomId, String displayName, String initialBoardId) {
         if (roomId == null) throw new IllegalArgumentException("roomId must not be null");
         JsonObject o = new JsonObject();
         o.addProperty("roomId", roomId);
+        o.addProperty("displayName", displayName != null ? displayName : "");
         if (initialBoardId != null && !initialBoardId.isBlank()) {
             o.addProperty("initialBoardId", initialBoardId);
         }
@@ -361,8 +357,9 @@ public final class MessageCodec {
     }
 
     /**
-     * Parses {@code JOIN_ROOM} payload: JSON object {@code { roomId, initialBoardId? }}, or a legacy
-     * JSON string room id. Missing or blank {@code initialBoardId} defaults to {@link #DEFAULT_INITIAL_BOARD_ID}.
+     * Parses {@code JOIN_ROOM} payload: JSON object {@code { roomId, displayName?, initialBoardId? }},
+     * or a legacy JSON string room id. Missing or blank {@code initialBoardId} defaults to
+     * {@link #DEFAULT_INITIAL_BOARD_ID}; missing {@code displayName} defaults to {@code ""}.
      */
     public static JoinRoomPayload decodeJoinRoom(Message msg) {
         if (msg == null) throw new IllegalArgumentException("msg must not be null");
@@ -380,7 +377,7 @@ public final class MessageCodec {
                 if (rid.isBlank()) {
                     throw new IllegalArgumentException("JOIN_ROOM room id is blank");
                 }
-                return new JoinRoomPayload(rid, DEFAULT_INITIAL_BOARD_ID);
+                return new JoinRoomPayload(rid, DEFAULT_INITIAL_BOARD_ID, "");
             }
             if (el.isJsonObject()) {
                 JsonObject o = el.getAsJsonObject();
@@ -398,7 +395,11 @@ public final class MessageCodec {
                         board = ib;
                     }
                 }
-                return new JoinRoomPayload(rid, board);
+                String name = "";
+                if (o.has("displayName") && !o.get("displayName").isJsonNull()) {
+                    name = o.get("displayName").getAsString();
+                }
+                return new JoinRoomPayload(rid, board, name);
             }
         } catch (IllegalArgumentException e) {
             throw e;
