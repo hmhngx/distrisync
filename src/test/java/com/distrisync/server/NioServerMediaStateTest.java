@@ -134,6 +134,55 @@ class NioServerMediaStateTest {
     }
 
     @Test
+    void mediaControl_unknownAction_droppedWithoutCrashingServer() throws Exception {
+        WalManager walManager = new WalManager(tempDir);
+        roomManager = new RoomManager(walManager);
+        startServer(roomManager, walManager);
+        int port = serverPort();
+        String roomId = "media-garbage-room";
+        String boardId = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+
+        try (SocketChannel owner = SocketChannel.open();
+             SocketChannel member = SocketChannel.open()) {
+            owner.configureBlocking(true);
+            member.configureBlocking(true);
+            owner.connect(new InetSocketAddress(HOST, port));
+            member.connect(new InetSocketAddress(HOST, port));
+
+            writeFully(owner, MessageCodec.encodeHandshake("Owner", "owner-client"));
+            writeFully(member, MessageCodec.encodeHandshake("Member", "member-client"));
+            drainUntilQuiet(owner, ByteBuffer.allocate(256 * 1024), 250, 5_000);
+            drainUntilQuiet(member, ByteBuffer.allocate(256 * 1024), 250, 5_000);
+
+            writeFully(owner, MessageCodec.encodeJoinRoom(roomId, boardId));
+            drainUntilQuiet(owner, ByteBuffer.allocate(256 * 1024), 250, 5_000);
+            writeFully(member, MessageCodec.encodeJoinRoom(roomId, boardId));
+            drainUntilQuiet(member, ByteBuffer.allocate(256 * 1024), 250, 5_000);
+
+            RoomContext room = roomManager.getRoom(roomId);
+            assertThat(room).isNotNull();
+            assertThat(room.currentMediaState).isNull();
+
+            writeFully(owner, MessageCodec.encodeMediaControl(
+                    new MessageCodec.MediaControlPayload("GARBAGE", 0, "")));
+            drainUntilQuiet(owner, ByteBuffer.allocate(256 * 1024), 250, 1_000);
+
+            assertThat(room.currentMediaState)
+                    .as("unknown MEDIA_CONTROL action must not mutate room state")
+                    .isNull();
+
+            writeFully(owner, MessageCodec.encodeMediaControl(
+                    new MessageCodec.MediaControlPayload("PLAY", 5.0, "")));
+            await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
+                    assertThat(room.currentMediaState).isNotNull());
+            assertThat(room.currentMediaState.state()).isEqualTo("PLAYING");
+
+            List<Message> memberMessages = drainMessages(member, 2_000);
+            assertThat(memberMessages).anyMatch(m -> m.type() == MessageType.MEDIA_STATE_UPDATE);
+        }
+    }
+
+    @Test
     void mediaControl_stop_clearsStateAndBroadcastsStopToPeers() throws Exception {
         WalManager walManager = new WalManager(tempDir);
         roomManager = new RoomManager(walManager);
