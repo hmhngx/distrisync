@@ -135,8 +135,8 @@ public final class BotSwarm {
         try (SocketChannel channel = openChannel(host, port)) {
             metrics.activeBots.incrementAndGet();
 
-            writeFrame(channel, MessageCodec.encodeHandshake(authorName, clientId), metrics);
-            writeFrame(channel, MessageCodec.encodeJoinRoom(roomId), metrics);
+            writeFrame(channel, MessageCodec.encodeHandshake(clientId), metrics);
+            writeFrame(channel, MessageCodec.encodeJoinRoom(roomId, authorName), metrics);
 
             AtomicBoolean running = new AtomicBoolean(true);
 

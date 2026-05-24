@@ -113,7 +113,7 @@ class ClientServerIntegrationTest {
         NetworkClient client = new NetworkClient(HOST, serverPort);
         client.addListener(listener);
         client.connect();
-        client.sendJoinRoom("Global");
+        client.sendJoinRoom("Global", "TestUser");
         return client;
     }
 
