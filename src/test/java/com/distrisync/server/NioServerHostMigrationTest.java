@@ -186,9 +186,9 @@ class NioServerHostMigrationTest {
     private static void joinRoom(SocketChannel channel, int port, String authorName, String clientId,
                                  String roomId, String boardId) throws Exception {
         channel.connect(new InetSocketAddress(HOST, port));
-        writeFully(channel, MessageCodec.encodeHandshake(authorName, clientId));
+        writeFully(channel, MessageCodec.encodeHandshake(clientId));
         drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-        writeFully(channel, MessageCodec.encodeJoinRoom(roomId, boardId));
+        writeFully(channel, MessageCodec.encodeJoinRoom(roomId, authorName, boardId));
         drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
     }
 

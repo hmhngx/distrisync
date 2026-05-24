@@ -108,9 +108,9 @@ class NioServerDeadSessionReadTest {
         SocketChannel channel = SocketChannel.open();
         channel.configureBlocking(true);
         channel.connect(new InetSocketAddress(HOST, serverPort()));
-        writeFully(channel, MessageCodec.encodeHandshake(author, clientId));
+        writeFully(channel, MessageCodec.encodeHandshake(clientId));
         drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-        writeFully(channel, MessageCodec.encodeJoinRoom(roomId, boardId));
+        writeFully(channel, MessageCodec.encodeJoinRoom(roomId, author, boardId));
         drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
         return channel;
     }

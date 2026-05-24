@@ -56,14 +56,14 @@ class NioServerBoardPresenceTest {
             clientA.connect(new InetSocketAddress(HOST, port));
             clientB.connect(new InetSocketAddress(HOST, port));
 
-            writeFully(clientA, MessageCodec.encodeHandshake("UserA", "client-a"));
-            writeFully(clientB, MessageCodec.encodeHandshake("UserB", "client-b"));
+            writeFully(clientA, MessageCodec.encodeHandshake("client-a"));
+            writeFully(clientB, MessageCodec.encodeHandshake("client-b"));
             drainUntilQuiet(clientA, ByteBuffer.allocate(256 * 1024), 250, 5_000);
             drainUntilQuiet(clientB, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
-            writeFully(clientA, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(clientA, MessageCodec.encodeJoinRoom(roomId, "UserA", boardId));
             drainUntilQuiet(clientA, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-            writeFully(clientB, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(clientB, MessageCodec.encodeJoinRoom(roomId, "UserB", boardId));
             drainUntilQuiet(clientB, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
             ByteBuffer accB = ByteBuffer.allocate(256 * 1024);

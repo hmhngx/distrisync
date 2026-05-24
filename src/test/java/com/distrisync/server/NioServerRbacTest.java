@@ -64,7 +64,7 @@ class NioServerRbacTest {
             channel.configureBlocking(true);
             channel.connect(new InetSocketAddress(HOST, serverPort()));
 
-            writeFully(channel, MessageCodec.encodeHandshake("lobby-user", "lobby-client"));
+            writeFully(channel, MessageCodec.encodeHandshake("lobby-client"));
             drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
             writeFully(channel, MessageCodec.encodeDeleteRoom(roomId));
@@ -95,14 +95,14 @@ class NioServerRbacTest {
             owner.connect(new InetSocketAddress(HOST, port));
             member.connect(new InetSocketAddress(HOST, port));
 
-            writeFully(owner, MessageCodec.encodeHandshake("owner", "owner-client"));
+            writeFully(owner, MessageCodec.encodeHandshake("owner-client"));
             drainUntilQuiet(owner, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-            writeFully(owner, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(owner, MessageCodec.encodeJoinRoom(roomId, "owner", boardId));
             drainUntilQuiet(owner, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
-            writeFully(member, MessageCodec.encodeHandshake("member", "member-client"));
+            writeFully(member, MessageCodec.encodeHandshake("member-client"));
             drainUntilQuiet(member, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-            writeFully(member, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(member, MessageCodec.encodeJoinRoom(roomId, "member", boardId));
             drainUntilQuiet(member, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
             ClientSession ownerSession = findSession(roomManager, roomId, "owner-client");
@@ -141,19 +141,19 @@ class NioServerRbacTest {
             member.connect(new InetSocketAddress(HOST, port));
             victim.connect(new InetSocketAddress(HOST, port));
 
-            writeFully(owner, MessageCodec.encodeHandshake("owner", "owner-client"));
+            writeFully(owner, MessageCodec.encodeHandshake("owner-client"));
             drainUntilQuiet(owner, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-            writeFully(owner, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(owner, MessageCodec.encodeJoinRoom(roomId, "owner", boardId));
             drainUntilQuiet(owner, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
-            writeFully(member, MessageCodec.encodeHandshake("member", "member-client"));
+            writeFully(member, MessageCodec.encodeHandshake("member-client"));
             drainUntilQuiet(member, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-            writeFully(member, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(member, MessageCodec.encodeJoinRoom(roomId, "member", boardId));
             drainUntilQuiet(member, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
-            writeFully(victim, MessageCodec.encodeHandshake("victim", "victim-client"));
+            writeFully(victim, MessageCodec.encodeHandshake("victim-client"));
             drainUntilQuiet(victim, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-            writeFully(victim, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(victim, MessageCodec.encodeJoinRoom(roomId, "victim", boardId));
             drainUntilQuiet(victim, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
             assertThat(roomManager.getRoom(roomId).getActiveClientCount()).isEqualTo(3);
@@ -183,14 +183,14 @@ class NioServerRbacTest {
             owner.connect(new InetSocketAddress(HOST, port));
             victim.connect(new InetSocketAddress(HOST, port));
 
-            writeFully(owner, MessageCodec.encodeHandshake("owner", "owner-client"));
+            writeFully(owner, MessageCodec.encodeHandshake("owner-client"));
             drainUntilQuiet(owner, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-            writeFully(owner, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(owner, MessageCodec.encodeJoinRoom(roomId, "owner", boardId));
             drainUntilQuiet(owner, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
-            writeFully(victim, MessageCodec.encodeHandshake("victim", "victim-client"));
+            writeFully(victim, MessageCodec.encodeHandshake("victim-client"));
             drainUntilQuiet(victim, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-            writeFully(victim, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(victim, MessageCodec.encodeJoinRoom(roomId, "victim", boardId));
             drainUntilQuiet(victim, ByteBuffer.allocate(256 * 1024), 250, 5_000);
 
             assertThat(roomManager.getRoom(roomId).getActiveClientCount()).isEqualTo(2);

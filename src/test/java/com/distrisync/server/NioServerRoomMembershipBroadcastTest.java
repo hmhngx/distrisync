@@ -75,6 +75,122 @@ class NioServerRoomMembershipBroadcastTest {
     }
 
     @Test
+    void blankDisplayName_fallsBackToClientIdPrefix() throws Exception {
+        final String roomId = "membership-blank-name";
+        final String boardId = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+
+        WalManager walManager = new WalManager(tempDir);
+        RoomManager roomManager = new RoomManager(walManager);
+        startServer(roomManager, walManager);
+        int port = serverPort();
+
+        try (SocketChannel first = SocketChannel.open();
+             SocketChannel second = SocketChannel.open()) {
+            first.configureBlocking(true);
+            second.configureBlocking(true);
+
+            joinRoom(first, port, "Alice", "client-a", roomId, boardId);
+            joinRoom(second, port, "   ", "abcdef123456", roomId, boardId);
+
+            List<Message> receivedByFirst = drainMessages(first, 2_000);
+            MessageCodec.RoomMemberJoinedPayload join = receivedByFirst.stream()
+                    .filter(m -> m.type() == MessageType.JOIN_ROOM)
+                    .map(MessageCodec::decodeRoomMemberJoined)
+                    .filter(p -> "abcdef123456".equals(p.clientId()))
+                    .findFirst()
+                    .orElseThrow();
+            assertThat(join.authorName()).isEqualTo("abcdef12");
+        }
+    }
+
+    @Test
+    void longDisplayName_isTruncatedToTwentyCharacters() throws Exception {
+        final String roomId = "membership-long-name";
+        final String boardId = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+        final String longName = "ABCDEFGHIJKLMNOPQRSTUVWXY";
+
+        WalManager walManager = new WalManager(tempDir);
+        RoomManager roomManager = new RoomManager(walManager);
+        startServer(roomManager, walManager);
+        int port = serverPort();
+
+        try (SocketChannel first = SocketChannel.open();
+             SocketChannel second = SocketChannel.open()) {
+            first.configureBlocking(true);
+            second.configureBlocking(true);
+
+            joinRoom(first, port, "Alice", "client-a", roomId, boardId);
+            joinRoom(second, port, longName, "client-b", roomId, boardId);
+
+            List<Message> receivedByFirst = drainMessages(first, 2_000);
+            MessageCodec.RoomMemberJoinedPayload join = receivedByFirst.stream()
+                    .filter(m -> m.type() == MessageType.JOIN_ROOM)
+                    .map(MessageCodec::decodeRoomMemberJoined)
+                    .filter(p -> "client-b".equals(p.clientId()))
+                    .findFirst()
+                    .orElseThrow();
+            assertThat(join.authorName()).hasSize(20).isEqualTo("ABCDEFGHIJKLMNOPQRST");
+        }
+    }
+
+    @Test
+    void duplicateDisplayName_appendsHexDiscriminator() throws Exception {
+        final String roomId = "membership-dedup-name";
+        final String boardId = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+
+        WalManager walManager = new WalManager(tempDir);
+        RoomManager roomManager = new RoomManager(walManager);
+        startServer(roomManager, walManager);
+        int port = serverPort();
+
+        try (SocketChannel first = SocketChannel.open();
+             SocketChannel second = SocketChannel.open()) {
+            first.configureBlocking(true);
+            second.configureBlocking(true);
+
+            joinRoom(first, port, "Alice", "client-a", roomId, boardId);
+            joinRoom(second, port, "Alice", "client-b", roomId, boardId);
+
+            List<Message> receivedByFirst = drainMessages(first, 2_000);
+            MessageCodec.RoomMemberJoinedPayload join = receivedByFirst.stream()
+                    .filter(m -> m.type() == MessageType.JOIN_ROOM)
+                    .map(MessageCodec::decodeRoomMemberJoined)
+                    .filter(p -> "client-b".equals(p.clientId()))
+                    .findFirst()
+                    .orElseThrow();
+            assertThat(join.authorName()).matches("^Alice #[0-9A-F]{4}$");
+        }
+    }
+
+    @Test
+    void joiner_receivesSelfJoinRoomConfirmationWithAuthoritativeName() throws Exception {
+        final String roomId = "membership-self-confirm";
+        final String boardId = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+
+        WalManager walManager = new WalManager(tempDir);
+        RoomManager roomManager = new RoomManager(walManager);
+        startServer(roomManager, walManager);
+        int port = serverPort();
+
+        try (SocketChannel channel = SocketChannel.open()) {
+            channel.configureBlocking(true);
+            channel.connect(new InetSocketAddress(HOST, port));
+            writeFully(channel, MessageCodec.encodeHandshake("client-b"));
+            drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
+            writeFully(channel, MessageCodec.encodeJoinRoom(roomId, "Bob", boardId));
+
+            List<Message> received = drainMessages(channel, 2_000);
+            MessageCodec.RoomMemberJoinedPayload selfConfirm = received.stream()
+                    .filter(m -> m.type() == MessageType.JOIN_ROOM)
+                    .map(MessageCodec::decodeRoomMemberJoined)
+                    .filter(p -> "client-b".equals(p.clientId()))
+                    .findFirst()
+                    .orElseThrow();
+            assertThat(selfConfirm.authorName()).isEqualTo("Bob");
+        }
+    }
+
+    @Test
     void lateJoiner_receivesJoinRoomHydrationBeforeBoardSwitch() throws Exception {
         final String roomId = "membership-late-hydrate";
         final String boardId = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
@@ -92,11 +208,19 @@ class NioServerRoomMembershipBroadcastTest {
             joinRoom(first, port, "Alice", "client-a", roomId, boardId);
 
             second.connect(new InetSocketAddress(HOST, port));
-            writeFully(second, MessageCodec.encodeHandshake("Bob", "client-b"));
+            writeFully(second, MessageCodec.encodeHandshake("client-b"));
             drainUntilQuiet(second, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-            writeFully(second, MessageCodec.encodeJoinRoom(roomId, boardId));
+            writeFully(second, MessageCodec.encodeJoinRoom(roomId, "Bob", boardId));
 
             List<Message> receivedBySecond = drainMessages(second, 2_000);
+
+            MessageCodec.RoomMemberJoinedPayload selfConfirm = receivedBySecond.stream()
+                    .filter(m -> m.type() == MessageType.JOIN_ROOM)
+                    .map(MessageCodec::decodeRoomMemberJoined)
+                    .filter(p -> "client-b".equals(p.clientId()))
+                    .findFirst()
+                    .orElseThrow();
+            assertThat(selfConfirm.authorName()).isEqualTo("Bob");
 
             MessageCodec.RoomMemberJoinedPayload hydration = receivedBySecond.stream()
                     .filter(m -> m.type() == MessageType.JOIN_ROOM)
@@ -196,9 +320,9 @@ class NioServerRoomMembershipBroadcastTest {
     private static void joinRoom(SocketChannel channel, int port, String authorName, String clientId,
                                  String roomId, String boardId) throws Exception {
         channel.connect(new InetSocketAddress(HOST, port));
-        writeFully(channel, MessageCodec.encodeHandshake(authorName, clientId));
+        writeFully(channel, MessageCodec.encodeHandshake(clientId));
         drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
-        writeFully(channel, MessageCodec.encodeJoinRoom(roomId, boardId));
+        writeFully(channel, MessageCodec.encodeJoinRoom(roomId, authorName, boardId));
         drainUntilQuiet(channel, ByteBuffer.allocate(256 * 1024), 250, 5_000);
     }
 

@@ -48,7 +48,7 @@ class ServerMetricsFlushTest {
             channel.configureBlocking(true);
             channel.connect(new InetSocketAddress(HOST, serverPort));
 
-            ByteBuffer frame = MessageCodec.encodeHandshake("metrics-user", "metrics-client");
+            ByteBuffer frame = MessageCodec.encodeHandshake("metrics-client");
             while (frame.hasRemaining()) {
                 channel.write(frame);
             }
